@@ -1,0 +1,2 @@
+add_executable(nano_nccl_all_reduce_bench all_reduce_bench.cu)
+target_link_libraries(nano_nccl_all_reduce_bench PRIVATE nano_nccl)

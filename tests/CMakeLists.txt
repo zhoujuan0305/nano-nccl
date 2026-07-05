@@ -1,0 +1,3 @@
+add_executable(nano_nccl_smoke smoke.cu)
+add_executable(nano_nccl_correctness correctness.cu)
+target_link_libraries(nano_nccl_correctness PRIVATE nano_nccl)
