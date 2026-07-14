@@ -2,25 +2,23 @@
 
 [English](README.md)
 
-单机多 GPU All Reduce 库，在 4× GTX 1080 Ti (Pascal, 无 NVLink) 上达到 NCCL `Ring` + `Simple` + 4 channels 基线等价的性能。
+单机多 GPU All Reduce 库，目标是达到 NCCL `Ring` + `Simple` + 4 channels 的性能。
 
 ---
 
 ## 性能
 
-与同轮 NCCL 基线对比（out-of-place busbw，`-w 2 -n 5`）：
+与 NCCL 同轮对比（out-of-place busbw，`-w 2 -n 5`）。nano-nccl 使用 `--transport auto`，解析为 P2P/SHM 混合的 ring-edge 路径。
 
-| size (bytes) | NCCL busbw (GB/s) | nano-nccl busbw (GB/s) | ratio |
-| ---: | ---: | ---: | ---: |
-| 262144 | 4.46 | 4.88 | 1.094 |
-| 1048576 | 7.12 | 7.78 | 1.093 |
-| 4194304 | 8.51 | 8.85 | 1.040 |
-| 16777216 | 8.59 | 8.85 | 1.030 |
-| 67108864 | 8.71 | 8.86 | 1.017 |
+| dtype | 256 KiB | 1 MiB | 4 MiB | 16 MiB | 64 MiB | geomean |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| float | 1.300 | 1.225 | 1.039 | 1.013 | 1.021 | 1.114 |
+| fp16 | 1.334 | 1.250 | 1.331 | 1.322 | 1.150 | 1.276 |
+| bf16 | 1.303 | 1.236 | 1.062 | 1.018 | 1.022 | 1.122 |
 
-geomean(ratio) = 1.054，所有尺寸均 ≥ 1.00。
+表中数值为 `nano-nccl busbw / NCCL busbw`；全部 15 个测点均正确（`#wrong=0`），并且不低于 NCCL 基线。
 
-**测试环境**：4× GTX 1080 Ti (Pascal sm_61)，CUDA 12.4，driver 550.127.05，无 NVLink，GPU0/1 NUMA 0 / GPU2/3 NUMA 1。
+**测试环境**：4× NVIDIA RTX A6000 (Ampere sm_86)，CUDA 12.8，`CUDA_VISIBLE_DEVICES=0,1,2,3`。NCCL 使用 `Ring` + `Simple`、4 channels 和 `NCCL_BUFFSIZE=33554432`。
 
 > 性能数据仅适用于上述硬件和参数场景。
 
@@ -38,16 +36,10 @@ cmake .. -DCMAKE_BUILD_TYPE=Release \
 make -j$(nproc)
 ```
 
-例如，4 GPU Pascal (sm_61) 系统：
+例如，本次测试的 4 GPU RTX A6000 (sm_86) 系统：
 
 ```bash
-cmake .. -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=61
-```
-
-2 GPU Turing (sm_75) 系统：
-
-```bash
-cmake .. -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_NRANKS=2 -DNANO_NCCL_CUDA_ARCH=75
+cmake .. -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=86
 ```
 
 构建产物：
@@ -75,13 +67,16 @@ NUMA 拓扑在运行时从 `/sys/bus/pci/devices/*/numa_node` 自动检测，换
 ```bash
 # Benchmark（性能 + 正确性）
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
-  --algo ring_simple --dtype float -b 262144 -e 67108864 -f 4 -w 2 -n 5
+  --algo ring_simple --dtype float --transport auto \
+  -b 262144 -e 67108864 -f 4 -w 2 -n 5
 
 # FP16 和 BF16 的正确性/性能运行（BF16 需要 SM80+）
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
-  --algo ring_simple --dtype fp16 -b 262144 -e 67108864 -f 4 -w 2 -n 5
+  --algo ring_simple --dtype fp16 --transport auto \
+  -b 262144 -e 67108864 -f 4 -w 2 -n 5
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
-  --algo ring_simple --dtype bf16 -b 262144 -e 67108864 -f 4 -w 2 -n 5
+  --algo ring_simple --dtype bf16 --transport auto \
+  -b 262144 -e 67108864 -f 4 -w 2 -n 5
 
 # 纯正确性测试
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_correctness
@@ -89,6 +84,16 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_correctness
 # 冒烟测试
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_smoke
 ```
+
+### 通信路径选择
+
+`--transport` 接受 `auto`、`shm` 和 `p2p`。
+
+- `auto`（默认值）对每条 ring edge 独立选择：只有具备 direct NVLink 和双向 CUDA peer access 时才选择 P2P；其余 edge 使用 SHM。最终路径可能是 `shm`、`p2p` 或 `mixed`。
+- `shm` 强制使用 mapped host memory 的 SHM FIFO 路径。
+- `p2p` 要求每条 ring edge 都具备所需的双向 peer access。任一方向不可用时，初始化会在第一个不可用方向报错，不会回退。
+
+P2P 是单机通信路径，需要每对完整配置环邻居之间的双向 CUDA peer access；它不是多机或网络通信路径。
 
 ---
 
@@ -100,9 +105,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_smoke
 - `float`、FP16（`fp16`）和 BF16（`bf16`）类型；BF16 需要 SM80+
 - `sum` 规约操作
 - out-of-place
-
-上方记录的 NCCL 性能对比仅覆盖 `float`。FP16 和 BF16 已在当前合同范围内提供功能支持，
-但本文档未提供对应的 NCCL 性能对比。
+- SHM FIFO 和 device P2P FIFO 通信路径；P2P 仅支持单机
 
 未来计划扩展：
 
@@ -110,7 +113,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_smoke
 - reduce op：`max` / `min` / `prod`
 - rank 数：2 / 8 / 16（模板参数化，host 侧分发）
 - collective：`all_gather` / `reduce_scatter` / `broadcast`
-- 通信路径：P2P / NVLink / 网络
+- 通信路径：网络
 
 ---
 

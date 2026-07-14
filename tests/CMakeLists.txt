@@ -1,3 +1,12 @@
 add_executable(nano_nccl_smoke smoke.cu)
 add_executable(nano_nccl_correctness correctness.cu)
 target_link_libraries(nano_nccl_correctness PRIVATE nano_nccl)
+
+add_executable(nano_nccl_p2p_step_counters p2p_step_counters.cu)
+target_link_libraries(nano_nccl_p2p_step_counters PRIVATE nano_nccl)
+
+add_executable(nano_nccl_p2p_topology p2p_topology.cu)
+target_link_libraries(nano_nccl_p2p_topology PRIVATE nano_nccl)
+
+add_executable(nano_nccl_simple_protocol simple_protocol.cu)
+target_link_libraries(nano_nccl_simple_protocol PRIVATE nano_nccl)

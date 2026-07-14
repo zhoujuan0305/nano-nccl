@@ -24,9 +24,30 @@ constexpr int kChannels = NANO_NCCL_NCHANNELS;
 #define NANO_NCCL_BLOCK_THREADS 512
 #endif
 constexpr int kBlockThreads = NANO_NCCL_BLOCK_THREADS;
+static_assert(kBlockThreads % 32 == 0,
+              "NANO_NCCL_BLOCK_THREADS must be a multiple of 32");
 
 // dtype 枚举与名称转换是公共接口；实际存储类型由 DTypeTraits 提供。
 enum class DType { Float, Float16, BFloat16 };
+
+enum class TransportKind { Auto, Shm, P2p, Mixed };
+
+inline const char* transport_name(TransportKind transport) {
+    switch (transport) {
+        case TransportKind::Auto: return "auto";
+        case TransportKind::Shm: return "shm";
+        case TransportKind::P2p: return "p2p";
+        case TransportKind::Mixed: return "mixed";
+    }
+    return "unknown";
+}
+
+inline bool parse_transport(const char* text, TransportKind* transport) {
+    if (std::strcmp(text, "auto") == 0) { *transport = TransportKind::Auto; return true; }
+    if (std::strcmp(text, "shm") == 0) { *transport = TransportKind::Shm; return true; }
+    if (std::strcmp(text, "p2p") == 0) { *transport = TransportKind::P2p; return true; }
+    return false;
+}
 
 inline const char* dtype_name(DType dtype) {
     switch (dtype) {
@@ -49,6 +70,7 @@ enum class RedOp { Sum };
 struct BenchConfig {
     std::string algo = "ring_simple";
     DType dtype = DType::Float;
+    TransportKind transport = TransportKind::Auto;
     std::size_t min_bytes = 262144;
     std::size_t max_bytes = 67108864;
     int factor = 4;
@@ -60,6 +82,7 @@ struct BenchConfig {
 struct BenchResult {
     std::string algo;
     DType dtype = DType::Float;
+    TransportKind transport = TransportKind::Auto;
     std::size_t bytes = 0;
     std::size_t count = 0;
     double time_us = 0.0;

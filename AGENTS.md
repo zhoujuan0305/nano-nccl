@@ -8,8 +8,8 @@ Current capabilities:
 
 - Single-node multi-GPU (tested with `CUDA_VISIBLE_DEVICES=0,1,2,3`; rank count configurable via CMake `NANO_NCCL_NRANKS`)
 - `float`, FP16, and BF16 dtypes with the `sum` reduce op, out-of-place; BF16 requires SM80+
-- Ring + Simple protocol, SHM FIFO transport
-- Performance parity with NCCL `Ring` + `Simple` + 4 channels baseline achieved for `float` (see Acceptance section below)
+- Ring + Simple protocol, with SHM FIFO and device P2P FIFO transports
+- A6000 same-round results exceed the NCCL `Ring` + `Simple` + 4 channels baseline for float, FP16, and BF16 (see Acceptance section below)
 
 Future expansion axes:
 
@@ -17,7 +17,7 @@ Future expansion axes:
 - **reduce op**: `sum` → `max`/`min`/`prod`
 - **rank count**: 4 → 2/8/16 (templated, host-side dispatch)
 - **collective**: `all_reduce` → `all_gather`/`reduce_scatter`/`broadcast`
-- **transport**: SHM FIFO → P2P/NVLink/network
+- **transport**: SHM FIFO/P2P FIFO → network
 
 Only the above scenario is currently supported. Do not claim general NCCL replacement capability until expansion is complete.
 
@@ -38,7 +38,10 @@ nano-nccl/
 │   │   ├── numa.h / numa.cu           # NUMA mapping
 │   │   └── stream.h                   # Stream/Event/GraphExec RAII wrappers
 │   ├── transport/
-│   │   ├── transport.h                # Transport interface (seam for P2P/network)
+│   │   ├── transport.h                # Transport interface (seam for network)
+│   │   ├── simple_protocol.h          # Shared Simple protocol constants
+│   │   ├── p2p/
+│   │   │   └── p2p_fifo.h / .cu       # Device FIFO and ring peer-access checks
 │   │   └── shm/
 │   │       ├── shm_fifo.h / .cu       # SHM FIFO buffer management
 │   │       └── shm_step.h             # step counter (wait/post)
@@ -84,6 +87,7 @@ Directory responsibilities:
 Namespace layering maps 1:1 to directory structure:
 
 - `nano_nccl::core` — buffer, numa, stream
+- `nano_nccl::transport::p2p` — device FIFO, P2P ring validation
 - `nano_nccl::transport::shm` — SHM FIFO, step counter
 - `nano_nccl::collective::all_reduce` — all_reduce host-side orchestration
 - `nano_nccl::kernels` — device kernel templates
@@ -108,7 +112,18 @@ Namespace layering maps 1:1 to directory structure:
 
 - **Device kernel** is templated: `template<int NRanks, typename T, typename RedOp> __global__ void ring_simple_kernel(...)`. dtype, reduce op, and rank count are compile-time parameters, enabling loop unrolling and zero virtual-call overhead.
 - **Host side** uses runtime parameters to select algo/transport/collective, does not require compiling all combinations.
-- **Transport**: SHM FIFO. GPUs read/write mapped host memory directly over PCIe (`cudaHostAllocMapped`), no proxy thread, no cudaMemcpy. FIFO buffers allocated on receiver NUMA node to avoid cross-NUMA bandwidth loss.
+- **Transport**: SHM FIFO or device P2P FIFO. SHM GPUs read/write mapped host memory directly over PCIe (`cudaHostAllocMapped`), with no proxy thread or `cudaMemcpy`; FIFO buffers are allocated on the receiver NUMA node to avoid cross-NUMA bandwidth loss. P2P FIFO buffers are allocated on the receiver GPU and require bidirectional CUDA peer access between every ring-neighbor pair.
+
+### Transport selection
+
+The benchmark `--transport` option accepts `auto`, `shm`, and `p2p`. `auto`
+(the default) resolves each ring edge independently: it selects P2P for an edge
+only when that edge has an active, direct NVLink and CUDA peer access in both
+directions (`rank i -> rank (i + 1) % nranks` and the reverse); all other edges
+use SHM. Its aggregate transport is `shm`, `p2p`, or `mixed` according to the
+resolved edge plan. `shm` always selects SHM. Explicit `p2p` validates those
+directions and fails on the first unavailable direction; it does not fall back.
+P2P is single-node only and is not a network transport.
 
 **Key design points**:
 
@@ -134,34 +149,28 @@ Build artifacts:
 
 ## Acceptance
 
-Current status: **PASS** (2026-07-05, re-verified after refactoring)
+Current status: **PASS** (2026-07-14)
 
-Candidate path: `ring_simple` (Ring + Simple protocol, SHM FIFO transport)
+Candidate path: `ring_simple` (Ring + Simple protocol, `--transport auto`)
 
-This performance comparison covers `float` only. FP16 and BF16 are functionally
-supported by the current contract, but do not have a recorded NCCL performance
-comparison here.
+Same-round comparison (out-of-place busbw) on 4× NVIDIA RTX A6000 (Ampere
+sm_86), CUDA 12.8. `auto` resolved to a mixed P2P/SHM edge plan. The values
+below are geomean `candidate_busbw / nccl_busbw`; all 15 measured points had
+`#wrong=0` and met the per-size gate.
 
-Same-round comparison (out-of-place busbw):
-
-| size(bytes) | NCCL busbw(GB/s) | candidate busbw(GB/s) | ratio |
-| ---: | ---: | ---: | ---: |
-| 262144 | 4.46 | 4.88 | 1.094 |
-| 1048576 | 7.12 | 7.78 | 1.093 |
-| 4194304 | 8.51 | 8.85 | 1.040 |
-| 16777216 | 8.59 | 8.85 | 1.030 |
-| 67108864 | 8.71 | 8.86 | 1.017 |
-
-geomean(ratio) = 1.054 ≥ 1.00 ✓
-
-Environment: 4× GTX 1080 Ti (Pascal sm_61), CUDA 12.4, driver 550.127.05, no NVLink, GPU0/1 NUMA 0, GPU2/3 NUMA 1.
+| dtype | 256 KiB | 1 MiB | 4 MiB | 16 MiB | 64 MiB | geomean |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| float | 1.300 | 1.225 | 1.039 | 1.013 | 1.021 | 1.114 |
+| FP16 | 1.334 | 1.250 | 1.331 | 1.322 | 1.150 | 1.276 |
+| BF16 | 1.303 | 1.236 | 1.062 | 1.018 | 1.022 | 1.122 |
 
 Re-verification commands:
 
 ```bash
 # Candidate
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
-  --algo ring_simple -b 262144 -e 67108864 -f 4 -w 2 -n 5
+  --algo ring_simple --transport auto --dtype <float|fp16|bf16> \
+  -b 262144 -e 67108864 -f 4 -w 2 -n 5
 
 # NCCL baseline (same-round, requires nccl-tests installed and NCCL library path)
 cd <nccl-tests-build-dir>
@@ -169,7 +178,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 \
 LD_LIBRARY_PATH=<nccl-lib-path> \
 NCCL_ALGO=Ring NCCL_PROTO=Simple \
 NCCL_MIN_NCHANNELS=4 NCCL_MAX_NCHANNELS=4 NCCL_BUFFSIZE=33554432 \
-./build/all_reduce_perf -b 262144 -e 67108864 -f 4 -g 4 -w 2 -n 5
+./build/all_reduce_perf -b 262144 -e 67108864 -f 4 -g 4 -w 2 -n 5 -d <float|half|bfloat16>
 ```
 
 Pass criterion: for each contract message size `s`, `candidate_busbw(s) >= nccl_busbw(s)`.
@@ -180,4 +189,4 @@ Pass criterion: for each contract message size `s`, `candidate_busbw(s) >= nccl_
 - **New reduce op**: implement RedOp trait in `include/nano_nccl/traits.h`, add template instantiation in `ring_simple.cu`
 - **New rank count**: add `switch(nranks)` branch in host-side dispatch in `ring_simple.cu`, instantiate kernel for that `NRanks`
 - **New collective**: create subdirectory under `src/collective/`, implement collective interface
-- **New transport**: create subdirectory under `src/transport/`, implement transport interface
+- **New transport**: create a subdirectory under `src/transport/` and implement the transport interface (for example, a network transport)

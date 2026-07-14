@@ -1,6 +1,6 @@
 #pragma once
 
-#include "nano_nccl/types.h"
+#include "transport/simple_protocol.h"
 #include "transport/shm/shm_step.h"
 
 #include <cstddef>
@@ -8,21 +8,26 @@
 
 namespace nano_nccl::transport::shm {
 
-// SHM FIFO 一次 kernel launch 的参数。send_fifo/recv_fifo 按 channel 分配，
-// 每条 ring edge 一份 buffer，receiver NUMA 节点分配。T 由 collective 实例化。
-template <typename T>
-struct ShmFifoArgs {
-    int rank;
-    std::size_t count;
-    std::size_t slot_elems;
-    std::size_t step_elems;
-    const T* input;
-    T* output;
-    T* send_fifo[kChannels];
-    const T* recv_fifo[kChannels];
-    std::uint64_t* steps;
-    std::uint64_t* base_steps;
-};
+// SHM 保留 edge-indexed mapped counter backing，kernel 仅接收本 rank 的方向指针。
+inline SimpleControlArgs make_simple_control_args(std::uint64_t* steps,
+                                                  std::uint64_t* base_steps,
+                                                  int rank) {
+    SimpleControlArgs control{};
+    int send_edge = rank;
+    int recv_edge = (rank + kRanks - 1) % kRanks;
+    for (int channel = 0; channel < kChannels; ++channel) {
+        control.send_head[channel] =
+            steps + step_idx(0, channel, send_edge);
+        control.recv_tail[channel] =
+            steps + step_idx(1, channel, recv_edge);
+        control.send_tail[channel] =
+            steps + step_idx(1, channel, send_edge);
+        control.recv_head[channel] =
+            steps + step_idx(0, channel, recv_edge);
+    }
+    control.base_steps = base_steps + rank * kChannels;
+    return control;
+}
 
 __host__ __device__ inline std::size_t div_up(std::size_t value,
                                               std::size_t divisor) {

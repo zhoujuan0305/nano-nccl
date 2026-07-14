@@ -1,6 +1,9 @@
 add_library(nano_nccl STATIC
     core/buffer.cu
     core/numa.cu
+    transport/p2p/p2p_fifo.cu
+    transport/p2p/p2p_step_counters.cu
+    transport/p2p/p2p_topology.cu
     transport/shm/shm_fifo.cu
     collective/all_reduce/ring_simple.cu
 )
@@ -15,4 +18,10 @@ target_compile_options(nano_nccl PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O3>
 )
 
-target_link_libraries(nano_nccl PUBLIC ${NUMA_LIB} cudart)
+find_library(NVML_LIB nvidia-ml)
+if(NOT NVML_LIB)
+    find_file(NVML_LIB libnvidia-ml.so.1 REQUIRED
+        PATHS /usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}
+              /lib/${CMAKE_LIBRARY_ARCHITECTURE})
+endif()
+target_link_libraries(nano_nccl PUBLIC ${NUMA_LIB} cudart ${NVML_LIB})

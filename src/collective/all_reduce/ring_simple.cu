@@ -6,6 +6,8 @@
 #include "nano_nccl/all_reduce.h"
 #include "nano_nccl/traits.h"
 #include "nano_nccl/types.h"
+#include "transport/p2p/p2p_fifo.h"
+#include "transport/p2p/p2p_step_counters.h"
 #include "transport/shm/shm_fifo.h"
 #include "transport/shm/shm_step.h"
 
@@ -30,10 +32,12 @@ using nano_nccl::core::DeviceBuffer;
 using nano_nccl::core::MappedBuffer;
 using nano_nccl::core::MappedU64Array;
 using nano_nccl::core::Stream;
-using nano_nccl::transport::shm::ShmFifoArgs;
+using nano_nccl::transport::SimpleControlArgs;
+using nano_nccl::transport::SimpleFifoArgs;
 using nano_nccl::kernels::ring_simple_kernel;
 using nano_nccl::DType;
 using nano_nccl::RedOp;
+using nano_nccl::TransportKind;
 
 float input_value(int rank, std::size_t idx) {
     int bucket = static_cast<int>(idx % 251);
@@ -131,69 +135,52 @@ void require_bf16_devices() {
     }
 }
 
-void enable_peer_access_or_throw() {
-    for (int src = 0; src < kRanks; ++src) {
-        CUDA_CHECK_THROW(cudaSetDevice(src));
-        for (int dst = 0; dst < kRanks; ++dst) {
-            if (src == dst) {
-                continue;
-            }
-            int can_access = 0;
-            CUDA_CHECK_THROW(cudaDeviceCanAccessPeer(&can_access, src, dst));
-            if (!can_access) {
-                continue;
-            }
-            cudaError_t err = cudaDeviceEnablePeerAccess(dst, 0);
-            if (err == cudaErrorPeerAccessAlreadyEnabled) {
-                cudaGetLastError();
-            } else if (err != cudaSuccess) {
-                throw std::runtime_error(cudaGetErrorString(err));
-            }
-        }
-    }
-}
-
 template <typename T, DType kDType>
 class AllReduceRunner {
 public:
-    explicit AllReduceRunner(std::size_t max_count) : max_count_(max_count) {
-        require_devices();
-        enable_peer_access_or_throw();
-
-        for (int rank = 0; rank < kRanks; ++rank) {
-            inputs_[rank] = new DeviceBuffer<T>(rank, max_count_);
-            outputs_[rank] = new DeviceBuffer<T>(rank, max_count_);
-            streams_[rank] = new Stream(rank);
-        }
-
-        // step counter 跨迭代持久化，容量覆盖 2 * kChannels * kRanks（kind/channel/edge）。
-        simple_fifo_steps_.reset(2 * kChannels * kRanks);
-        simple_fifo_base_step_.reset(kRanks * kChannels);
-        for (int channel = 0; channel < kChannels; ++channel) {
-            std::size_t part_offset = 0;
-            std::size_t part_count = 0;
-            std::size_t chunk_count = 0;
-            transport::shm::cbd_part<T>(max_count_, channel, &part_offset,
-                                        &part_count, &chunk_count);
-            simple_fifo_slot_elems_ =
-                std::max(simple_fifo_slot_elems_, chunk_count);
-        }
-        simple_fifo_slot_elems_ =
-            std::max<std::size_t>(simple_fifo_slot_elems_, 1);
-    }
-
-    ~AllReduceRunner() {
-        for (int channel = 0; channel < kChannels; ++channel) {
-            for (int edge = 0; edge < kRanks; ++edge) {
-                delete simple_fifo_[channel][edge];
+    explicit AllReduceRunner(std::size_t max_count, TransportKind requested)
+        : max_count_(max_count) {
+        try {
+            require_devices();
+            transport_plan_ = transport::p2p::resolve_ring_transport(requested);
+            if (transport_plan_.uses_p2p()) {
+                transport::p2p::enable_p2p_ring_peer_access_or_throw(
+                    transport_plan_);
             }
-        }
-        for (int rank = 0; rank < kRanks; ++rank) {
-            delete streams_[rank];
-            delete outputs_[rank];
-            delete inputs_[rank];
+
+            for (int rank = 0; rank < kRanks; ++rank) {
+                inputs_[rank] = new DeviceBuffer<T>(rank, max_count_);
+                outputs_[rank] = new DeviceBuffer<T>(rank, max_count_);
+                streams_[rank] = new Stream(rank);
+            }
+
+            // step counter 跨迭代持久化，容量覆盖 2 * kChannels * kRanks（kind/channel/edge）。
+            simple_fifo_steps_.reset(2 * kChannels * kRanks);
+            simple_fifo_base_step_.reset(kRanks * kChannels);
+            for (int channel = 0; channel < kChannels; ++channel) {
+                std::size_t part_offset = 0;
+                std::size_t part_count = 0;
+                std::size_t chunk_count = 0;
+                transport::shm::cbd_part<T>(max_count_, channel, &part_offset,
+                                            &part_count, &chunk_count);
+                simple_fifo_slot_elems_ =
+                    std::max(simple_fifo_slot_elems_, chunk_count);
+            }
+            simple_fifo_slot_elems_ =
+                std::max<std::size_t>(simple_fifo_slot_elems_, 1);
+            if (transport_plan_.uses_p2p()) {
+                p2p_fifo_ = new transport::p2p::P2pFifo<T>(
+                    simple_fifo_slot_elems_, transport_plan_);
+                p2p_steps_ = new transport::p2p::P2pStepCounters(
+                    transport_plan_);
+            }
+        } catch (...) {
+            cleanup();
+            throw;
         }
     }
+
+    ~AllReduceRunner() { cleanup(); }
 
     void load_inputs(std::vector<T> host_inputs[kRanks], std::size_t count) {
         std::size_t bytes = count * sizeof(T);
@@ -212,8 +199,7 @@ public:
 
     void run_once(std::size_t count) {
         ensure_fifo_buffers();
-        simple_fifo_steps_.clear_host();
-        simple_fifo_base_step_.clear_host();
+        reset_control();
         launch_ring_simple(count);
         sync_streams(streams_);
     }
@@ -222,8 +208,7 @@ public:
     // 对齐 NCCL BenchTime 计时口径。
     void run_batch(std::size_t count, int iters) {
         ensure_fifo_buffers();
-        simple_fifo_steps_.clear_host();
-        simple_fifo_base_step_.clear_host();
+        reset_control();
 
         cudaEvent_t iter_events[kRanks];
         for (int r = 0; r < kRanks; ++r) {
@@ -264,7 +249,30 @@ public:
                                       max_abs_error);
     }
 
+    TransportKind transport() const { return transport_plan_.resolved_kind(); }
+
 private:
+    void cleanup() {
+        for (int channel = 0; channel < kChannels; ++channel) {
+            for (int edge = 0; edge < kRanks; ++edge) {
+                delete simple_fifo_[channel][edge];
+                simple_fifo_[channel][edge] = nullptr;
+            }
+        }
+        delete p2p_fifo_;
+        p2p_fifo_ = nullptr;
+        delete p2p_steps_;
+        p2p_steps_ = nullptr;
+        for (int rank = 0; rank < kRanks; ++rank) {
+            delete streams_[rank];
+            streams_[rank] = nullptr;
+            delete outputs_[rank];
+            outputs_[rank] = nullptr;
+            delete inputs_[rank];
+            inputs_[rank] = nullptr;
+        }
+    }
+
     // Ring 拓扑：edge i 的 sender 是 rank i，receiver 是 rank (i+1)%kRanks。
     int ring_edge_recv_gpu(int edge) const {
         return (edge + 1) % kRanks;
@@ -278,6 +286,9 @@ private:
     void ensure_fifo_buffers() {
         for (int channel = 0; channel < kChannels; ++channel) {
             for (int edge = 0; edge < kRanks; ++edge) {
+                if (transport_plan_.edge_kind(edge) != TransportKind::Shm) {
+                    continue;
+                }
                 if (simple_fifo_[channel][edge] == nullptr) {
                     int recv_gpu = ring_edge_recv_gpu(edge);
                     int numa_node = core::gpu_numa_node(recv_gpu);
@@ -290,18 +301,58 @@ private:
         }
     }
 
+    void reset_control() {
+        simple_fifo_steps_.clear_host();
+        simple_fifo_base_step_.clear_host();
+        if (transport_plan_.uses_p2p()) {
+            cudaStream_t raw_streams[kRanks];
+            for (int rank = 0; rank < kRanks; ++rank) {
+                raw_streams[rank] = streams_[rank]->get();
+            }
+            p2p_steps_->reset(raw_streams);
+
+            cudaEvent_t reset_events[kRanks];
+            for (int rank = 0; rank < kRanks; ++rank) {
+                CUDA_CHECK_THROW(cudaSetDevice(rank));
+                CUDA_CHECK_THROW(cudaEventCreateWithFlags(
+                    &reset_events[rank], cudaEventDisableTiming));
+                CUDA_CHECK_THROW(cudaEventRecord(reset_events[rank],
+                                                 streams_[rank]->get()));
+            }
+            // 本 rank 的 kernel 会发布相邻 GPU 的 counter，必须先等所有
+            // device-resident counter 都完成清零，避免清零覆盖首个发布。
+            for (int stream_rank = 0; stream_rank < kRanks; ++stream_rank) {
+                CUDA_CHECK_THROW(cudaSetDevice(stream_rank));
+                for (int event_rank = 0; event_rank < kRanks; ++event_rank) {
+                    CUDA_CHECK_THROW(cudaStreamWaitEvent(
+                        streams_[stream_rank]->get(), reset_events[event_rank],
+                        0));
+                }
+            }
+            for (int rank = 0; rank < kRanks; ++rank) {
+                CUDA_CHECK_THROW(cudaSetDevice(rank));
+                CUDA_CHECK_THROW(cudaEventDestroy(reset_events[rank]));
+            }
+        }
+    }
+
     void launch_ring_simple(std::size_t count) {
         for (int rank = 0; rank < kRanks; ++rank) {
-            ShmFifoArgs<T> args{};
+            SimpleFifoArgs<T> args{};
             args.rank = rank;
             args.count = count;
             args.slot_elems = simple_fifo_slot_elems_;
             args.step_elems = transport::shm::simple_fifo_step_elems<T>();
             args.input = inputs_[rank]->get();
             args.output = outputs_[rank]->get();
-            args.steps = simple_fifo_steps_.device_ptr(rank);
-            args.base_steps = simple_fifo_base_step_.device_ptr(rank) +
-                              static_cast<std::size_t>(rank) * kChannels;
+            SimpleControlArgs shm_control =
+                transport::shm::make_simple_control_args(
+                    simple_fifo_steps_.device_ptr(rank),
+                    simple_fifo_base_step_.device_ptr(rank), rank);
+            SimpleControlArgs p2p_control{};
+            if (p2p_steps_ != nullptr) {
+                p2p_control = p2p_steps_->control_args(rank);
+            }
 
             int next = (rank + 1) % kRanks;
             int prev = (rank + kRanks - 1) % kRanks;
@@ -312,11 +363,40 @@ private:
                     "ring_simple saw an unexpected ring edge");
             }
             for (int channel = 0; channel < kChannels; ++channel) {
-                args.send_fifo[channel] =
-                    simple_fifo_[channel][send_edge]->device_ptr(rank);
-                args.recv_fifo[channel] =
-                    simple_fifo_[channel][recv_edge]->device_ptr(rank);
+                if (transport_plan_.edge_kind(send_edge) == TransportKind::P2p) {
+                    args.send_fifo[channel] =
+                        p2p_fifo_->edge_ptr(channel, send_edge);
+                } else {
+                    args.send_fifo[channel] =
+                        simple_fifo_[channel][send_edge]->device_ptr(rank);
+                }
+                if (transport_plan_.edge_kind(recv_edge) == TransportKind::P2p) {
+                    args.recv_fifo[channel] =
+                        p2p_fifo_->edge_ptr(channel, recv_edge);
+                } else {
+                    args.recv_fifo[channel] =
+                        simple_fifo_[channel][recv_edge]->device_ptr(rank);
+                }
+                args.control.send_head[channel] =
+                    transport_plan_.edge_kind(send_edge) == TransportKind::P2p
+                        ? p2p_control.send_head[channel]
+                        : shm_control.send_head[channel];
+                args.control.send_tail[channel] =
+                    transport_plan_.edge_kind(send_edge) == TransportKind::P2p
+                        ? p2p_control.send_tail[channel]
+                        : shm_control.send_tail[channel];
+                args.control.recv_tail[channel] =
+                    transport_plan_.edge_kind(recv_edge) == TransportKind::P2p
+                        ? p2p_control.recv_tail[channel]
+                        : shm_control.recv_tail[channel];
+                args.control.recv_head[channel] =
+                    transport_plan_.edge_kind(recv_edge) == TransportKind::P2p
+                        ? p2p_control.recv_head[channel]
+                        : shm_control.recv_head[channel];
             }
+            args.control.base_steps = p2p_control.base_steps != nullptr
+                                          ? p2p_control.base_steps
+                                          : shm_control.base_steps;
 
             CUDA_CHECK_THROW(cudaSetDevice(rank));
             ring_simple_kernel<kRanks, T, RedOp::Sum>
@@ -332,7 +412,11 @@ private:
     MappedU64Array simple_fifo_steps_;
     MappedU64Array simple_fifo_base_step_;
     MappedBuffer<T>* simple_fifo_[kChannels][kRanks]{};
+    transport::p2p::P2pFifo<T>* p2p_fifo_ = nullptr;
+    transport::p2p::P2pStepCounters* p2p_steps_ = nullptr;
     std::size_t simple_fifo_slot_elems_ = 0;
+    transport::p2p::RingTransportPlan transport_plan_ =
+        transport::p2p::RingTransportPlan::uniform(TransportKind::Shm);
 };
 
 template <DType kDType>
@@ -357,7 +441,8 @@ int run_ring_simple_bench_typed(const BenchConfig& config,
         if constexpr (kDType == DType::BFloat16) {
             require_bf16_devices();
         }
-        AllReduceRunner<T, kDType> runner(sizes.back() / sizeof(T));
+        AllReduceRunner<T, kDType> runner(sizes.back() / sizeof(T),
+                                          config.transport);
 
         for (std::size_t bytes : sizes) {
             std::size_t count = bytes / sizeof(T);
@@ -392,6 +477,7 @@ int run_ring_simple_bench_typed(const BenchConfig& config,
             BenchResult result;
             result.algo = algo;
             result.dtype = kDType;
+            result.transport = runner.transport();
             result.bytes = bytes;
             result.count = count;
             result.time_us = time_us;
@@ -430,12 +516,12 @@ int run_ring_simple_bench(const BenchConfig& config,
 // 必须在 kernels 命名空间内显式实例化。
 namespace nano_nccl::kernels {
 template __global__ void ring_simple_kernel<nano_nccl::kRanks, float, nano_nccl::RedOp::Sum>(
-    nano_nccl::transport::shm::ShmFifoArgs<float>);
+    nano_nccl::transport::SimpleFifoArgs<float>);
 template __global__ void ring_simple_kernel<nano_nccl::kRanks, __half, nano_nccl::RedOp::Sum>(
-    nano_nccl::transport::shm::ShmFifoArgs<__half>);
+    nano_nccl::transport::SimpleFifoArgs<__half>);
 template __global__ void ring_simple_kernel<nano_nccl::kRanks, __nv_bfloat16,
                                             nano_nccl::RedOp::Sum>(
-    nano_nccl::transport::shm::ShmFifoArgs<__nv_bfloat16>);
+    nano_nccl::transport::SimpleFifoArgs<__nv_bfloat16>);
 }  // namespace nano_nccl::kernels
 
 namespace nano_nccl {

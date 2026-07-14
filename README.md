@@ -2,25 +2,23 @@
 
 [中文说明](README.zh.md)
 
-A single-node multi-GPU All Reduce library that matches NCCL `Ring` + `Simple` + 4 channels baseline performance on 4× GTX 1080 Ti (Pascal, no NVLink).
+A single-node multi-GPU All Reduce library targeting NCCL `Ring` + `Simple` + 4 channels performance.
 
 ---
 
 ## Performance
 
-Compared against NCCL baseline in the same run (out-of-place busbw, `-w 2 -n 5`):
+Same-round comparison against NCCL (out-of-place busbw, `-w 2 -n 5`). nano-nccl used `--transport auto`, which resolved to a mixed P2P/SHM ring-edge plan.
 
-| size (bytes) | NCCL busbw (GB/s) | nano-nccl busbw (GB/s) | ratio |
-| ---: | ---: | ---: | ---: |
-| 262144 | 4.46 | 4.88 | 1.094 |
-| 1048576 | 7.12 | 7.78 | 1.093 |
-| 4194304 | 8.51 | 8.85 | 1.040 |
-| 16777216 | 8.59 | 8.85 | 1.030 |
-| 67108864 | 8.71 | 8.86 | 1.017 |
+| dtype | 256 KiB | 1 MiB | 4 MiB | 16 MiB | 64 MiB | geomean |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| float | 1.300 | 1.225 | 1.039 | 1.013 | 1.021 | 1.114 |
+| fp16 | 1.334 | 1.250 | 1.331 | 1.322 | 1.150 | 1.276 |
+| bf16 | 1.303 | 1.236 | 1.062 | 1.018 | 1.022 | 1.122 |
 
-geomean(ratio) = 1.054, all sizes ≥ 1.00.
+Each cell is `nano-nccl busbw / NCCL busbw`; all 15 measured points were correct (`#wrong=0`) and at or above the NCCL baseline.
 
-**Test environment**: 4× GTX 1080 Ti (Pascal sm_61), CUDA 12.4, driver 550.127.05, no NVLink, GPU0/1 NUMA 0 / GPU2/3 NUMA 1.
+**Test environment**: 4× NVIDIA RTX A6000 (Ampere sm_86), CUDA 12.8, `CUDA_VISIBLE_DEVICES=0,1,2,3`. NCCL used `Ring` + `Simple`, four channels, and `NCCL_BUFFSIZE=33554432`.
 
 > Performance data applies only to the above hardware and parameter configuration.
 
@@ -38,16 +36,10 @@ cmake .. -DCMAKE_BUILD_TYPE=Release \
 make -j$(nproc)
 ```
 
-For example, on a 4-GPU Pascal (sm_61) system:
+For example, on the measured 4-GPU RTX A6000 (sm_86) system:
 
 ```bash
-cmake .. -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=61
-```
-
-On a 2-GPU Turing (sm_75) system:
-
-```bash
-cmake .. -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_NRANKS=2 -DNANO_NCCL_CUDA_ARCH=75
+cmake .. -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=86
 ```
 
 Build artifacts:
@@ -75,13 +67,16 @@ NUMA topology is detected at runtime by reading `/sys/bus/pci/devices/*/numa_nod
 ```bash
 # Benchmark (perf + correctness)
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
-  --algo ring_simple --dtype float -b 262144 -e 67108864 -f 4 -w 2 -n 5
+  --algo ring_simple --dtype float --transport auto \
+  -b 262144 -e 67108864 -f 4 -w 2 -n 5
 
 # FP16 and BF16 correctness/performance runs (BF16 requires SM80+)
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
-  --algo ring_simple --dtype fp16 -b 262144 -e 67108864 -f 4 -w 2 -n 5
+  --algo ring_simple --dtype fp16 --transport auto \
+  -b 262144 -e 67108864 -f 4 -w 2 -n 5
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
-  --algo ring_simple --dtype bf16 -b 262144 -e 67108864 -f 4 -w 2 -n 5
+  --algo ring_simple --dtype bf16 --transport auto \
+  -b 262144 -e 67108864 -f 4 -w 2 -n 5
 
 # Correctness-only test
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_correctness
@@ -89,6 +84,20 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_correctness
 # Smoke test
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_smoke
 ```
+
+### Transport selection
+
+`--transport` accepts `auto`, `shm`, and `p2p`.
+
+- `auto` (the default) selects P2P independently for each ring edge only when
+  it has a direct NVLink and CUDA peer access in both directions; other edges
+  use SHM. The resulting transport is `shm`, `p2p`, or `mixed`.
+- `shm` forces the mapped-host-memory SHM FIFO path.
+- `p2p` requires that every ring edge has the required bidirectional peer
+  access and fails during setup on the first unavailable direction.
+
+P2P is a single-node transport. It requires CUDA peer access for the complete
+configured ring; it is not a multi-node or network transport.
 
 ---
 
@@ -100,10 +109,7 @@ Currently supports only:
 - `float`, FP16 (`fp16`), and BF16 (`bf16`) dtypes; BF16 requires SM80+
 - `sum` reduce op
 - out-of-place
-
-The recorded NCCL performance comparison above covers `float` only. FP16 and BF16
-are functionally supported by the current contract, but have no corresponding
-NCCL comparison in this document.
+- SHM FIFO and device P2P FIFO transports; P2P is single-node only
 
 Future expansion plans:
 
@@ -111,7 +117,7 @@ Future expansion plans:
 - reduce op: `max` / `min` / `prod`
 - rank count: 2 / 8 / 16 (templated, host-side dispatch)
 - collective: `all_gather` / `reduce_scatter` / `broadcast`
-- transport: P2P / NVLink / network
+- transport: network
 
 ---
 

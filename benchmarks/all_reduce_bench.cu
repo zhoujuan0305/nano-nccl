@@ -28,6 +28,7 @@ void usage(const char* argv0) {
     std::fprintf(stderr,
                  "Usage: %s [--algo auto|ring_simple] "
                  "[--dtype float|fp16|bf16] "
+                 "[--transport auto|shm|p2p] "
                  "[-b bytes] [-e bytes] [-f factor] [-w warmup] [-n iters]\n",
                  argv0);
 }
@@ -46,6 +47,12 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--dtype") == 0) {
             if (i + 1 >= argc ||
                 !nano_nccl::parse_dtype(argv[++i], &config.dtype)) {
+                usage(argv[0]);
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--transport") == 0) {
+            if (i + 1 >= argc ||
+                !nano_nccl::parse_transport(argv[++i], &config.transport)) {
                 usage(argv[0]);
                 return 2;
             }
@@ -84,17 +91,19 @@ int main(int argc, char** argv) {
     int rc = nano_nccl::run_all_reduce_bench(config, &results);
 
     std::printf("# nano-nccl all_reduce_bench\n");
-    std::printf("# algo %s dtype %s nGpus %d warmup iters: %d iters: %d validation: 1\n",
+    std::printf("# algo %s dtype %s transport %s nGpus %d warmup iters: %d iters: %d validation: 1\n",
                 config.algo.c_str(), nano_nccl::dtype_name(config.dtype),
+                nano_nccl::transport_name(config.transport),
                 nano_nccl::kRanks, config.warmup_iters, config.iters);
-    std::printf("# %14s %8s %12s %12s %10s %10s %10s %8s %12s\n", "algo",
-                "dtype", "size(B)", "count", "time(us)", "algbw", "busbw",
-                "#wrong", "max_abs");
+    std::printf("# %14s %8s %10s %12s %12s %10s %10s %10s %8s %12s\n", "algo",
+                "dtype", "transport", "size(B)", "count", "time(us)", "algbw",
+                "busbw", "#wrong", "max_abs");
     for (const auto& result : results) {
-        std::printf("%14s %8s %12zu %12zu %10.2f %10.2f %10.2f %8d %12.6g\n",
+        std::printf("%14s %8s %10s %12zu %12zu %10.2f %10.2f %10.2f %8d %12.6g\n",
                     result.algo.c_str(), nano_nccl::dtype_name(result.dtype),
-                    result.bytes, result.count, result.time_us, result.algbw,
-                    result.busbw, result.wrong, result.max_abs_error);
+                    nano_nccl::transport_name(result.transport), result.bytes,
+                    result.count, result.time_us, result.algbw, result.busbw,
+                    result.wrong, result.max_abs_error);
     }
 
     if (rc != 0) {

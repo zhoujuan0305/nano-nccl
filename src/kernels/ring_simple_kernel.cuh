@@ -44,6 +44,15 @@ __device__ __forceinline__ float4 load_volatile_float4(const float* ptr) {
     return v;
 }
 
+__device__ __forceinline__ uint4 load_volatile_uint4(const void* ptr) {
+    uint4 value;
+    asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
+                 : "l"(global_address(ptr))
+                 : "memory");
+    return value;
+}
+
 __device__ inline bool aligned_vec4(const float* a, const float* b,
                                     const float* c, std::size_t count) {
     unsigned long long addr =
@@ -51,6 +60,139 @@ __device__ inline bool aligned_vec4(const float* a, const float* b,
         reinterpret_cast<unsigned long long>(b) |
         reinterpret_cast<unsigned long long>(c);
     return (count % 4 == 0) && ((addr & 0xfULL) == 0);
+}
+
+template <typename T>
+__device__ inline bool aligned_packed16(const T* a, const T* b, const T* c,
+                                        std::size_t count) {
+    unsigned long long address = reinterpret_cast<unsigned long long>(a) |
+                                 reinterpret_cast<unsigned long long>(b) |
+                                 reinterpret_cast<unsigned long long>(c);
+    return count % 8 == 0 && (address & 0xfULL) == 0;
+}
+
+template <typename T>
+inline constexpr bool kIsPacked16 =
+    std::is_same_v<T, __half> || std::is_same_v<T, __nv_bfloat16>;
+
+__device__ __forceinline__ __half2 half2_from_bits(std::uint32_t bits) {
+    __half2_raw raw;
+    raw.x = static_cast<unsigned short>(bits);
+    raw.y = static_cast<unsigned short>(bits >> 16);
+    return __half2(raw);
+}
+
+__device__ __forceinline__ std::uint32_t half2_to_bits(__half2 value) {
+    __half2_raw raw = static_cast<__half2_raw>(value);
+    return static_cast<std::uint32_t>(raw.x) |
+           (static_cast<std::uint32_t>(raw.y) << 16);
+}
+
+__device__ __forceinline__ __nv_bfloat162 bfloat162_from_bits(std::uint32_t bits) {
+    __nv_bfloat162_raw raw;
+    raw.x = static_cast<unsigned short>(bits);
+    raw.y = static_cast<unsigned short>(bits >> 16);
+    return __nv_bfloat162(raw);
+}
+
+__device__ __forceinline__ std::uint32_t bfloat162_to_bits(__nv_bfloat162 value) {
+    __nv_bfloat162_raw raw = static_cast<__nv_bfloat162_raw>(value);
+    return static_cast<std::uint32_t>(raw.x) |
+           (static_cast<std::uint32_t>(raw.y) << 16);
+}
+
+template <typename T>
+struct Packed16Traits;
+
+template <>
+struct Packed16Traits<__half> {
+    static __device__ __forceinline__ std::uint32_t apply(std::uint32_t a,
+                                                           std::uint32_t b) {
+        return half2_to_bits(__hadd2(half2_from_bits(a), half2_from_bits(b)));
+    }
+};
+
+template <>
+struct Packed16Traits<__nv_bfloat16> {
+    static __device__ __forceinline__ std::uint32_t apply(std::uint32_t a,
+                                                           std::uint32_t b) {
+        return bfloat162_to_bits(
+            __hadd2(bfloat162_from_bits(a), bfloat162_from_bits(b)));
+    }
+};
+
+template <typename T>
+__device__ __forceinline__ uint4 reduce_packed16(uint4 local, uint4 recv) {
+    return make_uint4(Packed16Traits<T>::apply(local.x, recv.x),
+                      Packed16Traits<T>::apply(local.y, recv.y),
+                      Packed16Traits<T>::apply(local.z, recv.z),
+                      Packed16Traits<T>::apply(local.w, recv.w));
+}
+
+template <typename T>
+__device__ inline void copy_packed16_worker(const T* src, T* dst,
+                                             std::size_t count, int nworkers) {
+    if (threadIdx.x >= nworkers) return;
+    std::size_t vec_count = count / 8;
+    const uint4* src4 = reinterpret_cast<const uint4*>(src);
+    uint4* dst4 = reinterpret_cast<uint4*>(dst);
+    for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
+        dst4[i] = src4[i];
+    }
+}
+
+template <typename T>
+__device__ inline void copy_volatile_packed16_worker(
+    const T* src, T* dst, std::size_t count, int nworkers) {
+    if (threadIdx.x >= nworkers) return;
+    std::size_t vec_count = count / 8;
+    uint4* dst4 = reinterpret_cast<uint4*>(dst);
+    for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
+        dst4[i] = load_volatile_uint4(src + 8 * i);
+    }
+}
+
+template <typename T>
+__device__ inline void reduce_volatile_packed16_worker(
+    const T* local, const T* recv, T* dst, std::size_t count, int nworkers) {
+    if (threadIdx.x >= nworkers) return;
+    std::size_t vec_count = count / 8;
+    const uint4* local4 = reinterpret_cast<const uint4*>(local);
+    uint4* dst4 = reinterpret_cast<uint4*>(dst);
+    for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
+        dst4[i] = reduce_packed16<T>(local4[i], load_volatile_uint4(recv + 8 * i));
+    }
+}
+
+template <typename T>
+__device__ inline void copy_broadcast_volatile_packed16_worker(
+    const T* src, T* dst0, T* dst1, std::size_t count, int nworkers) {
+    if (threadIdx.x >= nworkers) return;
+    std::size_t vec_count = count / 8;
+    uint4* dst04 = reinterpret_cast<uint4*>(dst0);
+    uint4* dst14 = reinterpret_cast<uint4*>(dst1);
+    for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
+        uint4 value = load_volatile_uint4(src + 8 * i);
+        dst04[i] = value;
+        dst14[i] = value;
+    }
+}
+
+template <typename T>
+__device__ inline void reduce_broadcast_volatile_packed16_worker(
+    const T* local, const T* recv, T* dst0, T* dst1,
+    std::size_t count, int nworkers) {
+    if (threadIdx.x >= nworkers) return;
+    std::size_t vec_count = count / 8;
+    const uint4* local4 = reinterpret_cast<const uint4*>(local);
+    uint4* dst04 = reinterpret_cast<uint4*>(dst0);
+    uint4* dst14 = reinterpret_cast<uint4*>(dst1);
+    for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
+        uint4 value = reduce_packed16<T>(local4[i],
+                                         load_volatile_uint4(recv + 8 * i));
+        dst04[i] = value;
+        dst14[i] = value;
+    }
 }
 
 __device__ inline void copy_float_worker(const float* src, float* dst,
@@ -101,6 +243,12 @@ __device__ inline void copy_worker(const T* src, T* dst, std::size_t count,
                                    int nworkers) {
     if constexpr (std::is_same_v<T, float>) {
         copy_float_worker(src, dst, count, nworkers);
+    } else if constexpr (kIsPacked16<T>) {
+        if (aligned_packed16(src, dst, dst, count)) {
+            copy_packed16_worker(src, dst, count, nworkers);
+        } else {
+            copy_scalar_worker(src, dst, count, nworkers);
+        }
     } else {
         copy_scalar_worker(src, dst, count, nworkers);
     }
@@ -111,6 +259,12 @@ __device__ inline void copy_volatile_worker(const T* src, T* dst,
                                              std::size_t count, int nworkers) {
     if constexpr (std::is_same_v<T, float>) {
         copy_volatile_float_worker(src, dst, count, nworkers);
+    } else if constexpr (kIsPacked16<T>) {
+        if (aligned_packed16(src, dst, dst, count)) {
+            copy_volatile_packed16_worker(src, dst, count, nworkers);
+        } else {
+            copy_scalar_worker(src, dst, count, nworkers);
+        }
     } else {
         copy_scalar_worker(src, dst, count, nworkers);
     }
@@ -138,6 +292,11 @@ __device__ inline void reduce_volatile_worker(const T* local, const T* recv,
             }
             return;
         }
+    } else if constexpr (kIsPacked16<T> && kRedOp == RedOp::Sum) {
+        if (aligned_packed16(local, recv, dst, count)) {
+            reduce_volatile_packed16_worker(local, recv, dst, count, nworkers);
+            return;
+        }
     }
     volatile const T* recv_v = reinterpret_cast<volatile const T*>(recv);
     for (std::size_t i = threadIdx.x; i < count; i += nworkers) {
@@ -160,6 +319,12 @@ __device__ inline void copy_broadcast_volatile_worker(
                 dst04[i] = v;
                 dst14[i] = v;
             }
+            return;
+        }
+    } else if constexpr (kIsPacked16<T>) {
+        if (aligned_packed16(src, dst0, dst1, count)) {
+            copy_broadcast_volatile_packed16_worker(src, dst0, dst1, count,
+                                                     nworkers);
             return;
         }
     }
@@ -196,6 +361,13 @@ __device__ inline void reduce_broadcast_volatile_worker(
             }
             return;
         }
+    } else if constexpr (kIsPacked16<T> && kRedOp == RedOp::Sum) {
+        if (aligned_packed16(local, recv, dst0, count) &&
+            aligned_packed16(local, recv, dst1, count)) {
+            reduce_broadcast_volatile_packed16_worker(local, recv, dst0, dst1,
+                                                       count, nworkers);
+            return;
+        }
     }
     volatile const T* recv_v = reinterpret_cast<volatile const T*>(recv);
     for (std::size_t i = threadIdx.x; i < count; i += nworkers) {
@@ -208,12 +380,9 @@ __device__ inline void reduce_broadcast_volatile_worker(
 // 等待 send 方有可用 slot（credit）。专用 threadIdx==1 轮询，对齐 NCCL connStepCache。
 template <int NRanks, typename T>
 __device__ inline void wait_send_credit(
-    transport::shm::ShmFifoArgs<T> args, int channel, std::uint64_t step,
+    transport::SimpleChannelArgs<T> args, std::uint64_t step,
     std::uint64_t* head_cache) {
-    int edge = transport::shm::ring_edge_index(args.rank,
-                                               (args.rank + 1) % NRanks, NRanks);
-    std::uint64_t* head =
-        args.steps + transport::shm::step_idx(0, channel, edge);
+    std::uint64_t* head = args.send_head;
     if (threadIdx.x == 1) {
         while (*head_cache + transport::shm::kSimpleFifoSteps <
                step + transport::shm::kSimpleFifoSliceSteps) {
@@ -224,12 +393,9 @@ __device__ inline void wait_send_credit(
 
 template <int NRanks, typename T>
 __device__ inline void wait_recv_ready(
-    transport::shm::ShmFifoArgs<T> args, int channel, std::uint64_t step,
+    transport::SimpleChannelArgs<T> args, std::uint64_t step,
     std::uint64_t* tail_cache) {
-    int prev = (args.rank + NRanks - 1) % NRanks;
-    int edge = transport::shm::ring_edge_index(prev, args.rank, NRanks);
-    std::uint64_t* tail =
-        args.steps + transport::shm::step_idx(1, channel, edge);
+    std::uint64_t* tail = args.recv_tail;
     if (threadIdx.x == 0) {
         while (*tail_cache < step + transport::shm::kSimpleFifoSliceSteps) {
             *tail_cache = transport::shm::load_step(tail);
@@ -237,29 +403,27 @@ __device__ inline void wait_recv_ready(
     }
 }
 
+__device__ inline void worker_barrier(int nworkers) {
+    if (threadIdx.x < nworkers) {
+        asm volatile("bar.sync 1, %0;" : : "r"(nworkers));
+    }
+}
+
 template <int NRanks, typename T>
 __device__ inline void post_send_ready(
-    transport::shm::ShmFifoArgs<T> args, int channel, std::uint64_t step,
+    transport::SimpleChannelArgs<T> args, std::uint64_t step,
     bool data_stored) {
-    int edge = transport::shm::ring_edge_index(args.rank,
-                                               (args.rank + 1) % NRanks, NRanks);
-    std::uint64_t* tail =
-        args.steps + transport::shm::step_idx(1, channel, edge);
+    std::uint64_t* tail = args.send_tail;
     if (threadIdx.x == blockDim.x - 1) {
-        if (data_stored) {
-            __threadfence_system();
-        }
+        if (data_stored) __threadfence_system();
         transport::shm::store_step(tail, step + transport::shm::kSimpleFifoSliceSteps);
     }
 }
 
 template <int NRanks, typename T>
 __device__ inline void post_recv_credit(
-    transport::shm::ShmFifoArgs<T> args, int channel, std::uint64_t step) {
-    int prev = (args.rank + NRanks - 1) % NRanks;
-    int edge = transport::shm::ring_edge_index(prev, args.rank, NRanks);
-    std::uint64_t* head =
-        args.steps + transport::shm::step_idx(0, channel, edge);
+    transport::SimpleChannelArgs<T> args, std::uint64_t step) {
+    std::uint64_t* head = args.recv_head;
     if (threadIdx.x == blockDim.x - 2) {
         transport::shm::store_step(head, step + transport::shm::kSimpleFifoSliceSteps);
     }
@@ -267,7 +431,7 @@ __device__ inline void post_recv_credit(
 
 template <int NRanks, typename T, RedOp kRedOp>
 __device__ inline void direct_send(
-    transport::shm::ShmFifoArgs<T> args, int channel, const T* src,
+    transport::SimpleChannelArgs<T> args, const T* src,
     std::size_t nelem, std::uint64_t* send_step,
     std::uint64_t* send_head_cache, int nworkers) {
     std::size_t slice_size =
@@ -280,16 +444,16 @@ __device__ inline void direct_send(
             slice_offset < nelem
                 ? transport::shm::nelem(slice_size, nelem, slice_offset)
                 : 0;
-        wait_send_credit<NRanks, T>(args, channel, *send_step, send_head_cache);
-        __syncthreads();
-        T* dst = args.send_fifo[channel] +
+        wait_send_credit<NRanks, T>(args, *send_step, send_head_cache);
+        worker_barrier(nworkers);
+        T* dst = args.send_fifo +
                      ((*send_step % transport::shm::kSimpleFifoSteps) *
                       args.slot_elems);
         if (work != 0) {
             copy_worker(src + slice_offset, dst, work, nworkers);
         }
         __syncthreads();
-        post_send_ready<NRanks, T>(args, channel, *send_step, work != 0);
+        post_send_ready<NRanks, T>(args, *send_step, work != 0);
         *send_step += transport::shm::kSimpleFifoSliceSteps;
         slice_offset += slice_size;
     }
@@ -297,7 +461,7 @@ __device__ inline void direct_send(
 
 template <int NRanks, typename T, RedOp kRedOp>
 __device__ inline void recv_reduce_send(
-    transport::shm::ShmFifoArgs<T> args, int channel, const T* local,
+    transport::SimpleChannelArgs<T> args, const T* local,
     std::size_t nelem, std::uint64_t* recv_step, std::uint64_t* send_step,
     std::uint64_t* recv_tail_cache, std::uint64_t* send_head_cache,
     int nworkers) {
@@ -311,13 +475,13 @@ __device__ inline void recv_reduce_send(
             slice_offset < nelem
                 ? transport::shm::nelem(slice_size, nelem, slice_offset)
                 : 0;
-        wait_recv_ready<NRanks, T>(args, channel, *recv_step, recv_tail_cache);
-        wait_send_credit<NRanks, T>(args, channel, *send_step, send_head_cache);
-        __syncthreads();
-        const T* recv = args.recv_fifo[channel] +
+        wait_recv_ready<NRanks, T>(args, *recv_step, recv_tail_cache);
+        wait_send_credit<NRanks, T>(args, *send_step, send_head_cache);
+        worker_barrier(nworkers);
+        const T* recv = args.recv_fifo +
                             ((*recv_step % transport::shm::kSimpleFifoSteps) *
                              args.slot_elems);
-        T* dst = args.send_fifo[channel] +
+        T* dst = args.send_fifo +
                      ((*send_step % transport::shm::kSimpleFifoSteps) *
                       args.slot_elems);
         if (work != 0) {
@@ -325,8 +489,8 @@ __device__ inline void recv_reduce_send(
                                                      dst, work, nworkers);
         }
         __syncthreads();
-        post_recv_credit<NRanks, T>(args, channel, *recv_step);
-        post_send_ready<NRanks, T>(args, channel, *send_step, work != 0);
+        post_recv_credit<NRanks, T>(args, *recv_step);
+        post_send_ready<NRanks, T>(args, *send_step, work != 0);
         *recv_step += transport::shm::kSimpleFifoSliceSteps;
         *send_step += transport::shm::kSimpleFifoSliceSteps;
         slice_offset += slice_size;
@@ -335,7 +499,7 @@ __device__ inline void recv_reduce_send(
 
 template <int NRanks, typename T, RedOp kRedOp>
 __device__ inline void recv_reduce_copy_send(
-    transport::shm::ShmFifoArgs<T> args, int channel, const T* local,
+    transport::SimpleChannelArgs<T> args, const T* local,
     T* out, std::size_t nelem, std::uint64_t* recv_step,
     std::uint64_t* send_step, std::uint64_t* recv_tail_cache,
     std::uint64_t* send_head_cache, int nworkers) {
@@ -349,13 +513,13 @@ __device__ inline void recv_reduce_copy_send(
             slice_offset < nelem
                 ? transport::shm::nelem(slice_size, nelem, slice_offset)
                 : 0;
-        wait_recv_ready<NRanks, T>(args, channel, *recv_step, recv_tail_cache);
-        wait_send_credit<NRanks, T>(args, channel, *send_step, send_head_cache);
-        __syncthreads();
-        const T* recv = args.recv_fifo[channel] +
+        wait_recv_ready<NRanks, T>(args, *recv_step, recv_tail_cache);
+        wait_send_credit<NRanks, T>(args, *send_step, send_head_cache);
+        worker_barrier(nworkers);
+        const T* recv = args.recv_fifo +
                             ((*recv_step % transport::shm::kSimpleFifoSteps) *
                              args.slot_elems);
-        T* dst = args.send_fifo[channel] +
+        T* dst = args.send_fifo +
                      ((*send_step % transport::shm::kSimpleFifoSteps) *
                       args.slot_elems);
         if (work != 0) {
@@ -364,8 +528,8 @@ __device__ inline void recv_reduce_copy_send(
                 nworkers);
         }
         __syncthreads();
-        post_recv_credit<NRanks, T>(args, channel, *recv_step);
-        post_send_ready<NRanks, T>(args, channel, *send_step, work != 0);
+        post_recv_credit<NRanks, T>(args, *recv_step);
+        post_send_ready<NRanks, T>(args, *send_step, work != 0);
         *recv_step += transport::shm::kSimpleFifoSliceSteps;
         *send_step += transport::shm::kSimpleFifoSliceSteps;
         slice_offset += slice_size;
@@ -374,7 +538,7 @@ __device__ inline void recv_reduce_copy_send(
 
 template <int NRanks, typename T, RedOp kRedOp>
 __device__ inline void recv_copy_send(
-    transport::shm::ShmFifoArgs<T> args, int channel, T* out,
+    transport::SimpleChannelArgs<T> args, T* out,
     std::size_t nelem, std::uint64_t* recv_step, std::uint64_t* send_step,
     std::uint64_t* recv_tail_cache, std::uint64_t* send_head_cache,
     int nworkers) {
@@ -388,13 +552,13 @@ __device__ inline void recv_copy_send(
             slice_offset < nelem
                 ? transport::shm::nelem(slice_size, nelem, slice_offset)
                 : 0;
-        wait_recv_ready<NRanks, T>(args, channel, *recv_step, recv_tail_cache);
-        wait_send_credit<NRanks, T>(args, channel, *send_step, send_head_cache);
-        __syncthreads();
-        const T* recv = args.recv_fifo[channel] +
+        wait_recv_ready<NRanks, T>(args, *recv_step, recv_tail_cache);
+        wait_send_credit<NRanks, T>(args, *send_step, send_head_cache);
+        worker_barrier(nworkers);
+        const T* recv = args.recv_fifo +
                             ((*recv_step % transport::shm::kSimpleFifoSteps) *
                              args.slot_elems);
-        T* dst = args.send_fifo[channel] +
+        T* dst = args.send_fifo +
                      ((*send_step % transport::shm::kSimpleFifoSteps) *
                       args.slot_elems);
         if (work != 0) {
@@ -402,8 +566,8 @@ __device__ inline void recv_copy_send(
                 recv, out + slice_offset, dst, work, nworkers);
         }
         __syncthreads();
-        post_recv_credit<NRanks, T>(args, channel, *recv_step);
-        post_send_ready<NRanks, T>(args, channel, *send_step, work != 0);
+        post_recv_credit<NRanks, T>(args, *recv_step);
+        post_send_ready<NRanks, T>(args, *send_step, work != 0);
         *recv_step += transport::shm::kSimpleFifoSliceSteps;
         *send_step += transport::shm::kSimpleFifoSliceSteps;
         slice_offset += slice_size;
@@ -412,7 +576,7 @@ __device__ inline void recv_copy_send(
 
 template <int NRanks, typename T, RedOp kRedOp>
 __device__ inline void direct_recv(
-    transport::shm::ShmFifoArgs<T> args, int channel, T* out,
+    transport::SimpleChannelArgs<T> args, T* out,
     std::size_t nelem, std::uint64_t* recv_step,
     std::uint64_t* recv_tail_cache, int nworkers) {
     std::size_t slice_size =
@@ -425,16 +589,16 @@ __device__ inline void direct_recv(
             slice_offset < nelem
                 ? transport::shm::nelem(slice_size, nelem, slice_offset)
                 : 0;
-        wait_recv_ready<NRanks, T>(args, channel, *recv_step, recv_tail_cache);
-        __syncthreads();
-        const T* recv = args.recv_fifo[channel] +
+        wait_recv_ready<NRanks, T>(args, *recv_step, recv_tail_cache);
+        worker_barrier(nworkers);
+        const T* recv = args.recv_fifo +
                             ((*recv_step % transport::shm::kSimpleFifoSteps) *
                              args.slot_elems);
         if (work != 0) {
             copy_volatile_worker(recv, out + slice_offset, work, nworkers);
         }
         __syncthreads();
-        post_recv_credit<NRanks, T>(args, channel, *recv_step);
+        post_recv_credit<NRanks, T>(args, *recv_step);
         *recv_step += transport::shm::kSimpleFifoSliceSteps;
         slice_offset += slice_size;
     }
@@ -446,11 +610,21 @@ __device__ inline void direct_recv(
 //   nworkers = blockDim - 32：留 3 个专用线程做 wait/post，其余做数据搬运。
 template <int NRanks, typename T, RedOp kRedOp>
 __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel(
-    transport::shm::ShmFifoArgs<T> args) {
+    transport::SimpleFifoArgs<T> args) {
     int channel = blockIdx.x;
     if (channel >= kChannels) {
         return;
     }
+    transport::SimpleChannelArgs<T> channel_args{
+        args.slot_elems,
+        args.step_elems,
+        args.send_fifo[channel],
+        args.recv_fifo[channel],
+        args.control.send_head[channel],
+        args.control.recv_tail[channel],
+        args.control.send_tail[channel],
+        args.control.recv_head[channel],
+    };
     int nworkers = blockDim.x >= 3 * 32 ? blockDim.x - 32 : blockDim.x;
     std::size_t part_offset = 0;
     std::size_t part_count = 0;
@@ -463,7 +637,7 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
 
     __shared__ std::uint64_t s_base_step;
     if (threadIdx.x == 0) {
-        s_base_step = args.base_steps[channel];
+        s_base_step = args.control.base_steps[channel];
     }
     __syncthreads();
     std::uint64_t base_step = s_base_step;
@@ -487,7 +661,7 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
         std::size_t chunk_offset = static_cast<std::size_t>(chunk) * loop_chunk;
         std::size_t offset = part_offset + elem_offset + chunk_offset;
         std::size_t work = transport::shm::nelem(loop_chunk, rem_count, chunk_offset);
-        direct_send<NRanks, T, kRedOp>(args, channel, args.input + offset, work,
+        direct_send<NRanks, T, kRedOp>(channel_args, args.input + offset, work,
                                       &send_step, &send_head_cache, nworkers);
 
         for (int j = 2; j < NRanks; ++j) {
@@ -496,7 +670,7 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
             offset = part_offset + elem_offset + chunk_offset;
             work = transport::shm::nelem(loop_chunk, rem_count, chunk_offset);
             recv_reduce_send<NRanks, T, kRedOp>(
-                args, channel, args.input + offset, work, &recv_step,
+                channel_args, args.input + offset, work, &recv_step,
                 &send_step, &recv_tail_cache, &send_head_cache, nworkers);
         }
 
@@ -505,7 +679,7 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
         offset = part_offset + elem_offset + chunk_offset;
         work = transport::shm::nelem(loop_chunk, rem_count, chunk_offset);
         recv_reduce_copy_send<NRanks, T, kRedOp>(
-            args, channel, args.input + offset, args.output + offset, work,
+            channel_args, args.input + offset, args.output + offset, work,
             &recv_step, &send_step, &recv_tail_cache, &send_head_cache,
             nworkers);
 
@@ -515,7 +689,7 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
             offset = part_offset + elem_offset + chunk_offset;
             work = transport::shm::nelem(loop_chunk, rem_count, chunk_offset);
             recv_copy_send<NRanks, T, kRedOp>(
-                args, channel, args.output + offset, work, &recv_step,
+                channel_args, args.output + offset, work, &recv_step,
                 &send_step, &recv_tail_cache, &send_head_cache, nworkers);
         }
 
@@ -523,7 +697,7 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
         chunk_offset = static_cast<std::size_t>(chunk) * loop_chunk;
         offset = part_offset + elem_offset + chunk_offset;
         work = transport::shm::nelem(loop_chunk, rem_count, chunk_offset);
-        direct_recv<NRanks, T, kRedOp>(args, channel, args.output + offset, work,
+        direct_recv<NRanks, T, kRedOp>(channel_args, args.output + offset, work,
                                       &recv_step, &recv_tail_cache, nworkers);
 
         elem_offset += loop_count;
@@ -531,7 +705,7 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
 
     __syncthreads();
     if (threadIdx.x == 0) {
-        args.base_steps[channel] = send_step;
+        args.control.base_steps[channel] = send_step;
     }
 }
 
