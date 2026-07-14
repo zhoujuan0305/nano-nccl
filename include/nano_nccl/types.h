@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -24,22 +25,41 @@ constexpr int kChannels = NANO_NCCL_NCHANNELS;
 #endif
 constexpr int kBlockThreads = NANO_NCCL_BLOCK_THREADS;
 
-// dtype 与 redop 暂只支持单一特化，枚举为未来扩展留 seam。
-enum class DType { Float };
+// dtype 枚举与名称转换是公共接口；实际存储类型由 DTypeTraits 提供。
+enum class DType { Float, Float16, BFloat16 };
+
+inline const char* dtype_name(DType dtype) {
+    switch (dtype) {
+        case DType::Float: return "float";
+        case DType::Float16: return "fp16";
+        case DType::BFloat16: return "bf16";
+    }
+    return "unknown";
+}
+
+inline bool parse_dtype(const char* text, DType* dtype) {
+    if (std::strcmp(text, "float") == 0) { *dtype = DType::Float; return true; }
+    if (std::strcmp(text, "fp16") == 0) { *dtype = DType::Float16; return true; }
+    if (std::strcmp(text, "bf16") == 0) { *dtype = DType::BFloat16; return true; }
+    return false;
+}
+
 enum class RedOp { Sum };
 
 struct BenchConfig {
     std::string algo = "ring_simple";
+    DType dtype = DType::Float;
     std::size_t min_bytes = 262144;
     std::size_t max_bytes = 67108864;
     int factor = 4;
     int warmup_iters = 2;
     int iters = 5;
-    float epsilon = 1e-5f;
+    float epsilon = 0.0f;
 };
 
 struct BenchResult {
     std::string algo;
+    DType dtype = DType::Float;
     std::size_t bytes = 0;
     std::size_t count = 0;
     double time_us = 0.0;

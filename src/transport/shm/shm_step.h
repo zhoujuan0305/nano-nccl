@@ -8,21 +8,29 @@
 namespace nano_nccl::transport::shm {
 
 // SHM FIFO 布局常量，对齐 NCCL Simple 协议：
-//   buff 切成 kSimpleFifoSteps 个 step，每个 step 容纳 kSimpleFifoStepElems 个 float；
+//   buff 切成 kSimpleFifoSteps 个 step，容量按 storage dtype 计算；
 //   一个 chunk 占 kSimpleFifoChunkSteps 个 step，按 kSimpleFifoSliceSteps 粒度收发。
 //   SlicePerChunk=1（kSimpleFifoChunkSteps == kSimpleFifoSliceSteps）消除空 slice 屏障。
 constexpr int kSimpleFifoSteps = 8;
 constexpr int kSimpleFifoSliceSteps = 4;
 constexpr int kSimpleFifoChunkSteps = 4;
+constexpr std::size_t kSimpleFifoVectorBytes = 16;
 // FIFO buffer 总字节由 CMake 通过 NANO_NCCL_FIFO_BUFF_BYTES 注入，默认 32MiB。
 #ifndef NANO_NCCL_FIFO_BUFF_BYTES
 #define NANO_NCCL_FIFO_BUFF_BYTES 33554432
 #endif
 constexpr std::size_t kSimpleFifoBuffBytes = NANO_NCCL_FIFO_BUFF_BYTES;
-constexpr std::size_t kSimpleFifoStepElems =
-    kSimpleFifoBuffBytes / kSimpleFifoSteps / sizeof(float);
+
+template <typename T>
+__host__ __device__ constexpr std::size_t simple_fifo_step_elems() {
+    return kSimpleFifoBuffBytes / kSimpleFifoSteps / sizeof(T);
+}
+
 // 512 是内存对齐 grain（字节），不是线程数，保持固定。
-constexpr std::size_t kSimpleFifoGrainElems = 512 / sizeof(float);
+template <typename T>
+__host__ __device__ constexpr std::size_t simple_fifo_grain_elems() {
+    return 512 / sizeof(T);
+}
 
 // step counter 在 mapped host memory 上，GPU 用 volatile u64 读写。
 // kind: 0=send head / recv credit, 1=send ready / recv tail。

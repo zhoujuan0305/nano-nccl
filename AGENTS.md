@@ -7,13 +7,13 @@ This project is a GPU collective communication library targeting NCCL-equivalent
 Current capabilities:
 
 - Single-node multi-GPU (tested with `CUDA_VISIBLE_DEVICES=0,1,2,3`; rank count configurable via CMake `NANO_NCCL_NRANKS`)
-- `float` dtype, `sum` reduce op, out-of-place
+- `float`, FP16, and BF16 dtypes with the `sum` reduce op, out-of-place; BF16 requires SM80+
 - Ring + Simple protocol, SHM FIFO transport
-- Performance parity with NCCL `Ring` + `Simple` + 4 channels baseline achieved (see Acceptance section below)
+- Performance parity with NCCL `Ring` + `Simple` + 4 channels baseline achieved for `float` (see Acceptance section below)
 
 Future expansion axes:
 
-- **dtype**: `float` → `half`/`double`/`int8`
+- **dtype**: `float`/FP16/BF16 → `double`/`int8`
 - **reduce op**: `sum` → `max`/`min`/`prod`
 - **rank count**: 4 → 2/8/16 (templated, host-side dispatch)
 - **collective**: `all_reduce` → `all_gather`/`reduce_scatter`/`broadcast`
@@ -138,6 +138,10 @@ Current status: **PASS** (2026-07-05, re-verified after refactoring)
 
 Candidate path: `ring_simple` (Ring + Simple protocol, SHM FIFO transport)
 
+This performance comparison covers `float` only. FP16 and BF16 are functionally
+supported by the current contract, but do not have a recorded NCCL performance
+comparison here.
+
 Same-round comparison (out-of-place busbw):
 
 | size(bytes) | NCCL busbw(GB/s) | candidate busbw(GB/s) | ratio |
@@ -172,7 +176,7 @@ Pass criterion: for each contract message size `s`, `candidate_busbw(s) >= nccl_
 
 ## Extension Guide
 
-- **New dtype**: implement pack/unpack trait in `include/nano_nccl/traits.h`, add template instantiation in `ring_simple.cu`
+- **New dtype**: implement pack/unpack trait in `include/nano_nccl/traits.h`, add template instantiation in `ring_simple.cu`; current `float`, FP16, and BF16 support `sum`, and BF16 requires SM80+
 - **New reduce op**: implement RedOp trait in `include/nano_nccl/traits.h`, add template instantiation in `ring_simple.cu`
 - **New rank count**: add `switch(nranks)` branch in host-side dispatch in `ring_simple.cu`, instantiate kernel for that `NRanks`
 - **New collective**: create subdirectory under `src/collective/`, implement collective interface

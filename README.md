@@ -75,7 +75,13 @@ NUMA topology is detected at runtime by reading `/sys/bus/pci/devices/*/numa_nod
 ```bash
 # Benchmark (perf + correctness)
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
-  --algo ring_simple -b 262144 -e 67108864 -f 4 -w 2 -n 5
+  --algo ring_simple --dtype float -b 262144 -e 67108864 -f 4 -w 2 -n 5
+
+# FP16 and BF16 correctness/performance runs (BF16 requires SM80+)
+CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
+  --algo ring_simple --dtype fp16 -b 262144 -e 67108864 -f 4 -w 2 -n 5
+CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
+  --algo ring_simple --dtype bf16 -b 262144 -e 67108864 -f 4 -w 2 -n 5
 
 # Correctness-only test
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_correctness
@@ -91,13 +97,17 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_smoke
 Currently supports only:
 
 - Single-node multi-GPU (tested with `CUDA_VISIBLE_DEVICES=0,1,2,3`; rank count is configurable via `NANO_NCCL_NRANKS`)
-- `float` dtype
+- `float`, FP16 (`fp16`), and BF16 (`bf16`) dtypes; BF16 requires SM80+
 - `sum` reduce op
 - out-of-place
 
+The recorded NCCL performance comparison above covers `float` only. FP16 and BF16
+are functionally supported by the current contract, but have no corresponding
+NCCL comparison in this document.
+
 Future expansion plans:
 
-- dtype: `half` / `double` / `int8`
+- dtype: `double` / `int8`
 - reduce op: `max` / `min` / `prod`
 - rank count: 2 / 8 / 16 (templated, host-side dispatch)
 - collective: `all_gather` / `reduce_scatter` / `broadcast`

@@ -43,11 +43,12 @@ __host__ __device__ inline int ring_edge_index(int src, int dst, int nranks) {
 }
 
 // channel-based 分片：把 count 按 channel 等分，再按 NRanks 切 chunk，
-// chunk 大小按 grain 对齐，保证 vec4 / vec16 访问对齐。
+// chunk 大小按 grain 对齐，保证向量访问对齐。
+template <typename T>
 __host__ __device__ inline void cbd_part(std::size_t count, int channel,
-                                          std::size_t* part_offset,
-                                          std::size_t* part_count,
-                                          std::size_t* chunk_count) {
+                                         std::size_t* part_offset,
+                                         std::size_t* part_count,
+                                         std::size_t* chunk_count) {
     std::size_t begin =
         count * static_cast<std::size_t>(channel) / kChannels;
     std::size_t end =
@@ -59,17 +60,18 @@ __host__ __device__ inline void cbd_part(std::size_t count, int channel,
         return;
     }
     *chunk_count = align_up(div_up(*part_count, kRanks),
-                            kSimpleFifoGrainElems);
+                            simple_fifo_grain_elems<T>());
 }
 
+template <typename T>
 __device__ inline std::size_t slice_elems(std::size_t nelem,
-                                           std::size_t step_elems) {
-    // slice 取 max(按 worker 数对齐, 按 step 容量对齐)，保证既不超 step 容量
-    // 也能让 nworkers 整除。
-    std::size_t by_count =
-        div_up(nelem, 16 * kSimpleFifoChunkSteps /
-                           kSimpleFifoSliceSteps) *
-        16;
+                                          std::size_t step_elems =
+                                              simple_fifo_step_elems<T>()) {
+    // slice 取 max(按向量访问对齐, 按 step 容量对齐)，保证既不超 step 容量。
+    constexpr std::size_t kVectorElems = kSimpleFifoVectorBytes / sizeof(T);
+    std::size_t by_count = div_up(nelem, kVectorElems * kSimpleFifoChunkSteps /
+                                             kSimpleFifoSliceSteps) *
+                           kVectorElems;
     std::size_t by_step = (step_elems * kSimpleFifoSliceSteps) / 32;
     return by_count > by_step ? by_count : by_step;
 }

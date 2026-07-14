@@ -46,40 +46,47 @@ std::string select_auto_algo(std::size_t /*bytes*/) {
     return "ring_simple";
 }
 
-void fill_inputs(std::vector<float> host_inputs[kRanks],
-                 std::vector<float>* expected, std::size_t count) {
+template <DType kDType>
+void fill_inputs(
+    std::vector<typename DTypeTraits<kDType>::type> host_inputs[kRanks],
+    std::vector<float>* expected, std::size_t count) {
+    using T = typename DTypeTraits<kDType>::type;
     expected->assign(count, 0.0f);
     for (int rank = 0; rank < kRanks; ++rank) {
         host_inputs[rank].resize(count);
         for (std::size_t i = 0; i < count; ++i) {
-            host_inputs[rank][i] = input_value(rank, i);
+            host_inputs[rank][i] =
+                DTypeTraits<kDType>::from_float(input_value(rank, i));
         }
     }
     // 期望值按 Sum redop 对所有 rank 求和，rank 数由 kRanks 决定。
     for (std::size_t i = 0; i < count; ++i) {
         float sum = 0.0f;
         for (int rank = 0; rank < kRanks; ++rank) {
-            sum += host_inputs[rank][i];
+            sum += DTypeTraits<kDType>::to_float(host_inputs[rank][i]);
         }
         (*expected)[i] = sum;
     }
 }
 
-int verify_outputs(DeviceBuffer<float>* outputs[kRanks],
-                   const std::vector<float>& expected, float epsilon,
-                   float* max_abs_error) {
-    std::vector<float> actual(expected.size());
+template <DType kDType>
+int verify_outputs(
+    DeviceBuffer<typename DTypeTraits<kDType>::type>* outputs[kRanks],
+    const std::vector<float>& expected, float epsilon, float* max_abs_error) {
+    using T = typename DTypeTraits<kDType>::type;
+    std::vector<T> actual(expected.size());
     int wrong = 0;
     *max_abs_error = 0.0f;
     bool debug_first_wrong =
         std::getenv("NANO_NCCL_DEBUG_FIRST_WRONG") != nullptr;
-    std::size_t bytes = expected.size() * sizeof(float);
+    std::size_t bytes = expected.size() * sizeof(T);
     for (int rank = 0; rank < kRanks; ++rank) {
         CUDA_CHECK_THROW(cudaSetDevice(rank));
         CUDA_CHECK_THROW(cudaMemcpy(actual.data(), outputs[rank]->get(), bytes,
                                     cudaMemcpyDeviceToHost));
         for (std::size_t i = 0; i < expected.size(); ++i) {
-            float err = std::fabs(actual[i] - expected[i]);
+            float actual_value = DTypeTraits<kDType>::to_float(actual[i]);
+            float err = std::fabs(actual_value - expected[i]);
             *max_abs_error = std::max(*max_abs_error, err);
             if (err > epsilon) {
                 ++wrong;
@@ -87,7 +94,7 @@ int verify_outputs(DeviceBuffer<float>* outputs[kRanks],
                     std::fprintf(stderr,
                                  "first wrong rank=%d index=%zu actual=%g "
                                  "expected=%g abs=%g\n",
-                                 rank, i, actual[i], expected[i], err);
+                                 rank, i, actual_value, expected[i], err);
                 }
                 break;
             }
@@ -113,6 +120,17 @@ void require_devices() {
     }
 }
 
+void require_bf16_devices() {
+    for (int rank = 0; rank < kRanks; ++rank) {
+        cudaDeviceProp props{};
+        CUDA_CHECK_THROW(cudaGetDeviceProperties(&props, rank));
+        if (props.major < 8) {
+            throw std::runtime_error(
+                "bf16 requires compute capability 8.0 or newer");
+        }
+    }
+}
+
 void enable_peer_access_or_throw() {
     for (int src = 0; src < kRanks; ++src) {
         CUDA_CHECK_THROW(cudaSetDevice(src));
@@ -135,6 +153,7 @@ void enable_peer_access_or_throw() {
     }
 }
 
+template <typename T, DType kDType>
 class AllReduceRunner {
 public:
     explicit AllReduceRunner(std::size_t max_count) : max_count_(max_count) {
@@ -142,8 +161,8 @@ public:
         enable_peer_access_or_throw();
 
         for (int rank = 0; rank < kRanks; ++rank) {
-            inputs_[rank] = new DeviceBuffer<float>(rank, max_count_);
-            outputs_[rank] = new DeviceBuffer<float>(rank, max_count_);
+            inputs_[rank] = new DeviceBuffer<T>(rank, max_count_);
+            outputs_[rank] = new DeviceBuffer<T>(rank, max_count_);
             streams_[rank] = new Stream(rank);
         }
 
@@ -154,8 +173,8 @@ public:
             std::size_t part_offset = 0;
             std::size_t part_count = 0;
             std::size_t chunk_count = 0;
-            transport::shm::cbd_part(max_count_, channel, &part_offset,
-                                     &part_count, &chunk_count);
+            transport::shm::cbd_part<T>(max_count_, channel, &part_offset,
+                                        &part_count, &chunk_count);
             simple_fifo_slot_elems_ =
                 std::max(simple_fifo_slot_elems_, chunk_count);
         }
@@ -176,8 +195,8 @@ public:
         }
     }
 
-    void load_inputs(std::vector<float> host_inputs[kRanks], std::size_t count) {
-        std::size_t bytes = count * sizeof(float);
+    void load_inputs(std::vector<T> host_inputs[kRanks], std::size_t count) {
+        std::size_t bytes = count * sizeof(T);
         for (int rank = 0; rank < kRanks; ++rank) {
             CUDA_CHECK_THROW(cudaSetDevice(rank));
             CUDA_CHECK_THROW(cudaMemcpy(inputs_[rank]->get(),
@@ -241,7 +260,8 @@ public:
 
     int verify(const std::vector<float>& expected, float epsilon,
                float* max_abs_error) {
-        return verify_outputs(outputs_, expected, epsilon, max_abs_error);
+        return verify_outputs<kDType>(outputs_, expected, epsilon,
+                                      max_abs_error);
     }
 
 private:
@@ -261,7 +281,7 @@ private:
                 if (simple_fifo_[channel][edge] == nullptr) {
                     int recv_gpu = ring_edge_recv_gpu(edge);
                     int numa_node = core::gpu_numa_node(recv_gpu);
-                    simple_fifo_[channel][edge] = new MappedBuffer(
+                    simple_fifo_[channel][edge] = new MappedBuffer<T>(
                         transport::shm::kSimpleFifoSteps *
                             simple_fifo_slot_elems_,
                         numa_node);
@@ -272,11 +292,11 @@ private:
 
     void launch_ring_simple(std::size_t count) {
         for (int rank = 0; rank < kRanks; ++rank) {
-            ShmFifoArgs<float> args{};
+            ShmFifoArgs<T> args{};
             args.rank = rank;
             args.count = count;
             args.slot_elems = simple_fifo_slot_elems_;
-            args.step_elems = transport::shm::kSimpleFifoStepElems;
+            args.step_elems = transport::shm::simple_fifo_step_elems<T>();
             args.input = inputs_[rank]->get();
             args.output = outputs_[rank]->get();
             args.steps = simple_fifo_steps_.device_ptr(rank);
@@ -299,47 +319,51 @@ private:
             }
 
             CUDA_CHECK_THROW(cudaSetDevice(rank));
-            ring_simple_kernel<kRanks, DTypeTraits<DType::Float>::type,
-                               RedOp::Sum>
+            ring_simple_kernel<kRanks, T, RedOp::Sum>
                 <<<kChannels, kBlockThreads, 0, streams_[rank]->get()>>>(args);
             CUDA_CHECK_THROW(cudaGetLastError());
         }
     }
 
     std::size_t max_count_ = 0;
-    DeviceBuffer<float>* inputs_[kRanks]{};
-    DeviceBuffer<float>* outputs_[kRanks]{};
+    DeviceBuffer<T>* inputs_[kRanks]{};
+    DeviceBuffer<T>* outputs_[kRanks]{};
     Stream* streams_[kRanks]{};
     MappedU64Array simple_fifo_steps_;
     MappedU64Array simple_fifo_base_step_;
-    MappedBuffer* simple_fifo_[kChannels][kRanks]{};
+    MappedBuffer<T>* simple_fifo_[kChannels][kRanks]{};
     std::size_t simple_fifo_slot_elems_ = 0;
 };
 
-}  // namespace
-
-int run_ring_simple_bench(const BenchConfig& config,
-                          std::vector<BenchResult>* results) {
+template <DType kDType>
+int run_ring_simple_bench_typed(const BenchConfig& config,
+                                std::vector<BenchResult>* results) {
+    using T = typename DTypeTraits<kDType>::type;
     try {
         auto sizes = make_sizes(config.min_bytes, config.max_bytes, config.factor);
         if (sizes.empty()) {
             std::fprintf(stderr, "invalid size range\n");
             return 2;
         }
-        std::size_t max_count = sizes.back() / sizeof(float);
-        AllReduceRunner runner(max_count);
-
         for (std::size_t bytes : sizes) {
-            if (bytes % sizeof(float) != 0) {
+            if (bytes % sizeof(T) != 0) {
                 std::fprintf(stderr,
-                             "size must be divisible by sizeof(float): %zu\n",
+                             "size must be divisible by dtype size: %zu\n",
                              bytes);
                 return 2;
             }
-            std::size_t count = bytes / sizeof(float);
-            std::vector<float> host_inputs[kRanks];
+        }
+        require_devices();
+        if constexpr (kDType == DType::BFloat16) {
+            require_bf16_devices();
+        }
+        AllReduceRunner<T, kDType> runner(sizes.back() / sizeof(T));
+
+        for (std::size_t bytes : sizes) {
+            std::size_t count = bytes / sizeof(T);
+            std::vector<T> host_inputs[kRanks];
             std::vector<float> expected;
-            fill_inputs(host_inputs, &expected, count);
+            fill_inputs<kDType>(host_inputs, &expected, count);
             runner.load_inputs(host_inputs, count);
             std::string algo =
                 (config.algo == "auto") ? select_auto_algo(bytes) : config.algo;
@@ -360,10 +384,14 @@ int run_ring_simple_bench(const BenchConfig& config,
             double time_us = total_us / static_cast<double>(config.iters);
 
             float max_abs_error = 0.0f;
-            int wrong = runner.verify(expected, config.epsilon, &max_abs_error);
+            float epsilon = config.epsilon <= 0.0f
+                                ? DTypeTraits<kDType>::kDefaultEpsilon
+                                : config.epsilon;
+            int wrong = runner.verify(expected, epsilon, &max_abs_error);
 
             BenchResult result;
             result.algo = algo;
+            result.dtype = kDType;
             result.bytes = bytes;
             result.count = count;
             result.time_us = time_us;
@@ -380,13 +408,34 @@ int run_ring_simple_bench(const BenchConfig& config,
     }
 }
 
+}  // namespace
+
+int run_ring_simple_bench(const BenchConfig& config,
+                          std::vector<BenchResult>* results) {
+    switch (config.dtype) {
+        case DType::Float:
+            return run_ring_simple_bench_typed<DType::Float>(config, results);
+        case DType::Float16:
+            return run_ring_simple_bench_typed<DType::Float16>(config, results);
+        case DType::BFloat16:
+            return run_ring_simple_bench_typed<DType::BFloat16>(config, results);
+    }
+    std::fprintf(stderr, "unsupported dtype\n");
+    return 2;
+}
+
 }  // namespace nano_nccl::collective::all_reduce
 
-// 显式实例化：NRanks/kRanks 由 CMake 配置，T=float、RedOp=Sum 为当前唯一特化。
+// 显式实例化：NRanks/kRanks 由 CMake 配置，dtype 和 RedOp 由 host dispatch 选择。
 // 必须在 kernels 命名空间内显式实例化。
 namespace nano_nccl::kernels {
 template __global__ void ring_simple_kernel<nano_nccl::kRanks, float, nano_nccl::RedOp::Sum>(
     nano_nccl::transport::shm::ShmFifoArgs<float>);
+template __global__ void ring_simple_kernel<nano_nccl::kRanks, __half, nano_nccl::RedOp::Sum>(
+    nano_nccl::transport::shm::ShmFifoArgs<__half>);
+template __global__ void ring_simple_kernel<nano_nccl::kRanks, __nv_bfloat16,
+                                            nano_nccl::RedOp::Sum>(
+    nano_nccl::transport::shm::ShmFifoArgs<__nv_bfloat16>);
 }  // namespace nano_nccl::kernels
 
 namespace nano_nccl {

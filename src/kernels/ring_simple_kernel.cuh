@@ -6,8 +6,28 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 #include <cuda_runtime.h>
+
+namespace nano_nccl {
+
+template <>
+struct RedOpTraits<RedOp::Sum, __half> {
+    static __device__ __forceinline__ __half apply(__half a, __half b) {
+        return __hadd(a, b);
+    }
+};
+
+template <>
+struct RedOpTraits<RedOp::Sum, __nv_bfloat16> {
+    static __device__ __forceinline__ __nv_bfloat16 apply(__nv_bfloat16 a,
+                                                          __nv_bfloat16 b) {
+        return __hadd(a, b);
+    }
+};
+
+}  // namespace nano_nccl
 
 namespace nano_nccl::kernels {
 
@@ -33,8 +53,8 @@ __device__ inline bool aligned_vec4(const float* a, const float* b,
     return (count % 4 == 0) && ((addr & 0xfULL) == 0);
 }
 
-__device__ inline void copy_worker(const float* src, float* dst,
-                                    std::size_t count, int nworkers) {
+__device__ inline void copy_float_worker(const float* src, float* dst,
+                                          std::size_t count, int nworkers) {
     if (threadIdx.x >= nworkers) return;
     if (aligned_vec4(src, dst, dst, count)) {
         std::size_t vec_count = count / 4;
@@ -50,8 +70,9 @@ __device__ inline void copy_worker(const float* src, float* dst,
     }
 }
 
-__device__ inline void copy_volatile_worker(const float* src, float* dst,
-                                             std::size_t count, int nworkers) {
+__device__ inline void copy_volatile_float_worker(const float* src, float* dst,
+                                                   std::size_t count,
+                                                   int nworkers) {
     if (threadIdx.x >= nworkers) return;
     if (aligned_vec4(src, dst, dst, count)) {
         std::size_t vec_count = count / 4;
@@ -67,29 +88,58 @@ __device__ inline void copy_volatile_worker(const float* src, float* dst,
     }
 }
 
+template <typename T>
+__device__ inline void copy_scalar_worker(const T* src, T* dst,
+                                          std::size_t count, int nworkers) {
+    if (threadIdx.x >= nworkers) return;
+    volatile const T* src_v = reinterpret_cast<volatile const T*>(src);
+    for (std::size_t i = threadIdx.x; i < count; i += nworkers) dst[i] = src_v[i];
+}
+
+template <typename T>
+__device__ inline void copy_worker(const T* src, T* dst, std::size_t count,
+                                   int nworkers) {
+    if constexpr (std::is_same_v<T, float>) {
+        copy_float_worker(src, dst, count, nworkers);
+    } else {
+        copy_scalar_worker(src, dst, count, nworkers);
+    }
+}
+
+template <typename T>
+__device__ inline void copy_volatile_worker(const T* src, T* dst,
+                                             std::size_t count, int nworkers) {
+    if constexpr (std::is_same_v<T, float>) {
+        copy_volatile_float_worker(src, dst, count, nworkers);
+    } else {
+        copy_scalar_worker(src, dst, count, nworkers);
+    }
+}
+
 // local + recv 规约后写 dst。reduce 通过 RedOpTraits，未来扩展 max/min 直接换 trait。
 template <int NRanks, typename T, RedOp kRedOp>
-__device__ inline void reduce_volatile_worker(const float* local,
-                                              const float* recv, float* dst,
-                                              std::size_t count,
+__device__ inline void reduce_volatile_worker(const T* local, const T* recv,
+                                              T* dst, std::size_t count,
                                               int nworkers) {
     if (threadIdx.x >= nworkers) return;
-    if (aligned_vec4(local, recv, dst, count)) {
-        std::size_t vec_count = count / 4;
-        const float4* local4 = reinterpret_cast<const float4*>(local);
-        float4* dst4 = reinterpret_cast<float4*>(dst);
-        for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
-            float4 a = local4[i];
-            float4 b = load_volatile_float4(recv + 4 * i);
-            dst4[i] = make_float4(
-                RedOpTraits<kRedOp, T>::apply(a.x, b.x),
-                RedOpTraits<kRedOp, T>::apply(a.y, b.y),
-                RedOpTraits<kRedOp, T>::apply(a.z, b.z),
-                RedOpTraits<kRedOp, T>::apply(a.w, b.w));
+    if constexpr (std::is_same_v<T, float>) {
+        if (aligned_vec4(local, recv, dst, count)) {
+            std::size_t vec_count = count / 4;
+            const float4* local4 = reinterpret_cast<const float4*>(local);
+            float4* dst4 = reinterpret_cast<float4*>(dst);
+            for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
+                float4 a = local4[i];
+                float4 b = load_volatile_float4(recv + 4 * i);
+                dst4[i] = make_float4(
+                    RedOpTraits<kRedOp, T>::apply(a.x, b.x),
+                    RedOpTraits<kRedOp, T>::apply(a.y, b.y),
+                    RedOpTraits<kRedOp, T>::apply(a.z, b.z),
+                    RedOpTraits<kRedOp, T>::apply(a.w, b.w));
+            }
+            return;
         }
-        return;
     }
-    volatile const float* recv_v = reinterpret_cast<volatile const float*>(recv);
+    volatile const T* recv_v = reinterpret_cast<volatile const T*>(recv);
     for (std::size_t i = threadIdx.x; i < count; i += nworkers) {
         dst[i] = RedOpTraits<kRedOp, T>::apply(local[i], recv_v[i]);
     }
@@ -97,23 +147,25 @@ __device__ inline void reduce_volatile_worker(const float* local,
 
 template <int NRanks, typename T, RedOp kRedOp>
 __device__ inline void copy_broadcast_volatile_worker(
-    const float* src, float* dst0, float* dst1, std::size_t count,
+    const T* src, T* dst0, T* dst1, std::size_t count,
     int nworkers) {
     if (threadIdx.x >= nworkers) return;
-    if (aligned_vec4(src, dst0, dst1, count)) {
-        std::size_t vec_count = count / 4;
-        float4* dst04 = reinterpret_cast<float4*>(dst0);
-        float4* dst14 = reinterpret_cast<float4*>(dst1);
-        for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
-            float4 v = load_volatile_float4(src + 4 * i);
-            dst04[i] = v;
-            dst14[i] = v;
+    if constexpr (std::is_same_v<T, float>) {
+        if (aligned_vec4(src, dst0, dst1, count)) {
+            std::size_t vec_count = count / 4;
+            float4* dst04 = reinterpret_cast<float4*>(dst0);
+            float4* dst14 = reinterpret_cast<float4*>(dst1);
+            for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
+                float4 v = load_volatile_float4(src + 4 * i);
+                dst04[i] = v;
+                dst14[i] = v;
+            }
+            return;
         }
-        return;
     }
-    volatile const float* src_v = reinterpret_cast<volatile const float*>(src);
+    volatile const T* src_v = reinterpret_cast<volatile const T*>(src);
     for (std::size_t i = threadIdx.x; i < count; i += nworkers) {
-        float v = src_v[i];
+        T v = src_v[i];
         dst0[i] = v;
         dst1[i] = v;
     }
@@ -121,31 +173,33 @@ __device__ inline void copy_broadcast_volatile_worker(
 
 template <int NRanks, typename T, RedOp kRedOp>
 __device__ inline void reduce_broadcast_volatile_worker(
-    const float* local, const float* recv, float* dst0, float* dst1,
+    const T* local, const T* recv, T* dst0, T* dst1,
     std::size_t count, int nworkers) {
     if (threadIdx.x >= nworkers) return;
-    if (aligned_vec4(local, recv, dst0, count) &&
-        aligned_vec4(local, recv, dst1, count)) {
-        std::size_t vec_count = count / 4;
-        const float4* local4 = reinterpret_cast<const float4*>(local);
-        float4* dst04 = reinterpret_cast<float4*>(dst0);
-        float4* dst14 = reinterpret_cast<float4*>(dst1);
-        for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
-            float4 a = local4[i];
-            float4 b = load_volatile_float4(recv + 4 * i);
-            float4 v = make_float4(
-                RedOpTraits<kRedOp, T>::apply(a.x, b.x),
-                RedOpTraits<kRedOp, T>::apply(a.y, b.y),
-                RedOpTraits<kRedOp, T>::apply(a.z, b.z),
-                RedOpTraits<kRedOp, T>::apply(a.w, b.w));
-            dst04[i] = v;
-            dst14[i] = v;
+    if constexpr (std::is_same_v<T, float>) {
+        if (aligned_vec4(local, recv, dst0, count) &&
+            aligned_vec4(local, recv, dst1, count)) {
+            std::size_t vec_count = count / 4;
+            const float4* local4 = reinterpret_cast<const float4*>(local);
+            float4* dst04 = reinterpret_cast<float4*>(dst0);
+            float4* dst14 = reinterpret_cast<float4*>(dst1);
+            for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
+                float4 a = local4[i];
+                float4 b = load_volatile_float4(recv + 4 * i);
+                float4 v = make_float4(
+                    RedOpTraits<kRedOp, T>::apply(a.x, b.x),
+                    RedOpTraits<kRedOp, T>::apply(a.y, b.y),
+                    RedOpTraits<kRedOp, T>::apply(a.z, b.z),
+                    RedOpTraits<kRedOp, T>::apply(a.w, b.w));
+                dst04[i] = v;
+                dst14[i] = v;
+            }
+            return;
         }
-        return;
     }
-    volatile const float* recv_v = reinterpret_cast<volatile const float*>(recv);
+    volatile const T* recv_v = reinterpret_cast<volatile const T*>(recv);
     for (std::size_t i = threadIdx.x; i < count; i += nworkers) {
-        float v = RedOpTraits<kRedOp, T>::apply(local[i], recv_v[i]);
+        T v = RedOpTraits<kRedOp, T>::apply(local[i], recv_v[i]);
         dst0[i] = v;
         dst1[i] = v;
     }
@@ -213,10 +267,11 @@ __device__ inline void post_recv_credit(
 
 template <int NRanks, typename T, RedOp kRedOp>
 __device__ inline void direct_send(
-    transport::shm::ShmFifoArgs<T> args, int channel, const float* src,
+    transport::shm::ShmFifoArgs<T> args, int channel, const T* src,
     std::size_t nelem, std::uint64_t* send_step,
     std::uint64_t* send_head_cache, int nworkers) {
-    std::size_t slice_size = transport::shm::slice_elems(nelem, args.step_elems);
+    std::size_t slice_size =
+        transport::shm::slice_elems<T>(nelem, args.step_elems);
     std::size_t slice_offset = 0;
     for (int slice = 0;
          slice < transport::shm::kSimpleFifoChunkSteps / transport::shm::kSimpleFifoSliceSteps;
@@ -227,7 +282,7 @@ __device__ inline void direct_send(
                 : 0;
         wait_send_credit<NRanks, T>(args, channel, *send_step, send_head_cache);
         __syncthreads();
-        float* dst = args.send_fifo[channel] +
+        T* dst = args.send_fifo[channel] +
                      ((*send_step % transport::shm::kSimpleFifoSteps) *
                       args.slot_elems);
         if (work != 0) {
@@ -242,11 +297,12 @@ __device__ inline void direct_send(
 
 template <int NRanks, typename T, RedOp kRedOp>
 __device__ inline void recv_reduce_send(
-    transport::shm::ShmFifoArgs<T> args, int channel, const float* local,
+    transport::shm::ShmFifoArgs<T> args, int channel, const T* local,
     std::size_t nelem, std::uint64_t* recv_step, std::uint64_t* send_step,
     std::uint64_t* recv_tail_cache, std::uint64_t* send_head_cache,
     int nworkers) {
-    std::size_t slice_size = transport::shm::slice_elems(nelem, args.step_elems);
+    std::size_t slice_size =
+        transport::shm::slice_elems<T>(nelem, args.step_elems);
     std::size_t slice_offset = 0;
     for (int slice = 0;
          slice < transport::shm::kSimpleFifoChunkSteps / transport::shm::kSimpleFifoSliceSteps;
@@ -258,10 +314,10 @@ __device__ inline void recv_reduce_send(
         wait_recv_ready<NRanks, T>(args, channel, *recv_step, recv_tail_cache);
         wait_send_credit<NRanks, T>(args, channel, *send_step, send_head_cache);
         __syncthreads();
-        const float* recv = args.recv_fifo[channel] +
+        const T* recv = args.recv_fifo[channel] +
                             ((*recv_step % transport::shm::kSimpleFifoSteps) *
                              args.slot_elems);
-        float* dst = args.send_fifo[channel] +
+        T* dst = args.send_fifo[channel] +
                      ((*send_step % transport::shm::kSimpleFifoSteps) *
                       args.slot_elems);
         if (work != 0) {
@@ -279,11 +335,12 @@ __device__ inline void recv_reduce_send(
 
 template <int NRanks, typename T, RedOp kRedOp>
 __device__ inline void recv_reduce_copy_send(
-    transport::shm::ShmFifoArgs<T> args, int channel, const float* local,
-    float* out, std::size_t nelem, std::uint64_t* recv_step,
+    transport::shm::ShmFifoArgs<T> args, int channel, const T* local,
+    T* out, std::size_t nelem, std::uint64_t* recv_step,
     std::uint64_t* send_step, std::uint64_t* recv_tail_cache,
     std::uint64_t* send_head_cache, int nworkers) {
-    std::size_t slice_size = transport::shm::slice_elems(nelem, args.step_elems);
+    std::size_t slice_size =
+        transport::shm::slice_elems<T>(nelem, args.step_elems);
     std::size_t slice_offset = 0;
     for (int slice = 0;
          slice < transport::shm::kSimpleFifoChunkSteps / transport::shm::kSimpleFifoSliceSteps;
@@ -295,10 +352,10 @@ __device__ inline void recv_reduce_copy_send(
         wait_recv_ready<NRanks, T>(args, channel, *recv_step, recv_tail_cache);
         wait_send_credit<NRanks, T>(args, channel, *send_step, send_head_cache);
         __syncthreads();
-        const float* recv = args.recv_fifo[channel] +
+        const T* recv = args.recv_fifo[channel] +
                             ((*recv_step % transport::shm::kSimpleFifoSteps) *
                              args.slot_elems);
-        float* dst = args.send_fifo[channel] +
+        T* dst = args.send_fifo[channel] +
                      ((*send_step % transport::shm::kSimpleFifoSteps) *
                       args.slot_elems);
         if (work != 0) {
@@ -317,11 +374,12 @@ __device__ inline void recv_reduce_copy_send(
 
 template <int NRanks, typename T, RedOp kRedOp>
 __device__ inline void recv_copy_send(
-    transport::shm::ShmFifoArgs<T> args, int channel, float* out,
+    transport::shm::ShmFifoArgs<T> args, int channel, T* out,
     std::size_t nelem, std::uint64_t* recv_step, std::uint64_t* send_step,
     std::uint64_t* recv_tail_cache, std::uint64_t* send_head_cache,
     int nworkers) {
-    std::size_t slice_size = transport::shm::slice_elems(nelem, args.step_elems);
+    std::size_t slice_size =
+        transport::shm::slice_elems<T>(nelem, args.step_elems);
     std::size_t slice_offset = 0;
     for (int slice = 0;
          slice < transport::shm::kSimpleFifoChunkSteps / transport::shm::kSimpleFifoSliceSteps;
@@ -333,10 +391,10 @@ __device__ inline void recv_copy_send(
         wait_recv_ready<NRanks, T>(args, channel, *recv_step, recv_tail_cache);
         wait_send_credit<NRanks, T>(args, channel, *send_step, send_head_cache);
         __syncthreads();
-        const float* recv = args.recv_fifo[channel] +
+        const T* recv = args.recv_fifo[channel] +
                             ((*recv_step % transport::shm::kSimpleFifoSteps) *
                              args.slot_elems);
-        float* dst = args.send_fifo[channel] +
+        T* dst = args.send_fifo[channel] +
                      ((*send_step % transport::shm::kSimpleFifoSteps) *
                       args.slot_elems);
         if (work != 0) {
@@ -354,10 +412,11 @@ __device__ inline void recv_copy_send(
 
 template <int NRanks, typename T, RedOp kRedOp>
 __device__ inline void direct_recv(
-    transport::shm::ShmFifoArgs<T> args, int channel, float* out,
+    transport::shm::ShmFifoArgs<T> args, int channel, T* out,
     std::size_t nelem, std::uint64_t* recv_step,
     std::uint64_t* recv_tail_cache, int nworkers) {
-    std::size_t slice_size = transport::shm::slice_elems(nelem, args.step_elems);
+    std::size_t slice_size =
+        transport::shm::slice_elems<T>(nelem, args.step_elems);
     std::size_t slice_offset = 0;
     for (int slice = 0;
          slice < transport::shm::kSimpleFifoChunkSteps / transport::shm::kSimpleFifoSliceSteps;
@@ -368,7 +427,7 @@ __device__ inline void direct_recv(
                 : 0;
         wait_recv_ready<NRanks, T>(args, channel, *recv_step, recv_tail_cache);
         __syncthreads();
-        const float* recv = args.recv_fifo[channel] +
+        const T* recv = args.recv_fifo[channel] +
                             ((*recv_step % transport::shm::kSimpleFifoSteps) *
                              args.slot_elems);
         if (work != 0) {
@@ -396,8 +455,8 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
     std::size_t part_offset = 0;
     std::size_t part_count = 0;
     std::size_t chunk_count = 0;
-    transport::shm::cbd_part(args.count, channel, &part_offset, &part_count,
-                             &chunk_count);
+    transport::shm::cbd_part<T>(args.count, channel, &part_offset, &part_count,
+                                &chunk_count);
     if (part_count == 0 || chunk_count == 0) {
         return;
     }
@@ -419,7 +478,8 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
         std::size_t loop_chunk = chunk_count;
         if (rem_count < NRanks * loop_chunk) {
             loop_chunk = transport::shm::align_up(
-                transport::shm::div_up(rem_count, NRanks), 16 / sizeof(float));
+                transport::shm::div_up(rem_count, NRanks),
+                transport::shm::kSimpleFifoVectorBytes / sizeof(T));
         }
         std::size_t loop_count = NRanks * loop_chunk;
 

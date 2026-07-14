@@ -1,8 +1,10 @@
 #include "core/buffer.h"
+#include "nano_nccl/traits.h"
 
 namespace nano_nccl::core {
 
-MappedBuffer::MappedBuffer(std::size_t count, int numa_node) {
+template <typename T>
+MappedBuffer<T>::MappedBuffer(std::size_t count, int numa_node) {
     reset(count, numa_node);
 }
 
@@ -10,14 +12,15 @@ RegisteredMappedBuffer::RegisteredMappedBuffer(std::size_t count) {
     reset(count);
 }
 
-void MappedBuffer::reset(std::size_t count, int numa_node) {
+template <typename T>
+void MappedBuffer<T>::reset(std::size_t count, int numa_node) {
     release();
     count_ = count;
     // 先按 receiver NUMA 绑定分配页，再恢复默认策略，避免污染后续分配。
     if (numa_node >= 0 && numa_available_()) {
         numa_set_prefer(numa_node);
     }
-    CUDA_CHECK_THROW(cudaHostAlloc(&host_ptr_, count_ * sizeof(float),
+    CUDA_CHECK_THROW(cudaHostAlloc(&host_ptr_, count_ * sizeof(T),
                                    cudaHostAllocMapped |
                                        cudaHostAllocPortable));
     if (numa_node >= 0 && numa_available_()) {
@@ -30,7 +33,8 @@ void MappedBuffer::reset(std::size_t count, int numa_node) {
     }
 }
 
-void MappedBuffer::release() {
+template <typename T>
+void MappedBuffer<T>::release() {
     if (host_ptr_ != nullptr) {
         cudaFreeHost(host_ptr_);
         host_ptr_ = nullptr;
@@ -40,6 +44,15 @@ void MappedBuffer::release() {
     }
     count_ = 0;
 }
+
+template <typename T>
+T* MappedBuffer<T>::device_ptr(int dev) const {
+    return device_ptrs_[dev];
+}
+
+template class MappedBuffer<float>;
+template class MappedBuffer<__half>;
+template class MappedBuffer<__nv_bfloat16>;
 
 void RegisteredMappedBuffer::reset(std::size_t count) {
     release();

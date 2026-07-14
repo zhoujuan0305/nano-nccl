@@ -104,6 +104,7 @@ private:
 
 // 跨 kRanks GPU 映射的 host-pinned buffer；GPU 经 PCIe 直接读写，无 proxy。
 // 按 receiver NUMA 节点分配，避免跨 NUMA 带宽损失。
+template <typename T = float>
 class MappedBuffer {
 public:
     MappedBuffer() = default;
@@ -116,12 +117,12 @@ public:
     void reset(std::size_t count, int numa_node = -1);
     void release();
 
-    float* device_ptr(int dev) const { return device_ptrs_[dev]; }
+    T* device_ptr(int dev) const;
 
 private:
     std::size_t count_ = 0;
-    float* host_ptr_ = nullptr;
-    float* device_ptrs_[kRanks]{};
+    T* host_ptr_ = nullptr;
+    T* device_ptrs_[kRanks]{};
 };
 
 // 基于 /dev/shm + cudaHostRegister 的映射 buffer；mapped flag 路径使用。

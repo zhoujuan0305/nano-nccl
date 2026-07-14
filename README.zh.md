@@ -75,7 +75,13 @@ NUMA 拓扑在运行时从 `/sys/bus/pci/devices/*/numa_node` 自动检测，换
 ```bash
 # Benchmark（性能 + 正确性）
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
-  --algo ring_simple -b 262144 -e 67108864 -f 4 -w 2 -n 5
+  --algo ring_simple --dtype float -b 262144 -e 67108864 -f 4 -w 2 -n 5
+
+# FP16 和 BF16 的正确性/性能运行（BF16 需要 SM80+）
+CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
+  --algo ring_simple --dtype fp16 -b 262144 -e 67108864 -f 4 -w 2 -n 5
+CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
+  --algo ring_simple --dtype bf16 -b 262144 -e 67108864 -f 4 -w 2 -n 5
 
 # 纯正确性测试
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_correctness
@@ -91,13 +97,16 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_smoke
 当前仅支持：
 
 - 单机多 GPU（已验证 `CUDA_VISIBLE_DEVICES=0,1,2,3`；rank 数可通过 `NANO_NCCL_NRANKS` 配置）
-- `float` 类型
+- `float`、FP16（`fp16`）和 BF16（`bf16`）类型；BF16 需要 SM80+
 - `sum` 规约操作
 - out-of-place
 
+上方记录的 NCCL 性能对比仅覆盖 `float`。FP16 和 BF16 已在当前合同范围内提供功能支持，
+但本文档未提供对应的 NCCL 性能对比。
+
 未来计划扩展：
 
-- dtype：`half` / `double` / `int8`
+- dtype：`double` / `int8`
 - reduce op：`max` / `min` / `prod`
 - rank 数：2 / 8 / 16（模板参数化，host 侧分发）
 - collective：`all_gather` / `reduce_scatter` / `broadcast`
