@@ -8,13 +8,13 @@
 
 ## 性能
 
-与 NCCL 同轮对比（out-of-place busbw，`-w 2 -n 5`）。nano-nccl 使用 `--transport auto`，解析为 P2P/SHM 混合的 ring-edge 路径。
+与 NCCL 同轮对比（out-of-place busbw，`-w 5 -n 20`）。nano-nccl 使用 `--transport auto`，解析为 P2P/SHM 混合的 ring-edge 路径。
 
 | dtype | 256 KiB | 1 MiB | 4 MiB | 16 MiB | 64 MiB | geomean |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| float | 1.300 | 1.225 | 1.039 | 1.013 | 1.021 | 1.114 |
-| fp16 | 1.334 | 1.250 | 1.331 | 1.322 | 1.150 | 1.276 |
-| bf16 | 1.303 | 1.236 | 1.062 | 1.018 | 1.022 | 1.122 |
+| float | 1.335 | 1.241 | 1.038 | 1.007 | 1.019 | 1.120 |
+| fp16 | 1.388 | 1.207 | 1.038 | 1.009 | 1.017 | 1.123 |
+| bf16 | 1.421 | 1.242 | 1.038 | 1.015 | 1.018 | 1.136 |
 
 表中数值为 `nano-nccl busbw / NCCL busbw`；全部 15 个测点均正确（`#wrong=0`），并且不低于 NCCL 基线。
 
@@ -68,15 +68,15 @@ NUMA 拓扑在运行时从 `/sys/bus/pci/devices/*/numa_node` 自动检测，换
 # Benchmark（性能 + 正确性）
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
   --algo ring_simple --dtype float --transport auto \
-  -b 262144 -e 67108864 -f 4 -w 2 -n 5
+  -b 262144 -e 67108864 -f 4 -w 5 -n 20
 
 # FP16 和 BF16 的正确性/性能运行（BF16 需要 SM80+）
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
   --algo ring_simple --dtype fp16 --transport auto \
-  -b 262144 -e 67108864 -f 4 -w 2 -n 5
+  -b 262144 -e 67108864 -f 4 -w 5 -n 20
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
   --algo ring_simple --dtype bf16 --transport auto \
-  -b 262144 -e 67108864 -f 4 -w 2 -n 5
+  -b 262144 -e 67108864 -f 4 -w 5 -n 20
 
 # 纯正确性测试
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_correctness

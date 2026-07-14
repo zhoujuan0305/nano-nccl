@@ -153,6 +153,8 @@ Current status: **PASS** (2026-07-14)
 
 Candidate path: `ring_simple` (Ring + Simple protocol, `--transport auto`)
 
+Use `-w 5 -n 20` for all future performance measurements and NCCL comparisons.
+
 Same-round comparison (out-of-place busbw) on 4× NVIDIA RTX A6000 (Ampere
 sm_86), CUDA 12.8. `auto` resolved to a mixed P2P/SHM edge plan. The values
 below are geomean `candidate_busbw / nccl_busbw`; all 15 measured points had
@@ -160,9 +162,9 @@ below are geomean `candidate_busbw / nccl_busbw`; all 15 measured points had
 
 | dtype | 256 KiB | 1 MiB | 4 MiB | 16 MiB | 64 MiB | geomean |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| float | 1.300 | 1.225 | 1.039 | 1.013 | 1.021 | 1.114 |
-| FP16 | 1.334 | 1.250 | 1.331 | 1.322 | 1.150 | 1.276 |
-| BF16 | 1.303 | 1.236 | 1.062 | 1.018 | 1.022 | 1.122 |
+| float | 1.335 | 1.241 | 1.038 | 1.007 | 1.019 | 1.120 |
+| FP16 | 1.388 | 1.207 | 1.038 | 1.009 | 1.017 | 1.123 |
+| BF16 | 1.421 | 1.242 | 1.038 | 1.015 | 1.018 | 1.136 |
 
 Re-verification commands:
 
@@ -170,7 +172,7 @@ Re-verification commands:
 # Candidate
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
   --algo ring_simple --transport auto --dtype <float|fp16|bf16> \
-  -b 262144 -e 67108864 -f 4 -w 2 -n 5
+  -b 262144 -e 67108864 -f 4 -w 5 -n 20
 
 # NCCL baseline (same-round, requires nccl-tests installed and NCCL library path)
 cd <nccl-tests-build-dir>
@@ -178,7 +180,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 \
 LD_LIBRARY_PATH=<nccl-lib-path> \
 NCCL_ALGO=Ring NCCL_PROTO=Simple \
 NCCL_MIN_NCHANNELS=4 NCCL_MAX_NCHANNELS=4 NCCL_BUFFSIZE=33554432 \
-./build/all_reduce_perf -b 262144 -e 67108864 -f 4 -g 4 -w 2 -n 5 -d <float|half|bfloat16>
+./build/all_reduce_perf -b 262144 -e 67108864 -f 4 -g 4 -w 5 -n 20 -d <float|half|bfloat16>
 ```
 
 Pass criterion: for each contract message size `s`, `candidate_busbw(s) >= nccl_busbw(s)`.

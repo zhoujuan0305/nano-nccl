@@ -8,13 +8,13 @@ A single-node multi-GPU All Reduce library targeting NCCL `Ring` + `Simple` + 4 
 
 ## Performance
 
-Same-round comparison against NCCL (out-of-place busbw, `-w 2 -n 5`). nano-nccl used `--transport auto`, which resolved to a mixed P2P/SHM ring-edge plan.
+Same-round comparison against NCCL (out-of-place busbw, `-w 5 -n 20`). nano-nccl used `--transport auto`, which resolved to a mixed P2P/SHM ring-edge plan.
 
 | dtype | 256 KiB | 1 MiB | 4 MiB | 16 MiB | 64 MiB | geomean |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| float | 1.300 | 1.225 | 1.039 | 1.013 | 1.021 | 1.114 |
-| fp16 | 1.334 | 1.250 | 1.331 | 1.322 | 1.150 | 1.276 |
-| bf16 | 1.303 | 1.236 | 1.062 | 1.018 | 1.022 | 1.122 |
+| float | 1.335 | 1.241 | 1.038 | 1.007 | 1.019 | 1.120 |
+| fp16 | 1.388 | 1.207 | 1.038 | 1.009 | 1.017 | 1.123 |
+| bf16 | 1.421 | 1.242 | 1.038 | 1.015 | 1.018 | 1.136 |
 
 Each cell is `nano-nccl busbw / NCCL busbw`; all 15 measured points were correct (`#wrong=0`) and at or above the NCCL baseline.
 
@@ -68,15 +68,15 @@ NUMA topology is detected at runtime by reading `/sys/bus/pci/devices/*/numa_nod
 # Benchmark (perf + correctness)
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
   --algo ring_simple --dtype float --transport auto \
-  -b 262144 -e 67108864 -f 4 -w 2 -n 5
+  -b 262144 -e 67108864 -f 4 -w 5 -n 20
 
 # FP16 and BF16 correctness/performance runs (BF16 requires SM80+)
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
   --algo ring_simple --dtype fp16 --transport auto \
-  -b 262144 -e 67108864 -f 4 -w 2 -n 5
+  -b 262144 -e 67108864 -f 4 -w 5 -n 20
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
   --algo ring_simple --dtype bf16 --transport auto \
-  -b 262144 -e 67108864 -f 4 -w 2 -n 5
+  -b 262144 -e 67108864 -f 4 -w 5 -n 20
 
 # Correctness-only test
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_correctness
