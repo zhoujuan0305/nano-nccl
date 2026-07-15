@@ -85,6 +85,55 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_correctness
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_smoke
 ```
 
+## 公共 C++ API
+
+`nano_nccl/communicator.h` 暴露 move-only 的 `Communicator`，用于一个进程管理
+全部已配置的本机 GPU。device buffer 与 CUDA stream 由调用者持有。三个数组都必须
+对每个 device 各有一个元素，且顺序与 `CommunicatorConfig::devices` 一致。
+
+```cpp
+#include "nano_nccl/communicator.h"
+
+#include <memory>
+#include <vector>
+
+std::vector<int> devices{0, 1, 2, 3};
+nano_nccl::CommunicatorConfig config{devices};
+std::unique_ptr<nano_nccl::Communicator> communicator =
+    nano_nccl::create_communicator(config);
+
+std::vector<const void*> send_buffers(devices.size());
+std::vector<void*> recv_buffers(devices.size());
+std::vector<cudaStream_t> streams(devices.size());
+
+// 在每张 device 上各分配一对 out-of-place 的 send/receive buffer 和一个 stream。
+// send_buffers[i]、recv_buffers[i]、streams[i] 必须属于 devices[i]。
+// ... cudaSetDevice(devices[i]), cudaMalloc, cudaStreamCreateWithFlags ...
+
+constexpr std::size_t count = 1 << 20;  // 每个本地 rank 的元素数。
+nano_nccl::CollectiveArgs args{
+    send_buffers,
+    recv_buffers,
+    streams,
+    count,
+    nano_nccl::DType::Float,
+    nano_nccl::RedOp::Sum,
+};
+
+communicator->all_reduce(args);  // 仅入队，不会同步。
+
+for (std::size_t i = 0; i < devices.size(); ++i) {
+    cudaSetDevice(devices[i]);
+    cudaStreamSynchronize(streams[i]);
+}
+communicator->check_async_error();
+```
+
+当前单机 adapter 要求 `devices` 正好是可见 device 顺序
+`{0, ..., NANO_NCCL_NRANKS - 1}`。`all_reduce` 为 out-of-place，支持 `float`、
+FP16、BF16 和 `sum`。`reduce_scatter` 与 `all_gather` 已在公共 interface 中暴露，
+但当前会抛出 unsupported-operation 错误。MPI bootstrap 和 socket transport 尚未实现。
+
 ### 通信路径选择
 
 `--transport` 接受 `auto`、`shm` 和 `p2p`。

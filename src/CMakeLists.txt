@@ -5,6 +5,7 @@ add_library(nano_nccl STATIC
     transport/p2p/p2p_step_counters.cu
     transport/p2p/p2p_topology.cu
     transport/shm/shm_fifo.cu
+    collective/all_reduce/communicator.cu
     collective/all_reduce/ring_simple.cu
 )
 

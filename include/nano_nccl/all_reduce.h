@@ -1,6 +1,6 @@
 #pragma once
 
-#include "nano_nccl/types.h"
+#include "nano_nccl/communicator.h"
 
 #include <vector>
 

@@ -85,6 +85,57 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_correctness
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_smoke
 ```
 
+## Public C++ API
+
+`nano_nccl/communicator.h` exposes a move-only `Communicator` for one process
+that owns all configured local GPUs. The caller owns the device buffers and
+CUDA streams. Buffer and stream arrays must have one entry per device, in the
+same order as `CommunicatorConfig::devices`.
+
+```cpp
+#include "nano_nccl/communicator.h"
+
+#include <memory>
+#include <vector>
+
+std::vector<int> devices{0, 1, 2, 3};
+nano_nccl::CommunicatorConfig config{devices};
+std::unique_ptr<nano_nccl::Communicator> communicator =
+    nano_nccl::create_communicator(config);
+
+std::vector<const void*> send_buffers(devices.size());
+std::vector<void*> recv_buffers(devices.size());
+std::vector<cudaStream_t> streams(devices.size());
+
+// Allocate one out-of-place send/receive pair and one stream on each device.
+// send_buffers[i], recv_buffers[i], and streams[i] must belong to devices[i].
+// ... cudaSetDevice(devices[i]), cudaMalloc, cudaStreamCreateWithFlags ...
+
+constexpr std::size_t count = 1 << 20;  // Elements per local rank.
+nano_nccl::CollectiveArgs args{
+    send_buffers,
+    recv_buffers,
+    streams,
+    count,
+    nano_nccl::DType::Float,
+    nano_nccl::RedOp::Sum,
+};
+
+communicator->all_reduce(args);  // Enqueues work; it does not synchronize.
+
+for (std::size_t i = 0; i < devices.size(); ++i) {
+    cudaSetDevice(devices[i]);
+    cudaStreamSynchronize(streams[i]);
+}
+communicator->check_async_error();
+```
+
+The current single-host adapter requires `devices` to be the visible-device
+sequence `{0, ..., NANO_NCCL_NRANKS - 1}`. `all_reduce` is out-of-place and
+supports `float`, FP16, BF16, and `sum`. `reduce_scatter` and `all_gather` are
+present in the public interface but currently throw an unsupported-operation
+error. MPI bootstrap and socket transport are not implemented yet.
+
 ### Transport selection
 
 `--transport` accepts `auto`, `shm`, and `p2p`.
