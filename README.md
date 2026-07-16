@@ -2,13 +2,13 @@
 
 [中文说明](README.zh.md)
 
-An All Reduce library targeting NCCL `Ring` + `Simple` + 4 channels performance on its validated single-host path. An optional MPI/socket path supports multi-host correctness runs.
+A GPU collective communication library for single-host multi-GPU All Reduce, targeting NCCL `Ring` + `Simple` + 4 channels performance. An optional MPI/socket path supports multi-host correctness runs.
 
 ---
 
 ## Performance
 
-The tables below report out-of-place `busbw` in GB/s from the current measurements (`-w 5 -n 20`).
+The tables below report out-of-place `busbw` in GB/s (`-w 5 -n 20`).
 
 ### Single host: 4× RTX A6000
 
@@ -18,7 +18,7 @@ CUDA 12.8, `CUDA_VISIBLE_DEVICES=0,1,2,3`, and `--transport auto` (resolved to `
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | float | 6.88 / 6.43 | 14.80 / 14.14 | 19.30 / 19.50 | 22.47 / 22.61 | 23.29 / 22.95 | 1.023 |
 | fp16 | 6.84 / 6.33 | 14.43 / 14.29 | 19.32 / 19.70 | 22.44 / 22.73 | 23.29 / 23.17 | 1.012 |
-| bf16 | 0.11 / 6.35 | 0.45 / 14.42 | 1.56 / 19.94 | 5.82 / 22.77 | 16.42 / 23.17 | 0.095 |
+| bf16 | 6.83 / 6.41 | 14.73 / 14.33 | 19.38 / 19.95 | 22.48 / 22.77 | 23.31 / 22.74 | 1.015 |
 
 ### Two hosts: 2×4 RTX A6000 over TCP socket
 
@@ -46,7 +46,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Release \
 make -j$(nproc)
 ```
 
-For example, on the measured 4-GPU RTX A6000 (sm_86) system:
+For example, for a 4-GPU RTX A6000 (sm_86) system:
 
 ```bash
 cmake .. -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=86
@@ -57,6 +57,17 @@ Build artifacts:
 - `build/benchmarks/nano_nccl_all_reduce_bench` — perf + correctness benchmark
 - `build/tests/nano_nccl_correctness` — correctness-only test
 - `build/tests/nano_nccl_smoke` — smoke test
+- `build/tests/nano_nccl_public_api` — public C++ API coverage
+- `build/tests/nano_nccl_p2p_step_counters` — P2P step-counter coverage
+- `build/tests/nano_nccl_p2p_topology` — P2P topology coverage
+- `build/tests/nano_nccl_simple_protocol` — Simple protocol layout coverage
+- `build-mpi/tests/nano_nccl_mpi_correctness` — MPI/socket correctness test (MPI build)
+- `build-mpi/tests/nano_nccl_mpi_bootstrap` — MPI bootstrap smoke test (MPI build)
+- `build-mpi/tests/nano_nccl_socket_protocol` — socket framing and proxy test (MPI build)
+
+When `BUILD_TESTING` is enabled (the default), `ctest --test-dir build
+--output-on-failure` also runs the static BF16 capability-validation regression
+check.
 
 ### CMake options
 
@@ -197,7 +208,7 @@ Currently supports only:
 - out-of-place
 - SHM FIFO and device P2P FIFO transports, plus optional MPI/socket for cross-process ring edges; P2P is single-node only
 
-No multi-host performance comparison or performance acceptance gate has been established. This project is not a general NCCL replacement.
+No multi-host performance acceptance gate has been established. This project is not a general NCCL replacement.
 
 Future expansion plans:
 

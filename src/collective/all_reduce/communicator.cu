@@ -201,7 +201,7 @@ public:
                 all_reduce_typed<__half>(args);
                 return;
             case DType::BFloat16:
-                require_bf16_devices(devices_);
+                ensure_bf16_devices_validated();
                 all_reduce_typed<__nv_bfloat16>(args);
                 return;
         }
@@ -617,6 +617,12 @@ private:
         }
     }
 
+    void ensure_bf16_devices_validated() {
+        if (bf16_devices_validated_) return;
+        require_bf16_devices(devices_);
+        bf16_devices_validated_ = true;
+    }
+
     template <typename T>
     void all_reduce_typed(const CollectiveArgs& args) {
         FifoResources<T>* resources = nullptr;
@@ -676,6 +682,7 @@ private:
     std::vector<cudaStream_t> fallback_streams_;
     std::vector<bool> completion_recorded_;
     std::vector<bool> fallback_in_flight_;
+    bool bf16_devices_validated_ = false;
     bool control_initialized_ = false;
     bool has_launch_ = false;
     bool has_untracked_launch_ = false;
