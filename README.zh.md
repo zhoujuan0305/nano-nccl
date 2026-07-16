@@ -2,14 +2,13 @@
 
 [English](README.md)
 
-All Reduce 库：已验证的单机路径目标是达到 NCCL `Ring` + `Simple` + 4 channels 的性能；可选 MPI/socket 路径支持多机正确性运行。
+面向单机多 GPU 的 All Reduce 通信库，目标是达到 NCCL `Ring` + `Simple` + 4 channels 的性能；可选 MPI/socket 路径用于多机正确性运行。
 
 ---
 
 ## 性能
 
-下表给出 out-of-place `busbw` 绝对值（GB/s，`-w 5 -n 20`）。BF16 行在
-2026-07-16 修复 BF16 device-capability validation cache 后重新测量。
+下表给出 out-of-place `busbw` 绝对值（GB/s，`-w 5 -n 20`）。
 
 ### 单机：4× RTX A6000
 
@@ -47,7 +46,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Release \
 make -j$(nproc)
 ```
 
-例如，本次测试的 4 GPU RTX A6000 (sm_86) 系统：
+例如，4 GPU RTX A6000 (sm_86) 系统：
 
 ```bash
 cmake .. -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=86

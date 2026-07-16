@@ -2,15 +2,13 @@
 
 [中文说明](README.zh.md)
 
-An All Reduce library targeting NCCL `Ring` + `Simple` + 4 channels performance on its validated single-host path. An optional MPI/socket path supports multi-host correctness runs.
+A GPU collective communication library for single-host multi-GPU All Reduce, targeting NCCL `Ring` + `Simple` + 4 channels performance. An optional MPI/socket path supports multi-host correctness runs.
 
 ---
 
 ## Performance
 
-The tables below report out-of-place `busbw` in GB/s (`-w 5 -n 20`). The BF16
-row was remeasured on 2026-07-16 after the BF16 device-capability validation
-cache fix.
+The tables below report out-of-place `busbw` in GB/s (`-w 5 -n 20`).
 
 ### Single host: 4× RTX A6000
 
@@ -48,7 +46,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Release \
 make -j$(nproc)
 ```
 
-For example, on the measured 4-GPU RTX A6000 (sm_86) system:
+For example, for a 4-GPU RTX A6000 (sm_86) system:
 
 ```bash
 cmake .. -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=86
