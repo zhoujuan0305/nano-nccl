@@ -2,31 +2,41 @@
 
 [中文说明](README.zh.md)
 
-A single-node multi-GPU All Reduce library targeting NCCL `Ring` + `Simple` + 4 channels performance.
+An All Reduce library targeting NCCL `Ring` + `Simple` + 4 channels performance on its validated single-host path. An optional MPI/socket path supports multi-host correctness runs.
 
 ---
 
 ## Performance
 
-Same-round comparison against NCCL (out-of-place busbw, `-w 5 -n 20`). nano-nccl used `--transport auto`, which resolved to a mixed P2P/SHM ring-edge plan.
+The tables below report out-of-place `busbw` in GB/s from the current measurements (`-w 5 -n 20`).
 
-| dtype | 256 KiB | 1 MiB | 4 MiB | 16 MiB | 64 MiB | geomean |
+### Single host: 4× RTX A6000
+
+CUDA 12.8, `CUDA_VISIBLE_DEVICES=0,1,2,3`, and `--transport auto` (resolved to `mixed`). NCCL used `Ring` + `Simple`, four channels, and `NCCL_BUFFSIZE=33554432`. Each size cell is `nano-nccl / NCCL` bus bandwidth in GB/s.
+
+| dtype | 256 KiB | 1 MiB | 4 MiB | 16 MiB | 64 MiB | nano/NCCL geomean |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| float | 1.335 | 1.241 | 1.038 | 1.007 | 1.019 | 1.120 |
-| fp16 | 1.388 | 1.207 | 1.038 | 1.009 | 1.017 | 1.123 |
-| bf16 | 1.421 | 1.242 | 1.038 | 1.015 | 1.018 | 1.136 |
+| float | 6.88 / 6.43 | 14.80 / 14.14 | 19.30 / 19.50 | 22.47 / 22.61 | 23.29 / 22.95 | 1.023 |
+| fp16 | 6.84 / 6.33 | 14.43 / 14.29 | 19.32 / 19.70 | 22.44 / 22.73 | 23.29 / 23.17 | 1.012 |
+| bf16 | 0.11 / 6.35 | 0.45 / 14.42 | 1.56 / 19.94 | 5.82 / 22.77 | 16.42 / 23.17 | 0.095 |
 
-Each cell is `nano-nccl busbw / NCCL busbw`; all 15 measured points were correct (`#wrong=0`) and at or above the NCCL baseline.
+### Two hosts: 2×4 RTX A6000 over TCP socket
 
-**Test environment**: 4× NVIDIA RTX A6000 (Ampere sm_86), CUDA 12.8, `CUDA_VISIBLE_DEVICES=0,1,2,3`. NCCL used `Ring` + `Simple`, four channels, and `NCCL_BUFFSIZE=33554432`.
+One four-GPU MPI process per host, `eno2`, CUDA 12.8, and Open MPI 4.1.2. nano-nccl used `--algo ring_simple --transport auto` and resolved to `mixed` (socket for cross-host edges). NCCL 2.25.1 used `Ring` + `Simple`, four channels, `NCCL_SOCKET_IFNAME=eno2`, and `NCCL_IB_DISABLE=1`.
 
-> Performance data applies only to the above hardware and parameter configuration.
+| size | nano-nccl time (us) | nano busbw (GB/s) | NCCL time (us) | NCCL busbw (GB/s) | nano/NCCL |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 KiB | 4203.72 | 0.109130 | 3989.82 | 0.114981 | 0.949116 |
+| 1 MiB | 16030.16 | 0.114472 | 16012.80 | 0.114596 | 0.998917 |
+| 4 MiB | 66742.16 | 0.109976 | 63165.10 | 0.116204 | 0.946405 |
+| 16 MiB | 275982.46 | 0.106384 | 252055.00 | 0.116483 | 0.913301 |
+| 64 MiB | 1107119.12 | 0.106078 | 1019285.00 | 0.115219 | 0.920664 |
 
 ---
 
 ## Build
 
-Dependencies: CUDA 12+, CMake 3.18+, libnuma-dev
+Dependencies: CUDA 12+, CMake 3.18+, libnuma-dev. The optional MPI/socket build requires Open MPI 4.1.2 on every host; every launched host must use the same Open MPI ABI.
 
 ```bash
 mkdir -p build && cd build
@@ -57,8 +67,30 @@ Build artifacts:
 | `NANO_NCCL_CUDA_ARCH` | 61 | CUDA compute capability (e.g. 61 for sm_61, 75 for Turing, 86 for Ampere) |
 | `NANO_NCCL_BLOCK_THREADS` | 512 | Threads per block |
 | `NANO_NCCL_FIFO_BUFF_BYTES` | 33554432 | FIFO buffer size in bytes (32 MiB) |
+| `NANO_NCCL_ENABLE_MPI` | `OFF` | Build the MPI communicator bootstrap and distributed benchmark/test |
+| `NANO_NCCL_SOCKET_TEST_FAULT_INJECTION` | `OFF` | Build a separate test-only fault-injection library for `nano_nccl_mpi_correctness`; ordinary MPI benchmarks never include the hook |
 
 NUMA topology is detected at runtime by reading `/sys/bus/pci/devices/*/numa_node` — no source code changes needed when moving to a different machine.
+
+### Optional MPI/socket build
+
+Build the same commit on each host with the global GPU count. The socket listener is IPv4-only; set `NANO_NCCL_SOCKET_IFNAME` to an interface that resolves to exactly one usable IPv4 address. The socket connection has no TLS, authentication, or automatic reconnect, so use it only on a trusted private network.
+
+```bash
+cmake -S . -B build-mpi -DCMAKE_BUILD_TYPE=Release \
+  -DNANO_NCCL_ENABLE_MPI=ON -DNANO_NCCL_NRANKS=8 -DNANO_NCCL_CUDA_ARCH=86
+cmake --build build-mpi -j$(nproc)
+```
+
+For a two-host, four-GPU-per-host launch, pass the interface export in both MPMD app contexts:
+
+```bash
+mpirun \
+  -np 1 --host 192.168.104.246 -x NANO_NCCL_SOCKET_IFNAME=eno2 \
+    ./build-mpi/tests/nano_nccl_mpi_correctness --dtype float \
+  : -np 1 --host 192.168.104.247 -x NANO_NCCL_SOCKET_IFNAME=eno2 \
+    ./build-mpi/tests/nano_nccl_mpi_correctness --dtype float
+```
 
 ---
 
@@ -130,15 +162,17 @@ for (std::size_t i = 0; i < devices.size(); ++i) {
 communicator->check_async_error();
 ```
 
-The current single-host adapter requires `devices` to be the visible-device
-sequence `{0, ..., NANO_NCCL_NRANKS - 1}`. `all_reduce` is out-of-place and
-supports `float`, FP16, BF16, and `sum`. `reduce_scatter` and `all_gather` are
-present in the public interface but currently throw an unsupported-operation
-error. MPI bootstrap and socket transport are not implemented yet.
+The single-host adapter requires `devices` to be the visible-device sequence
+`{0, ..., NANO_NCCL_NRANKS - 1}`. In an MPI build, `nano_nccl/mpi.h` provides
+`create_communicator_from_mpi(MPI_COMM_WORLD, config)` for a distributed
+communicator. `all_reduce` is out-of-place and supports `float`, FP16, BF16,
+and `sum`. `reduce_scatter` and `all_gather` are present in the public interface
+but throw an unsupported-operation error.
 
 ### Transport selection
 
-`--transport` accepts `auto`, `shm`, and `p2p`.
+`--transport` accepts `auto`, `shm`, and `p2p` on a single host. Distributed
+MPI communicators accept `auto`; cross-process ring edges resolve to socket.
 
 - `auto` (the default) selects P2P independently for each ring edge only when
   it has a direct NVLink and CUDA peer access in both directions; other edges
@@ -148,7 +182,8 @@ error. MPI bootstrap and socket transport are not implemented yet.
   access and fails during setup on the first unavailable direction.
 
 P2P is a single-node transport. It requires CUDA peer access for the complete
-configured ring; it is not a multi-node or network transport.
+configured ring; it is not a multi-node or network transport. Socket uses a
+trusted, IPv4-only TCP network boundary and has no TLS or auto reconnect.
 
 ---
 
@@ -156,11 +191,13 @@ configured ring; it is not a multi-node or network transport.
 
 Currently supports only:
 
-- Single-node multi-GPU (tested with `CUDA_VISIBLE_DEVICES=0,1,2,3`; rank count is configurable via `NANO_NCCL_NRANKS`)
+- Single-node multi-GPU performance path (tested with `CUDA_VISIBLE_DEVICES=0,1,2,3`); optional MPI/socket multi-host `all_reduce` correctness path
 - `float`, FP16 (`fp16`), and BF16 (`bf16`) dtypes; BF16 requires SM80+
 - `sum` reduce op
 - out-of-place
-- SHM FIFO and device P2P FIFO transports; P2P is single-node only
+- SHM FIFO and device P2P FIFO transports, plus optional MPI/socket for cross-process ring edges; P2P is single-node only
+
+No multi-host performance comparison or performance acceptance gate has been established. This project is not a general NCCL replacement.
 
 Future expansion plans:
 

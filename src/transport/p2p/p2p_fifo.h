@@ -13,6 +13,9 @@ class P2pFifo {
 public:
     P2pFifo(std::size_t slot_elems, int nranks);
     P2pFifo(std::size_t slot_elems, const RingTransportPlan& plan);
+    P2pFifo(
+        std::size_t slot_elems, const RingTransportPlan& plan,
+        const collective::all_reduce::ProcessTopology& topology);
     ~P2pFifo();
 
     P2pFifo(const P2pFifo&) = delete;

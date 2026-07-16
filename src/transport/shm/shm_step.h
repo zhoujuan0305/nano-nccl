@@ -46,4 +46,13 @@ __device__ __forceinline__ void store_step(std::uint64_t* ptr,
                  : "memory");
 }
 
+__device__ __forceinline__ std::uint32_t load_abort(const std::uint32_t* ptr) {
+    std::uint32_t ans;
+    asm volatile("ld.volatile.global.u32 %0, [%1];"
+                 : "=r"(ans)
+                 : "l"(__cvta_generic_to_global(ptr))
+                 : "memory");
+    return ans;
+}
+
 }  // namespace nano_nccl::transport::shm

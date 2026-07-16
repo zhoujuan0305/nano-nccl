@@ -40,6 +40,9 @@ struct SimpleFifoArgs {
     T* output;
     T* send_fifo[kChannels];
     const T* recv_fifo[kChannels];
+    std::uint32_t* send_payload_bytes[kChannels];
+    const std::uint32_t* recv_payload_bytes[kChannels];
+    const std::uint32_t* abort;
     SimpleControlArgs control;
 };
 
@@ -53,6 +56,10 @@ struct SimpleChannelArgs {
     std::uint64_t* recv_tail;
     std::uint64_t* send_tail;
     std::uint64_t* recv_head;
+    std::uint32_t* send_payload_bytes;
+    const std::uint32_t* recv_payload_bytes;
+    const std::uint32_t* abort;
+    std::uint32_t* wait_observer;
 };
 
 }  // namespace nano_nccl::transport

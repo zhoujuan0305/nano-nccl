@@ -68,6 +68,14 @@ __host__ __device__ inline void cbd_part(std::size_t count, int channel,
                             simple_fifo_grain_elems<T>());
 }
 
+// The active FIFO allocation defines the safe ring-loop stride.  Distributed
+// socket paths set slot_elems to one Simple step; local paths may grow it.
+template <typename T>
+__host__ __device__ inline std::size_t simple_fifo_loop_chunk_elems(
+    std::size_t chunk_elems, std::size_t slot_elems) {
+    return chunk_elems < slot_elems ? chunk_elems : slot_elems;
+}
+
 template <typename T>
 __device__ inline std::size_t slice_elems(std::size_t nelem,
                                           std::size_t step_elems =

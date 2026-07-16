@@ -1,5 +1,6 @@
 #include "transport/p2p/p2p_topology.h"
 
+#include "collective/all_reduce/topology.h"
 #include "transport/p2p/p2p_fifo.h"
 
 #include <cstdio>
@@ -101,6 +102,19 @@ bool edge_supports_p2p(NvmlSession* nvml, int sender, int receiver) {
            cuda_peer_access_available(receiver, sender);
 }
 
+bool is_local_edge(const collective::all_reduce::ProcessTopology& topology,
+                   int edge) {
+    int receiver = (edge + 1) % topology.global_rank_count;
+    return collective::all_reduce::is_local_global_rank(topology, edge) &&
+           collective::all_reduce::is_local_global_rank(topology, receiver);
+}
+
+int device_for_global_rank(
+    const collective::all_reduce::ProcessTopology& topology, int global_rank) {
+    return topology.devices[collective::all_reduce::local_rank_for_global_rank(
+        topology, global_rank)];
+}
+
 void enable_peer_access_or_throw(int src, int dst) {
     CUDA_CHECK_THROW(cudaSetDevice(src));
     cudaError_t error = cudaDeviceEnablePeerAccess(dst, 0);
@@ -118,8 +132,11 @@ void enable_peer_access_or_throw(int src, int dst) {
 }  // namespace
 
 RingTransportPlan::RingTransportPlan(
-    std::array<TransportKind, kRanks> edge_kinds)
-    : edge_kinds_(edge_kinds) {
+    std::vector<TransportKind> edge_kinds)
+    : edge_kinds_(std::move(edge_kinds)) {
+    if (edge_kinds_.size() != static_cast<std::size_t>(kRanks)) {
+        throw std::invalid_argument("ring transport plan rank count must match kRanks");
+    }
     for (TransportKind kind : edge_kinds_) {
         if (kind == TransportKind::Auto || kind == TransportKind::Mixed) {
             throw std::invalid_argument(
@@ -128,14 +145,16 @@ RingTransportPlan::RingTransportPlan(
     }
 }
 
-RingTransportPlan RingTransportPlan::uniform(TransportKind kind) {
-    std::array<TransportKind, kRanks> edge_kinds;
-    edge_kinds.fill(kind);
-    return RingTransportPlan(edge_kinds);
+RingTransportPlan RingTransportPlan::uniform(TransportKind kind, int rank_count) {
+    return RingTransportPlan(std::vector<TransportKind>(rank_count, kind));
 }
 
 TransportKind RingTransportPlan::edge_kind(int edge) const {
     return edge_kinds_.at(edge);
+}
+
+const std::vector<TransportKind>& RingTransportPlan::edge_kinds() const noexcept {
+    return edge_kinds_;
 }
 
 TransportKind RingTransportPlan::resolved_kind() const {
@@ -158,22 +177,55 @@ bool RingTransportPlan::uses_p2p() const {
 }
 
 RingTransportPlan resolve_ring_transport(TransportKind requested) {
+    collective::all_reduce::ProcessTopology topology{
+        kRanks,
+        0,
+        std::vector<int>(kRanks),
+        std::vector<TransportKind>(kRanks, TransportKind::Shm),
+        false,
+    };
+    for (int rank = 0; rank < kRanks; ++rank) topology.devices[rank] = rank;
+    return resolve_ring_transport(requested, topology);
+}
+
+RingTransportPlan resolve_ring_transport(
+    TransportKind requested,
+    const collective::all_reduce::ProcessTopology& topology) {
+    collective::all_reduce::validate_process_topology(topology);
     if (requested == TransportKind::Shm) {
         return RingTransportPlan::uniform(TransportKind::Shm);
     }
     if (requested == TransportKind::P2p) {
-        require_p2p_ring();
-        return RingTransportPlan::uniform(TransportKind::P2p);
+        std::vector<TransportKind> edge_kinds(kRanks, TransportKind::Shm);
+        for (int edge = 0; edge < kRanks; ++edge) {
+            if (!is_local_edge(topology, edge)) {
+                throw std::runtime_error("p2p transport requires local ring edges");
+            }
+            int receiver = (edge + 1) % kRanks;
+            int sender_device = device_for_global_rank(topology, edge);
+            int receiver_device = device_for_global_rank(topology, receiver);
+            if (!cuda_peer_access_available(sender_device, receiver_device) ||
+                !cuda_peer_access_available(receiver_device, sender_device)) {
+                throw std::runtime_error("p2p unavailable for local ring edge");
+            }
+            edge_kinds[edge] = TransportKind::P2p;
+        }
+        return RingTransportPlan(std::move(edge_kinds));
     }
     if (requested != TransportKind::Auto) {
         throw std::invalid_argument("mixed is a resolved transport only");
     }
 
     NvmlSession nvml;
-    std::array<TransportKind, kRanks> edge_kinds{};
+    std::vector<TransportKind> edge_kinds = topology.edge_kinds;
     for (int edge = 0; edge < kRanks; ++edge) {
+        if (!is_local_edge(topology, edge)) {
+            continue;
+        }
         int receiver = (edge + 1) % kRanks;
-        edge_kinds[edge] = edge_supports_p2p(&nvml, edge, receiver)
+        int sender_device = device_for_global_rank(topology, edge);
+        int receiver_device = device_for_global_rank(topology, receiver);
+        edge_kinds[edge] = edge_supports_p2p(&nvml, sender_device, receiver_device)
                                ? TransportKind::P2p
                                : TransportKind::Shm;
     }
@@ -181,13 +233,31 @@ RingTransportPlan resolve_ring_transport(TransportKind requested) {
 }
 
 void enable_p2p_ring_peer_access_or_throw(const RingTransportPlan& plan) {
+    collective::all_reduce::ProcessTopology topology{
+        kRanks,
+        0,
+        std::vector<int>(kRanks),
+        plan.edge_kinds(),
+        false,
+    };
+    for (int rank = 0; rank < kRanks; ++rank) topology.devices[rank] = rank;
+    enable_p2p_ring_peer_access_or_throw(plan, topology);
+}
+
+void enable_p2p_ring_peer_access_or_throw(
+    const RingTransportPlan& plan,
+    const collective::all_reduce::ProcessTopology& topology) {
+    collective::all_reduce::validate_process_topology(topology);
     for (int edge = 0; edge < kRanks; ++edge) {
-        if (plan.edge_kind(edge) != TransportKind::P2p) {
+        if (plan.edge_kind(edge) != TransportKind::P2p ||
+            !is_local_edge(topology, edge)) {
             continue;
         }
         int receiver = (edge + 1) % kRanks;
-        enable_peer_access_or_throw(edge, receiver);
-        enable_peer_access_or_throw(receiver, edge);
+        int sender_device = device_for_global_rank(topology, edge);
+        int receiver_device = device_for_global_rank(topology, receiver);
+        enable_peer_access_or_throw(sender_device, receiver_device);
+        enable_peer_access_or_throw(receiver_device, sender_device);
     }
 }
 

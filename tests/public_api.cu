@@ -1,5 +1,13 @@
 #include "nano_nccl/communicator.h"
 
+#include "collective/all_reduce/topology.h"
+#include "core/buffer.h"
+#include "kernels/ring_simple_kernel.cuh"
+#include "transport/p2p/p2p_fifo.h"
+#include "transport/p2p/p2p_step_counters.h"
+#include "transport/p2p/p2p_topology.h"
+#include "transport/simple_protocol.h"
+
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
@@ -115,9 +123,332 @@ bool verify_output(const std::vector<float>& output, int round) {
     return true;
 }
 
+std::vector<nano_nccl::collective::all_reduce::ProcessTopology>
+make_synthetic_topologies(const std::vector<int>& local_rank_counts) {
+    std::vector<nano_nccl::collective::all_reduce::ProcessTopology> topologies;
+    int global_rank_count = 0;
+    for (int count : local_rank_counts) global_rank_count += count;
+
+    int offset = 0;
+    for (int count : local_rank_counts) {
+        nano_nccl::collective::all_reduce::ProcessTopology topology;
+        topology.global_rank_count = global_rank_count;
+        topology.local_rank_offset = offset;
+        topology.devices.resize(count);
+        for (int local_rank = 0; local_rank < count; ++local_rank) {
+            topology.devices[local_rank] = local_rank;
+        }
+        topology.edge_kinds.assign(global_rank_count, nano_nccl::TransportKind::Shm);
+        topology.distributed = true;
+        topologies.push_back(std::move(topology));
+        offset += count;
+    }
+
+    for (int edge = 0; edge < global_rank_count; ++edge) {
+        int receiver = (edge + 1) % global_rank_count;
+        int sender_process = 0;
+        int receiver_process = 0;
+        while (edge >= topologies[sender_process].local_rank_offset +
+                           static_cast<int>(topologies[sender_process].devices.size())) {
+            ++sender_process;
+        }
+        while (receiver >= topologies[receiver_process].local_rank_offset +
+                               static_cast<int>(topologies[receiver_process].devices.size())) {
+            ++receiver_process;
+        }
+        if (sender_process != receiver_process) {
+            for (auto& topology : topologies) {
+                topology.edge_kinds[edge] = nano_nccl::TransportKind::Socket;
+            }
+        }
+    }
+    return topologies;
+}
+
+bool run_topology_test() {
+    using nano_nccl::TransportKind;
+    using nano_nccl::collective::all_reduce::ProcessTopology;
+    using nano_nccl::collective::all_reduce::validate_process_topology;
+    using nano_nccl::transport::p2p::P2pFifo;
+    using nano_nccl::transport::p2p::P2pStepCounters;
+    using nano_nccl::transport::p2p::RingTransportPlan;
+
+    ProcessTopology single_process{
+        4,
+        0,
+        {0, 1, 2, 3},
+        {TransportKind::P2p, TransportKind::Shm,
+         TransportKind::P2p, TransportKind::Shm},
+        false,
+    };
+    validate_process_topology(single_process);
+    for (int local_rank = 0; local_rank < 4; ++local_rank) {
+        if (single_process.local_rank_offset + local_rank != local_rank) {
+            return false;
+        }
+    }
+    if (single_process.edge_kinds.size() != 4 ||
+        single_process.edge_kinds[0] != TransportKind::P2p ||
+        single_process.edge_kinds[1] != TransportKind::Shm ||
+        single_process.edge_kinds[2] != TransportKind::P2p ||
+        single_process.edge_kinds[3] != TransportKind::Shm) {
+        return false;
+    }
+
+    auto two_process = make_synthetic_topologies({2, 2});
+    if (two_process.size() != 2 ||
+        two_process[0].local_rank_offset != 0 ||
+        two_process[1].local_rank_offset != 2 ||
+        two_process[0].global_rank_count != 4 ||
+        two_process[1].global_rank_count != 4 ||
+        two_process[0].edge_kinds[1] != TransportKind::Socket ||
+        two_process[0].edge_kinds[3] != TransportKind::Socket) {
+        return false;
+    }
+    validate_process_topology(two_process[0]);
+    validate_process_topology(two_process[1]);
+
+    ProcessTopology second_process = two_process[1];
+    auto resolved = nano_nccl::transport::p2p::resolve_ring_transport(
+        TransportKind::Auto, second_process);
+    if (resolved.edge_kind(1) != TransportKind::Socket ||
+        resolved.edge_kind(3) != TransportKind::Socket ||
+        resolved.edge_kind(2) == TransportKind::Socket) {
+        return false;
+    }
+
+    RingTransportPlan local_p2p_plan({TransportKind::Socket, TransportKind::Socket,
+                                      TransportKind::P2p, TransportKind::Socket});
+    cudaStream_t local_streams[2]{};
+    if (cudaSetDevice(0) != cudaSuccess ||
+        cudaStreamCreateWithFlags(&local_streams[0], cudaStreamNonBlocking) != cudaSuccess ||
+        cudaSetDevice(1) != cudaSuccess ||
+        cudaStreamCreateWithFlags(&local_streams[1], cudaStreamNonBlocking) != cudaSuccess) {
+        return false;
+    }
+    try {
+        P2pFifo<float> fifo(1, local_p2p_plan, second_process);
+        P2pStepCounters counters(local_p2p_plan, second_process);
+        counters.reset({local_streams[0], local_streams[1]});
+        if (cudaSetDevice(0) != cudaSuccess ||
+            cudaStreamSynchronize(local_streams[0]) != cudaSuccess ||
+            cudaSetDevice(1) != cudaSuccess ||
+            cudaStreamSynchronize(local_streams[1]) != cudaSuccess ||
+            fifo.edge_ptr(0, 2) == nullptr) {
+            return false;
+        }
+    } catch (const std::exception&) {
+        return false;
+    }
+    if (cudaSetDevice(0) != cudaSuccess ||
+        cudaStreamDestroy(local_streams[0]) != cudaSuccess ||
+        cudaSetDevice(1) != cudaSuccess ||
+        cudaStreamDestroy(local_streams[1]) != cudaSuccess) {
+        return false;
+    }
+
+    std::puts("topology=PASS");
+    return true;
+}
+
+__global__ void abort_aware_send_wait(
+    nano_nccl::transport::SimpleChannelArgs<float> args, int* result) {
+    std::uint64_t cache = 0;
+    __shared__ int wait_status;
+    bool ready = nano_nccl::kernels::wait_send_credit<nano_nccl::kRanks, float>(
+        args, 0, &cache, &wait_status);
+    if (threadIdx.x == 0) result[0] = ready ? 0 : 1;
+}
+
+__global__ void abort_after_send_wait_starts(
+    nano_nccl::transport::SimpleChannelArgs<float> args, int* result) {
+    std::uint64_t cache = 0;
+    __shared__ int wait_status;
+    bool ready = nano_nccl::kernels::wait_send_credit<nano_nccl::kRanks, float>(
+        args, 8, &cache, &wait_status);
+    if (threadIdx.x == 0) result[0] = ready ? 0 : 1;
+}
+
+__global__ void abort_after_recv_wait_starts(
+    nano_nccl::transport::SimpleChannelArgs<float> args, int* result) {
+    std::uint64_t cache = 0;
+    __shared__ int wait_status;
+    bool ready = nano_nccl::kernels::wait_recv_ready<nano_nccl::kRanks, float>(
+        args, 0, &cache, &wait_status);
+    if (threadIdx.x == 0) result[0] = ready ? 0 : 1;
+}
+
+__global__ void publish_socket_slice(
+    nano_nccl::transport::SimpleChannelArgs<float> args, const float* input) {
+    std::uint64_t step = 0;
+    std::uint64_t cache = 0;
+    __shared__ int wait_status;
+    nano_nccl::kernels::direct_send<nano_nccl::kRanks, float,
+                                    nano_nccl::RedOp::Sum>(
+        args, input, 4, &step, &cache, blockDim.x, &wait_status);
+}
+
+bool run_socket_abort_test() {
+    using nano_nccl::core::MappedU32Array;
+    using nano_nccl::core::MappedU64Array;
+    using nano_nccl::transport::SimpleChannelArgs;
+
+    constexpr int kDevice = 0;
+    MappedU64Array counters;
+    counters.reset(4, -1, {kDevice});
+    MappedU32Array abort;
+    abort.reset(1, -1, {kDevice});
+    MappedU32Array started;
+    started.reset(1, -1, {kDevice});
+    int* result = nullptr;
+    if (cudaSetDevice(kDevice) != cudaSuccess ||
+        cudaMalloc(&result, sizeof(int)) != cudaSuccess) {
+        return false;
+    }
+    SimpleChannelArgs<float> args{
+        1, 1, nullptr, nullptr,
+        counters.device_ptr(kDevice), counters.device_ptr(kDevice) + 1,
+        counters.device_ptr(kDevice) + 2, counters.device_ptr(kDevice) + 3,
+        nullptr, nullptr, abort.device_ptr(kDevice), started.device_ptr(kDevice),
+    };
+    abort_after_send_wait_starts<<<1, 32>>>(args, result);
+    for (int spin = 0; spin < 1000000 &&
+         __atomic_load_n(started.host_ptr(), __ATOMIC_ACQUIRE) == 0; ++spin) {}
+    const bool send_observed =
+        __atomic_load_n(started.host_ptr(), __ATOMIC_ACQUIRE) != 0;
+    __atomic_store_n(abort.host_ptr(), 1U, __ATOMIC_RELEASE);
+    int aborted = 0;
+    bool ok = cudaGetLastError() == cudaSuccess &&
+              cudaMemcpy(&aborted, result, sizeof(aborted), cudaMemcpyDeviceToHost) ==
+                  cudaSuccess &&
+              aborted == 1 && send_observed;
+    if (ok) {
+        __atomic_store_n(abort.host_ptr(), 0U, __ATOMIC_RELEASE);
+        __atomic_store_n(started.host_ptr(), 0U, __ATOMIC_RELEASE);
+        abort_after_recv_wait_starts<<<1, 32>>>(args, result);
+        for (int spin = 0; spin < 1000000 &&
+             __atomic_load_n(started.host_ptr(), __ATOMIC_ACQUIRE) == 0; ++spin) {}
+        const bool recv_observed =
+            __atomic_load_n(started.host_ptr(), __ATOMIC_ACQUIRE) != 0;
+        __atomic_store_n(abort.host_ptr(), 1U, __ATOMIC_RELEASE);
+        aborted = 0;
+        ok = cudaGetLastError() == cudaSuccess &&
+             cudaMemcpy(&aborted, result, sizeof(aborted), cudaMemcpyDeviceToHost) ==
+                 cudaSuccess &&
+             aborted == 1 && recv_observed;
+    }
+    cudaFree(result);
+    std::puts(ok ? "socket_abort=PASS" : "socket_abort=FAIL");
+    return ok;
+}
+
+bool run_socket_kernel_test() {
+    using nano_nccl::core::MappedBuffer;
+    using nano_nccl::core::MappedU32Array;
+    using nano_nccl::core::MappedU64Array;
+    using nano_nccl::transport::SimpleChannelArgs;
+
+    constexpr int kDevice = 0;
+    std::vector<int> devices{kDevice};
+    MappedBuffer<float> fifo(nano_nccl::transport::kSimpleFifoSteps * 16, -1,
+                             devices);
+    MappedU64Array counters;
+    counters.reset(4, -1, devices);
+    MappedU32Array sizes;
+    sizes.reset(nano_nccl::transport::kSimpleFifoSteps, -1, devices);
+    MappedU32Array abort;
+    abort.reset(1, -1, devices);
+
+    float* input = nullptr;
+    int* result = nullptr;
+    if (cudaSetDevice(kDevice) != cudaSuccess ||
+        cudaMalloc(&input, 4 * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&result, sizeof(int)) != cudaSuccess) {
+        return false;
+    }
+    bool ok = false;
+    try {
+        SimpleChannelArgs<float> args{
+            16,
+            16,
+            fifo.device_ptr(kDevice),
+            fifo.device_ptr(kDevice),
+            counters.device_ptr(kDevice),
+            counters.device_ptr(kDevice) + 1,
+            counters.device_ptr(kDevice) + 2,
+            counters.device_ptr(kDevice) + 3,
+            sizes.device_ptr(kDevice),
+            nullptr,
+            abort.device_ptr(kDevice),
+        };
+
+        __atomic_store_n(abort.host_ptr(), 1U, __ATOMIC_RELEASE);
+        abort_aware_send_wait<<<1, 32>>>(args, result);
+        int aborted = 0;
+        if (cudaGetLastError() == cudaSuccess &&
+            cudaMemcpy(&aborted, result, sizeof(aborted), cudaMemcpyDeviceToHost) ==
+                cudaSuccess &&
+            aborted == 1) {
+            __atomic_store_n(abort.host_ptr(), 0U, __ATOMIC_RELEASE);
+            publish_socket_slice<<<1, 32>>>(args, input);
+            std::uint64_t ready = 0;
+            for (int spin = 0; spin < 1000000 && ready == 0; ++spin) {
+                ready = __atomic_load_n(counters.host_ptr() + 2, __ATOMIC_ACQUIRE);
+            }
+            ok = cudaGetLastError() == cudaSuccess &&
+                 ready >= nano_nccl::transport::kSimpleFifoSliceSteps &&
+                 __atomic_load_n(sizes.host_ptr(), __ATOMIC_ACQUIRE) ==
+                     4 * sizeof(float) &&
+                 cudaDeviceSynchronize() == cudaSuccess;
+            if (!ok) {
+                std::fprintf(stderr, "socket_kernel detail tail=%llu size=%u\n",
+                             static_cast<unsigned long long>(ready), sizes.host_ptr()[0]);
+            }
+        }
+    } catch (const std::exception&) {
+        ok = false;
+    }
+    cudaFree(input);
+    cudaFree(result);
+    std::puts(ok ? "socket_kernel=PASS" : "socket_kernel=FAIL");
+    return ok;
+}
+
+bool run_socket_stride_test() {
+    constexpr std::size_t kCount = 128ULL * 1024 * 1024 / sizeof(float);
+    std::size_t part_offset = 0;
+    std::size_t part_count = 0;
+    std::size_t chunk_count = 0;
+    nano_nccl::transport::shm::cbd_part<float>(kCount, 0, &part_offset,
+                                               &part_count, &chunk_count);
+    const std::size_t stride = nano_nccl::transport::shm::simple_fifo_step_elems<float>();
+    const std::size_t socket_loop_chunk =
+        nano_nccl::transport::shm::simple_fifo_loop_chunk_elems<float>(chunk_count, stride);
+    const std::size_t local_loop_chunk =
+        nano_nccl::transport::shm::simple_fifo_loop_chunk_elems<float>(chunk_count, 2 * stride);
+    bool ok = chunk_count > stride && socket_loop_chunk == stride &&
+              local_loop_chunk == 2 * stride &&
+              nano_nccl::transport::kSimpleFifoSteps * stride * sizeof(float) ==
+                  nano_nccl::transport::kSimpleFifoBuffBytes;
+    std::puts(ok ? "socket_stride=PASS" : "socket_stride=FAIL");
+    return ok;
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--topology") {
+        return run_topology_test() ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--socket-kernel") {
+        return run_socket_kernel_test() ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--socket-abort") {
+        return run_socket_abort_test() ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--socket-stride") {
+        return run_socket_stride_test() ? 0 : 1;
+    }
     std::vector<const void*> send_buffers(kRanks);
     std::vector<void*> recv_buffers(kRanks);
     std::vector<cudaStream_t> streams(kRanks);

@@ -30,13 +30,14 @@ static_assert(kBlockThreads % 32 == 0,
 // dtype 枚举与名称转换是公共接口；实际存储类型由 DTypeTraits 提供。
 enum class DType { Float, Float16, BFloat16 };
 
-enum class TransportKind { Auto, Shm, P2p, Mixed };
+enum class TransportKind { Auto, Shm, P2p, Socket, Mixed };
 
 inline const char* transport_name(TransportKind transport) {
     switch (transport) {
         case TransportKind::Auto: return "auto";
         case TransportKind::Shm: return "shm";
         case TransportKind::P2p: return "p2p";
+        case TransportKind::Socket: return "socket";
         case TransportKind::Mixed: return "mixed";
     }
     return "unknown";

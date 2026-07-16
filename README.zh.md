@@ -2,31 +2,41 @@
 
 [English](README.md)
 
-单机多 GPU All Reduce 库，目标是达到 NCCL `Ring` + `Simple` + 4 channels 的性能。
+All Reduce 库：已验证的单机路径目标是达到 NCCL `Ring` + `Simple` + 4 channels 的性能；可选 MPI/socket 路径支持多机正确性运行。
 
 ---
 
 ## 性能
 
-与 NCCL 同轮对比（out-of-place busbw，`-w 5 -n 20`）。nano-nccl 使用 `--transport auto`，解析为 P2P/SHM 混合的 ring-edge 路径。
+下表给出当前实测的 out-of-place `busbw` 绝对值（GB/s，`-w 5 -n 20`）。
 
-| dtype | 256 KiB | 1 MiB | 4 MiB | 16 MiB | 64 MiB | geomean |
+### 单机：4× RTX A6000
+
+CUDA 12.8，`CUDA_VISIBLE_DEVICES=0,1,2,3`，`--transport auto` 解析为 `mixed`。NCCL 使用 `Ring` + `Simple`、4 channels 和 `NCCL_BUFFSIZE=33554432`。各 size 单元格为 `nano-nccl / NCCL` 的 busbw（GB/s）。
+
+| dtype | 256 KiB | 1 MiB | 4 MiB | 16 MiB | 64 MiB | nano/NCCL 几何平均 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| float | 1.335 | 1.241 | 1.038 | 1.007 | 1.019 | 1.120 |
-| fp16 | 1.388 | 1.207 | 1.038 | 1.009 | 1.017 | 1.123 |
-| bf16 | 1.421 | 1.242 | 1.038 | 1.015 | 1.018 | 1.136 |
+| float | 6.88 / 6.43 | 14.80 / 14.14 | 19.30 / 19.50 | 22.47 / 22.61 | 23.29 / 22.95 | 1.023 |
+| fp16 | 6.84 / 6.33 | 14.43 / 14.29 | 19.32 / 19.70 | 22.44 / 22.73 | 23.29 / 23.17 | 1.012 |
+| bf16 | 0.11 / 6.35 | 0.45 / 14.42 | 1.56 / 19.94 | 5.82 / 22.77 | 16.42 / 23.17 | 0.095 |
 
-表中数值为 `nano-nccl busbw / NCCL busbw`；全部 15 个测点均正确（`#wrong=0`），并且不低于 NCCL 基线。
+### 两机：2×4 RTX A6000，经 TCP socket
 
-**测试环境**：4× NVIDIA RTX A6000 (Ampere sm_86)，CUDA 12.8，`CUDA_VISIBLE_DEVICES=0,1,2,3`。NCCL 使用 `Ring` + `Simple`、4 channels 和 `NCCL_BUFFSIZE=33554432`。
+每台机器一个管理四张 GPU 的 MPI 进程，使用 `eno2`、CUDA 12.8、Open MPI 4.1.2。nano-nccl 使用 `--algo ring_simple --transport auto`，解析为 `mixed`（跨机边为 socket）。NCCL 2.25.1 使用 `Ring` + `Simple`、4 channels、`NCCL_SOCKET_IFNAME=eno2`、`NCCL_IB_DISABLE=1`。
 
-> 性能数据仅适用于上述硬件和参数场景。
+| size | nano-nccl time (us) | nano busbw (GB/s) | NCCL time (us) | NCCL busbw (GB/s) | nano/NCCL |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 KiB | 4203.72 | 0.109130 | 3989.82 | 0.114981 | 0.949116 |
+| 1 MiB | 16030.16 | 0.114472 | 16012.80 | 0.114596 | 0.998917 |
+| 4 MiB | 66742.16 | 0.109976 | 63165.10 | 0.116204 | 0.946405 |
+| 16 MiB | 275982.46 | 0.106384 | 252055.00 | 0.116483 | 0.913301 |
+| 64 MiB | 1107119.12 | 0.106078 | 1019285.00 | 0.115219 | 0.920664 |
 
 ---
 
 ## 构建
 
-依赖：CUDA 12+、CMake 3.18+、libnuma-dev
+依赖：CUDA 12+、CMake 3.18+、libnuma-dev。可选 MPI/socket 构建要求每台机器使用 Open MPI 4.1.2，且所有启动端必须使用相同的 Open MPI ABI。
 
 ```bash
 mkdir -p build && cd build
@@ -57,8 +67,30 @@ cmake .. -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=8
 | `NANO_NCCL_CUDA_ARCH` | 61 | CUDA 算力（如 61 对应 sm_61，75 对应 Turing，86 对应 Ampere） |
 | `NANO_NCCL_BLOCK_THREADS` | 512 | 每 block 线程数 |
 | `NANO_NCCL_FIFO_BUFF_BYTES` | 33554432 | FIFO buffer 大小（字节，默认 32 MiB） |
+| `NANO_NCCL_ENABLE_MPI` | `OFF` | 构建 MPI communicator bootstrap 与分布式 benchmark/test |
+| `NANO_NCCL_SOCKET_TEST_FAULT_INJECTION` | `OFF` | 为 `nano_nccl_mpi_correctness` 构建独立的仅测试故障注入库；普通 MPI benchmark 永不包含该钩子 |
 
 NUMA 拓扑在运行时从 `/sys/bus/pci/devices/*/numa_node` 自动检测，换机器不需要改源码。
+
+### 可选 MPI/socket 构建
+
+每台机器都要从同一个 commit、以全局 GPU 数构建。socket listener 仅支持 IPv4；`NANO_NCCL_SOCKET_IFNAME` 必须指定一个恰好解析为一个可用 IPv4 地址的接口。socket 连接没有 TLS、认证或自动重连，因此只能在可信私有网络中使用。
+
+```bash
+cmake -S . -B build-mpi -DCMAKE_BUILD_TYPE=Release \
+  -DNANO_NCCL_ENABLE_MPI=ON -DNANO_NCCL_NRANKS=8 -DNANO_NCCL_CUDA_ARCH=86
+cmake --build build-mpi -j$(nproc)
+```
+
+两机、每机四张 GPU 时，MPMD 的两个 app context 都要显式导出接口：
+
+```bash
+mpirun \
+  -np 1 --host 192.168.104.246 -x NANO_NCCL_SOCKET_IFNAME=eno2 \
+    ./build-mpi/tests/nano_nccl_mpi_correctness --dtype float \
+  : -np 1 --host 192.168.104.247 -x NANO_NCCL_SOCKET_IFNAME=eno2 \
+    ./build-mpi/tests/nano_nccl_mpi_correctness --dtype float
+```
 
 ---
 
@@ -129,20 +161,23 @@ for (std::size_t i = 0; i < devices.size(); ++i) {
 communicator->check_async_error();
 ```
 
-当前单机 adapter 要求 `devices` 正好是可见 device 顺序
-`{0, ..., NANO_NCCL_NRANKS - 1}`。`all_reduce` 为 out-of-place，支持 `float`、
-FP16、BF16 和 `sum`。`reduce_scatter` 与 `all_gather` 已在公共 interface 中暴露，
-但当前会抛出 unsupported-operation 错误。MPI bootstrap 和 socket transport 尚未实现。
+单机 adapter 要求 `devices` 正好是可见 device 顺序
+`{0, ..., NANO_NCCL_NRANKS - 1}`。MPI 构建时，`nano_nccl/mpi.h` 提供
+`create_communicator_from_mpi(MPI_COMM_WORLD, config)` 以创建分布式 communicator。
+`all_reduce` 为 out-of-place，支持 `float`、FP16、BF16 和 `sum`。
+`reduce_scatter` 与 `all_gather` 已在公共 interface 中暴露，但当前会抛出
+unsupported-operation 错误。
 
 ### 通信路径选择
 
-`--transport` 接受 `auto`、`shm` 和 `p2p`。
+单机时 `--transport` 接受 `auto`、`shm` 和 `p2p`。分布式 MPI communicator
+接受 `auto`，跨进程 ring edge 会解析为 socket。
 
 - `auto`（默认值）对每条 ring edge 独立选择：只有具备 direct NVLink 和双向 CUDA peer access 时才选择 P2P；其余 edge 使用 SHM。最终路径可能是 `shm`、`p2p` 或 `mixed`。
 - `shm` 强制使用 mapped host memory 的 SHM FIFO 路径。
 - `p2p` 要求每条 ring edge 都具备所需的双向 peer access。任一方向不可用时，初始化会在第一个不可用方向报错，不会回退。
 
-P2P 是单机通信路径，需要每对完整配置环邻居之间的双向 CUDA peer access；它不是多机或网络通信路径。
+P2P 是单机通信路径，需要每对完整配置环邻居之间的双向 CUDA peer access；它不是多机或网络通信路径。socket 使用可信、仅 IPv4 的 TCP 网络边界，不提供 TLS 或自动重连。
 
 ---
 
@@ -150,11 +185,13 @@ P2P 是单机通信路径，需要每对完整配置环邻居之间的双向 CUD
 
 当前仅支持：
 
-- 单机多 GPU（已验证 `CUDA_VISIBLE_DEVICES=0,1,2,3`；rank 数可通过 `NANO_NCCL_NRANKS` 配置）
+- 单机多 GPU 性能路径（已验证 `CUDA_VISIBLE_DEVICES=0,1,2,3`）；可选 MPI/socket 多机 `all_reduce` 正确性路径
 - `float`、FP16（`fp16`）和 BF16（`bf16`）类型；BF16 需要 SM80+
 - `sum` 规约操作
 - out-of-place
-- SHM FIFO 和 device P2P FIFO 通信路径；P2P 仅支持单机
+- SHM FIFO、device P2P FIFO 通信路径，以及跨进程 ring edge 的可选 MPI/socket；P2P 仅支持单机
+
+尚未建立多机性能对比或性能验收 gate。本项目不是通用 NCCL 替代品。
 
 未来计划扩展：
 

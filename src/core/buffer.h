@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <vector>
 
 #include <cuda_runtime.h>
 
@@ -108,21 +109,24 @@ template <typename T = float>
 class MappedBuffer {
 public:
     MappedBuffer() = default;
-    explicit MappedBuffer(std::size_t count, int numa_node = -1);
+    explicit MappedBuffer(std::size_t count, int numa_node,
+                          std::vector<int> devices);
     ~MappedBuffer() { release(); }
 
     MappedBuffer(const MappedBuffer&) = delete;
     MappedBuffer& operator=(const MappedBuffer&) = delete;
 
-    void reset(std::size_t count, int numa_node = -1);
+    void reset(std::size_t count, int numa_node, std::vector<int> devices);
     void release();
 
-    T* device_ptr(int dev) const;
+    T* device_ptr(int device) const;
+    T* host_ptr() const { return host_ptr_; }
 
 private:
     std::size_t count_ = 0;
     T* host_ptr_ = nullptr;
-    T* device_ptrs_[kRanks]{};
+    std::vector<int> devices_;
+    std::vector<T*> device_ptrs_;
 };
 
 // 基于 /dev/shm + cudaHostRegister 的映射 buffer；mapped flag 路径使用。
@@ -170,17 +174,43 @@ public:
     MappedU64Array(const MappedU64Array&) = delete;
     MappedU64Array& operator=(const MappedU64Array&) = delete;
 
-    void reset(int count, int numa_node = -1);
+    void reset(int count, int numa_node, std::vector<int> devices);
     void release();
 
     void clear_host();
 
-    std::uint64_t* device_ptr(int dev) const { return device_ptrs_[dev]; }
+    std::uint64_t* device_ptr(int device) const;
+    std::uint64_t* host_ptr() const { return host_ptr_; }
 
 private:
     int count_ = 0;
     std::uint64_t* host_ptr_ = nullptr;
-    std::uint64_t* device_ptrs_[kRanks]{};
+    std::vector<int> devices_;
+    std::vector<std::uint64_t*> device_ptrs_;
+};
+
+// 跨本地 GPU 映射的 u32 数组；socket proxy 的 slice 大小和 abort flag 使用。
+class MappedU32Array {
+public:
+    MappedU32Array() = default;
+    ~MappedU32Array() { release(); }
+
+    MappedU32Array(const MappedU32Array&) = delete;
+    MappedU32Array& operator=(const MappedU32Array&) = delete;
+
+    void reset(int count, int numa_node, std::vector<int> devices);
+    void release();
+
+    void clear_host();
+
+    std::uint32_t* device_ptr(int device) const;
+    std::uint32_t* host_ptr() const { return host_ptr_; }
+
+private:
+    int count_ = 0;
+    std::uint32_t* host_ptr_ = nullptr;
+    std::vector<int> devices_;
+    std::vector<std::uint32_t*> device_ptrs_;
 };
 
 }  // namespace nano_nccl::core

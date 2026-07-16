@@ -10,6 +10,10 @@
 
 namespace nano_nccl {
 
+namespace collective::all_reduce {
+class CommunicatorFactory;
+}
+
 struct CommunicatorConfig {
     std::vector<int> devices;
     TransportKind transport = TransportKind::Auto;
@@ -38,6 +42,7 @@ public:
     void check_async_error() const;
     int local_rank_count() const noexcept;
     int global_rank_count() const noexcept;
+    TransportKind transport() const noexcept;
 
 private:
     class Impl;
@@ -46,6 +51,7 @@ private:
 
     friend std::unique_ptr<Communicator> create_communicator(
         const CommunicatorConfig& config);
+    friend class collective::all_reduce::CommunicatorFactory;
 };
 
 std::unique_ptr<Communicator> create_communicator(

@@ -18,9 +18,20 @@ set(NANO_NCCL_NCHANNELS 4 CACHE STRING "Number of channels")
 set(NANO_NCCL_CUDA_ARCH 61 CACHE STRING "CUDA compute capability (e.g. 61 for sm_61)")
 set(NANO_NCCL_BLOCK_THREADS 512 CACHE STRING "Threads per block")
 set(NANO_NCCL_FIFO_BUFF_BYTES 33554432 CACHE STRING "FIFO buffer size in bytes")
+option(NANO_NCCL_ENABLE_MPI "Build the optional MPI communicator bootstrap adapter" OFF)
+option(NANO_NCCL_SOCKET_TEST_FAULT_INJECTION
+       "Build a test-only MPI socket fault-injection library" OFF)
 
-find_package(CUDA REQUIRED)
+if(NANO_NCCL_SOCKET_TEST_FAULT_INJECTION AND NOT NANO_NCCL_ENABLE_MPI)
+    message(FATAL_ERROR
+        "NANO_NCCL_SOCKET_TEST_FAULT_INJECTION requires NANO_NCCL_ENABLE_MPI=ON")
+endif()
+
+find_package(CUDAToolkit REQUIRED)
 find_library(NUMA_LIB numa REQUIRED)
+if(NANO_NCCL_ENABLE_MPI)
+    find_package(MPI REQUIRED)
+endif()
 
 add_subdirectory(src)
 
@@ -30,6 +41,15 @@ target_compile_definitions(nano_nccl PUBLIC
     NANO_NCCL_BLOCK_THREADS=${NANO_NCCL_BLOCK_THREADS}
     NANO_NCCL_FIFO_BUFF_BYTES=${NANO_NCCL_FIFO_BUFF_BYTES}
 )
+
+if(NANO_NCCL_SOCKET_TEST_FAULT_INJECTION)
+    target_compile_definitions(nano_nccl_test_fault PUBLIC
+        NANO_NCCL_NRANKS=${NANO_NCCL_NRANKS}
+        NANO_NCCL_NCHANNELS=${NANO_NCCL_NCHANNELS}
+        NANO_NCCL_BLOCK_THREADS=${NANO_NCCL_BLOCK_THREADS}
+        NANO_NCCL_FIFO_BUFF_BYTES=${NANO_NCCL_FIFO_BUFF_BYTES}
+    )
+endif()
 
 add_subdirectory(benchmarks)
 add_subdirectory(tests)

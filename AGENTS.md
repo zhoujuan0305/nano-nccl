@@ -6,9 +6,10 @@ This project is a GPU collective communication library targeting NCCL-equivalent
 
 Current capabilities:
 
-- Single-node multi-GPU (tested with `CUDA_VISIBLE_DEVICES=0,1,2,3`; rank count configurable via CMake `NANO_NCCL_NRANKS`)
+- Single-node multi-GPU performance path (tested with `CUDA_VISIBLE_DEVICES=0,1,2,3`; rank count configurable via CMake `NANO_NCCL_NRANKS`)
+- Optional MPI/socket multi-host, out-of-place `all_reduce` correctness path; Open MPI 4.1.2 and the same MPI ABI are required on all hosts
 - `float`, FP16, and BF16 dtypes with the `sum` reduce op, out-of-place; BF16 requires SM80+
-- Ring + Simple protocol, with SHM FIFO and device P2P FIFO transports
+- Ring + Simple protocol, with SHM FIFO, device P2P FIFO, and optional MPI/socket transports
 - A6000 same-round results exceed the NCCL `Ring` + `Simple` + 4 channels baseline for float, FP16, and BF16 (see Acceptance section below)
 
 Future expansion axes:
@@ -19,7 +20,7 @@ Future expansion axes:
 - **collective**: `all_reduce` → `all_gather`/`reduce_scatter`/`broadcast`
 - **transport**: SHM FIFO/P2P FIFO → network
 
-Only the above scenario is currently supported. Do not claim general NCCL replacement capability until expansion is complete.
+`all_gather` and `reduce_scatter` are unsupported. There is no multi-host performance gate, and socket has no TLS or automatic reconnect; use it only on a trusted network. Do not claim general NCCL replacement capability until expansion is complete.
 
 ## Directory Structure
 
@@ -30,7 +31,9 @@ nano-nccl/
 ├── include/nano_nccl/
 │   ├── types.h                        # dtype/redop/config enums and structs
 │   ├── traits.h                       # dtype traits (pack/unpack), redop traits
-│   └── all_reduce.h                   # public API
+│   ├── communicator.h                 # public communicator and collective API
+│   ├── mpi.h                          # optional MPI communicator factory
+│   └── all_reduce.h                   # public benchmark API
 ├── src/
 │   ├── CMakeLists.txt
 │   ├── core/
@@ -41,15 +44,24 @@ nano-nccl/
 │   │   ├── transport.h                # Transport interface (seam for network)
 │   │   ├── simple_protocol.h          # Shared Simple protocol constants
 │   │   ├── p2p/
-│   │   │   └── p2p_fifo.h / .cu       # Device FIFO and ring peer-access checks
-│   │   └── shm/
+│   │   │   ├── p2p_fifo.h / .cu       # Device FIFO storage
+│   │   │   ├── p2p_step_counters.h/.cu # Device P2P step counters
+│   │   │   └── p2p_topology.h / .cu   # Ring peer-access checks
+│   │   ├── shm/
 │   │       ├── shm_fifo.h / .cu       # SHM FIFO buffer management
 │   │       └── shm_step.h             # step counter (wait/post)
+│   │   └── socket/
+│   │       ├── socket_endpoint.h / .cc # IPv4 endpoint and HELLO exchange
+│   │       ├── socket_protocol.h       # framed socket slice protocol
+│   │       └── socket_proxy.h / .cc    # host send/receive proxy threads
 │   ├── collective/
 │   │   ├── collective.h               # Collective interface (seam for all_gather etc.)
 │   │   └── all_reduce/
-│   │       ├── ring_simple.h          # ring_simple entry declaration
-│   │       └── ring_simple.cu         # host-side launcher + kernel template instantiation
+│   │       ├── communicator.cu         # communicator orchestration and transports
+│   │       ├── communicator_internal.h  # factory and owned socket connections
+│   │       ├── mpi_communicator.cc     # MPI bootstrap and socket connection exchange
+│   │       ├── topology.h / .cc         # local/global rank and edge topology
+│   │       └── ring_simple.h / .cu      # single-host benchmark implementation
 │   └── kernels/
 │       └── ring_simple_kernel.cuh     # device kernel template
 ├── benchmarks/
@@ -57,20 +69,28 @@ nano-nccl/
 │   └── all_reduce_bench.cu            # correctness + perf integrated benchmark
 ├── tests/
 │   ├── CMakeLists.txt
+│   ├── communicator_cleanup_static.py # communicator cleanup static regression check
 │   ├── smoke.cu                       # CUDA device/P2P smoke test
-│   └── correctness.cu                 # all_reduce correctness-only test
+│   ├── correctness.cu                 # single-host all_reduce correctness
+│   ├── public_api.cu                   # public communicator API coverage
+│   ├── p2p_step_counters.cu            # P2P step-counter coverage
+│   ├── p2p_topology.cu                 # P2P topology coverage
+│   ├── mpi_bootstrap.cu               # MPI bootstrap and socket smoke coverage
+│   ├── mpi_correctness.cu             # MPI/socket correctness and fault injection
+│   ├── socket_protocol_test.cc         # socket framing and proxy behavior
+│   └── simple_protocol.cu              # Simple protocol layout invariants
 └── LICENSE
 ```
 
 Directory responsibilities:
 
-- `include/nano_nccl/`: public headers, external users only include from here
+- `include/nano_nccl/`: public headers; `mpi.h` is available only in an MPI build
 - `src/core/`: infrastructure, collective-agnostic (buffer, NUMA, stream)
 - `src/transport/`: transport abstraction, subdirectories per transport type
 - `src/collective/`: collective operation abstraction, subdirectories per collective type
 - `src/kernels/`: device kernel template headers (`.cuh`), referenced and instantiated by collective implementations
 - `benchmarks/`: perf + correctness integrated benchmark
-- `tests/`: standalone correctness test and smoke test
+- `tests/`: single-host, MPI/socket, transport, and protocol regression coverage
 
 ## Naming Conventions
 
@@ -89,6 +109,7 @@ Namespace layering maps 1:1 to directory structure:
 - `nano_nccl::core` — buffer, numa, stream
 - `nano_nccl::transport::p2p` — device FIFO, P2P ring validation
 - `nano_nccl::transport::shm` — SHM FIFO, step counter
+- `nano_nccl::transport::socket` — IPv4 endpoints and socket proxy threads
 - `nano_nccl::collective::all_reduce` — all_reduce host-side orchestration
 - `nano_nccl::kernels` — device kernel templates
 
@@ -112,7 +133,7 @@ Namespace layering maps 1:1 to directory structure:
 
 - **Device kernel** is templated: `template<int NRanks, typename T, typename RedOp> __global__ void ring_simple_kernel(...)`. dtype, reduce op, and rank count are compile-time parameters, enabling loop unrolling and zero virtual-call overhead.
 - **Host side** uses runtime parameters to select algo/transport/collective, does not require compiling all combinations.
-- **Transport**: SHM FIFO or device P2P FIFO. SHM GPUs read/write mapped host memory directly over PCIe (`cudaHostAllocMapped`), with no proxy thread or `cudaMemcpy`; FIFO buffers are allocated on the receiver NUMA node to avoid cross-NUMA bandwidth loss. P2P FIFO buffers are allocated on the receiver GPU and require bidirectional CUDA peer access between every ring-neighbor pair.
+- **Transport**: SHM FIFO, device P2P FIFO, or MPI/socket for cross-process ring edges. SHM GPUs read/write mapped host memory directly over PCIe (`cudaHostAllocMapped`), with no proxy thread or `cudaMemcpy`; FIFO buffers are allocated on the receiver NUMA node to avoid cross-NUMA bandwidth loss. P2P FIFO buffers are allocated on the receiver GPU and require bidirectional CUDA peer access between every ring-neighbor pair. Socket uses an IPv4 listener chosen by `NANO_NCCL_SOCKET_IFNAME`; it is a trusted-network transport without TLS or auto reconnect.
 
 ### Transport selection
 
@@ -125,10 +146,12 @@ resolved edge plan. `shm` always selects SHM. Explicit `p2p` validates those
 directions and fails on the first unavailable direction; it does not fall back.
 P2P is single-node only and is not a network transport.
 
+For MPI/socket launches, set `NANO_NCCL_SOCKET_IFNAME` to an interface with exactly one usable IPv4 address in every MPMD app context. `NANO_NCCL_SOCKET_TEST_FAULT_INJECTION=ON` builds a separate test-only library for `nano_nccl_mpi_correctness`; ordinary MPI benchmarks always link the library without the `NANO_NCCL_SOCKET_FAIL_AFTER_SLICES` hook.
+
 **Key design points**:
 
 - Step counter persists across iterations (matching NCCL `conn->step`); `run_batch` uses CUDA events for cross-stream barriers instead of per-iteration `cudaStreamSynchronize`, aligning with NCCL `BenchTime` timing methodology.
-- `kSimpleFifoSliceSteps = 4` (SlicePerChunk = 1), eliminating empty-slice barrier and polling overhead.
+- `kSimpleFifoSliceSteps = 2` (two slices per chunk), matching the active Simple protocol constants.
 - Wait cache (`send_head_cache`/`recv_tail_cache`) matches NCCL `connStepCache`, avoiding reloading step counter from host memory on every wait.
 
 ## Build
@@ -141,11 +164,20 @@ cmake .. -DCMAKE_BUILD_TYPE=Release \
 make -j$(nproc)
 ```
 
+Optional two-host MPI/socket build (both hosts must build the same commit and use the same Open MPI 4.1.2 ABI):
+
+```bash
+cmake -S . -B build-mpi -DCMAKE_BUILD_TYPE=Release \
+  -DNANO_NCCL_ENABLE_MPI=ON -DNANO_NCCL_NRANKS=8 -DNANO_NCCL_CUDA_ARCH=86
+cmake --build build-mpi -j$(nproc)
+```
+
 Build artifacts:
 
 - `build/benchmarks/nano_nccl_all_reduce_bench` — perf + correctness benchmark
 - `build/tests/nano_nccl_correctness` — correctness-only test
 - `build/tests/nano_nccl_smoke` — smoke test
+- `build-mpi/tests/nano_nccl_mpi_correctness` — MPI/socket correctness and test-only fault injection
 
 ## Acceptance
 
@@ -184,6 +216,8 @@ NCCL_MIN_NCHANNELS=4 NCCL_MAX_NCHANNELS=4 NCCL_BUFFSIZE=33554432 \
 ```
 
 Pass criterion: for each contract message size `s`, `candidate_busbw(s) >= nccl_busbw(s)`.
+
+This is a single-host acceptance criterion only; no multi-host socket performance criterion has been established.
 
 ## Extension Guide
 
