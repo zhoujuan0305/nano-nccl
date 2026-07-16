@@ -14,6 +14,16 @@ target_link_libraries(nano_nccl_p2p_topology PRIVATE nano_nccl)
 add_executable(nano_nccl_simple_protocol simple_protocol.cu)
 target_link_libraries(nano_nccl_simple_protocol PRIVATE nano_nccl)
 
+if(BUILD_TESTING)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(
+        NAME nano_nccl_communicator_bf16_validation_static
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/communicator_bf16_validation_static.py
+                ${CMAKE_SOURCE_DIR}/src/collective/all_reduce/communicator.cu
+    )
+endif()
+
 if(NANO_NCCL_ENABLE_MPI)
     add_executable(nano_nccl_mpi_correctness mpi_correctness.cu)
     target_include_directories(nano_nccl_mpi_correctness PRIVATE ${MPI_CXX_INCLUDE_DIRS})
