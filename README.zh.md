@@ -8,7 +8,8 @@ All Reduce 库：已验证的单机路径目标是达到 NCCL `Ring` + `Simple` 
 
 ## 性能
 
-下表给出当前实测的 out-of-place `busbw` 绝对值（GB/s，`-w 5 -n 20`）。
+下表给出 out-of-place `busbw` 绝对值（GB/s，`-w 5 -n 20`）。BF16 行在
+2026-07-16 修复 BF16 device-capability validation cache 后重新测量。
 
 ### 单机：4× RTX A6000
 
@@ -18,7 +19,7 @@ CUDA 12.8，`CUDA_VISIBLE_DEVICES=0,1,2,3`，`--transport auto` 解析为 `mixed
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | float | 6.88 / 6.43 | 14.80 / 14.14 | 19.30 / 19.50 | 22.47 / 22.61 | 23.29 / 22.95 | 1.023 |
 | fp16 | 6.84 / 6.33 | 14.43 / 14.29 | 19.32 / 19.70 | 22.44 / 22.73 | 23.29 / 23.17 | 1.012 |
-| bf16 | 0.11 / 6.35 | 0.45 / 14.42 | 1.56 / 19.94 | 5.82 / 22.77 | 16.42 / 23.17 | 0.095 |
+| bf16 | 6.83 / 6.41 | 14.73 / 14.33 | 19.38 / 19.95 | 22.48 / 22.77 | 23.31 / 22.74 | 1.015 |
 
 ### 两机：2×4 RTX A6000，经 TCP socket
 
@@ -57,6 +58,16 @@ cmake .. -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=8
 - `build/benchmarks/nano_nccl_all_reduce_bench` — 性能 + 正确性 benchmark
 - `build/tests/nano_nccl_correctness` — 纯正确性测试
 - `build/tests/nano_nccl_smoke` — 冒烟测试
+- `build/tests/nano_nccl_public_api` — 公共 C++ API 覆盖测试
+- `build/tests/nano_nccl_p2p_step_counters` — P2P step-counter 覆盖测试
+- `build/tests/nano_nccl_p2p_topology` — P2P topology 覆盖测试
+- `build/tests/nano_nccl_simple_protocol` — Simple protocol layout 覆盖测试
+- `build-mpi/tests/nano_nccl_mpi_correctness` — MPI/socket 正确性测试（MPI 构建）
+- `build-mpi/tests/nano_nccl_mpi_bootstrap` — MPI bootstrap 冒烟测试（MPI 构建）
+- `build-mpi/tests/nano_nccl_socket_protocol` — socket framing 与 proxy 测试（MPI 构建）
+
+启用 `BUILD_TESTING`（默认开启）时，`ctest --test-dir build
+--output-on-failure` 还会运行 BF16 capability-validation 的静态回归检查。
 
 ### CMake 选项
 
@@ -191,7 +202,7 @@ P2P 是单机通信路径，需要每对完整配置环邻居之间的双向 CUD
 - out-of-place
 - SHM FIFO、device P2P FIFO 通信路径，以及跨进程 ring edge 的可选 MPI/socket；P2P 仅支持单机
 
-尚未建立多机性能对比或性能验收 gate。本项目不是通用 NCCL 替代品。
+尚未建立多机性能验收 gate。本项目不是通用 NCCL 替代品。
 
 未来计划扩展：
 

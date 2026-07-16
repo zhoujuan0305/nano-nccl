@@ -10,7 +10,7 @@ Current capabilities:
 - Optional MPI/socket multi-host, out-of-place `all_reduce` correctness path; Open MPI 4.1.2 and the same MPI ABI are required on all hosts
 - `float`, FP16, and BF16 dtypes with the `sum` reduce op, out-of-place; BF16 requires SM80+
 - Ring + Simple protocol, with SHM FIFO, device P2P FIFO, and optional MPI/socket transports
-- A6000 same-round results exceed the NCCL `Ring` + `Simple` + 4 channels baseline for float, FP16, and BF16 (see Acceptance section below)
+- The BF16 device-capability validation is cached after its first successful use; the full A6000 single-host performance gate is pending revalidation (see Acceptance section below)
 
 Future expansion axes:
 
@@ -70,6 +70,7 @@ nano-nccl/
 ├── tests/
 │   ├── CMakeLists.txt
 │   ├── communicator_cleanup_static.py # communicator cleanup static regression check
+│   ├── communicator_bf16_validation_static.py # BF16 validation-cache static regression check
 │   ├── smoke.cu                       # CUDA device/P2P smoke test
 │   ├── correctness.cu                 # single-host all_reduce correctness
 │   ├── public_api.cu                   # public communicator API coverage
@@ -177,26 +178,37 @@ Build artifacts:
 - `build/benchmarks/nano_nccl_all_reduce_bench` — perf + correctness benchmark
 - `build/tests/nano_nccl_correctness` — correctness-only test
 - `build/tests/nano_nccl_smoke` — smoke test
+- `build/tests/nano_nccl_public_api` — public C++ API coverage
+- `build/tests/nano_nccl_p2p_step_counters` — P2P step-counter coverage
+- `build/tests/nano_nccl_p2p_topology` — P2P topology coverage
+- `build/tests/nano_nccl_simple_protocol` — Simple protocol layout coverage
 - `build-mpi/tests/nano_nccl_mpi_correctness` — MPI/socket correctness and test-only fault injection
+- `build-mpi/tests/nano_nccl_mpi_bootstrap` — MPI bootstrap smoke test
+- `build-mpi/tests/nano_nccl_socket_protocol` — socket framing and proxy behavior
+
+When `BUILD_TESTING` is enabled (the default), `ctest --test-dir build
+--output-on-failure` also runs the static BF16 capability-validation regression
+check.
 
 ## Acceptance
 
-Current status: **PASS** (2026-07-14)
+Current status: **REVALIDATION PENDING** (2026-07-16)
 
 Candidate path: `ring_simple` (Ring + Simple protocol, `--transport auto`)
 
 Use `-w 5 -n 20` for all future performance measurements and NCCL comparisons.
 
-Same-round comparison (out-of-place busbw) on 4× NVIDIA RTX A6000 (Ampere
-sm_86), CUDA 12.8. `auto` resolved to a mixed P2P/SHM edge plan. The values
-below are geomean `candidate_busbw / nccl_busbw`; all 15 measured points had
-`#wrong=0` and met the per-size gate.
+The prior full `PASS` table is retired: its BF16 figures conflicted with the
+README and predated the BF16 validation-cache fix. A same-round BF16 comparison
+(out-of-place busbw) on 4× NVIDIA RTX A6000 (Ampere sm_86), CUDA 12.8, was
+rerun on 2026-07-16. `auto` resolved to a mixed P2P/SHM edge plan. All points
+had `#wrong=0`; however, the 4 MiB and 16 MiB points were below the NCCL
+baseline, so this result restores BF16 performance but does not satisfy the
+full per-size acceptance gate.
 
 | dtype | 256 KiB | 1 MiB | 4 MiB | 16 MiB | 64 MiB | geomean |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| float | 1.335 | 1.241 | 1.038 | 1.007 | 1.019 | 1.120 |
-| FP16 | 1.388 | 1.207 | 1.038 | 1.009 | 1.017 | 1.123 |
-| BF16 | 1.421 | 1.242 | 1.038 | 1.015 | 1.018 | 1.136 |
+| BF16 | 1.066 | 1.028 | 0.971 | 0.987 | 1.025 | 1.015 |
 
 Re-verification commands:
 
