@@ -67,7 +67,7 @@ Build artifacts:
 
 When `BUILD_TESTING` is enabled (the default), `ctest --test-dir build
 --output-on-failure` also runs the static BF16 capability-validation regression
-check.
+and benchmark profiling static regressions.
 
 ### CMake options
 
@@ -80,6 +80,7 @@ check.
 | `NANO_NCCL_FIFO_BUFF_BYTES` | 33554432 | FIFO buffer size in bytes (32 MiB) |
 | `NANO_NCCL_ENABLE_MPI` | `OFF` | Build the MPI communicator bootstrap and distributed benchmark/test |
 | `NANO_NCCL_SOCKET_TEST_FAULT_INJECTION` | `OFF` | Build a separate test-only fault-injection library for `nano_nccl_mpi_correctness`; ordinary MPI benchmarks never include the hook |
+| `NANO_NCCL_ENABLE_BENCH_PROFILING` | `OFF` | Compile NVTX/CUDA-profiler instrumentation into the all-reduce benchmark; keep `OFF` for reported bandwidth |
 
 NUMA topology is detected at runtime by reading `/sys/bus/pci/devices/*/numa_node` — no source code changes needed when moving to a different machine.
 
@@ -127,6 +128,24 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_correctness
 # Smoke test
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_smoke
 ```
+
+### Optional NVTX/CUDA profiling
+
+Build a separate profiling binary; do not use this build for performance comparisons:
+
+```bash
+cmake -S . -B build-profile -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
+  -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=86 \
+  -DNANO_NCCL_ENABLE_BENCH_PROFILING=ON
+cmake --build build-profile -j$(nproc)
+nsys profile --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop --output=bench-nvtx-profile \
+  ./build-profile/benchmarks/nano_nccl_all_reduce_bench \
+  --algo ring_simple --transport auto --dtype float -b 262144 -e 262144 -f 2 -w 1 -n 2
+nsys stats --report nvtx_pushpop_sum bench-nvtx-profile.nsys-rep
+```
+
+For every message size, the capture contains an outer `all_reduce size=<bytes>B` range and one `all_reduce size=<bytes>B iteration=<iteration>` range per measured iteration. Warmup is outside capture. CUDA 12.8 emits an NVTX 2 deprecation notice for `<nvToolsExt.h>`; it does not invalidate the capture.
 
 ## Public C++ API
 

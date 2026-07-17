@@ -66,7 +66,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=8
 - `build-mpi/tests/nano_nccl_socket_protocol` — socket framing 与 proxy 测试（MPI 构建）
 
 启用 `BUILD_TESTING`（默认开启）时，`ctest --test-dir build
---output-on-failure` 还会运行 BF16 capability-validation 的静态回归检查。
+--output-on-failure` 还会运行 BF16 capability-validation 和 benchmark profiling 的静态回归检查。
 
 ### CMake 选项
 
@@ -79,6 +79,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=8
 | `NANO_NCCL_FIFO_BUFF_BYTES` | 33554432 | FIFO buffer 大小（字节，默认 32 MiB） |
 | `NANO_NCCL_ENABLE_MPI` | `OFF` | 构建 MPI communicator bootstrap 与分布式 benchmark/test |
 | `NANO_NCCL_SOCKET_TEST_FAULT_INJECTION` | `OFF` | 为 `nano_nccl_mpi_correctness` 构建独立的仅测试故障注入库；普通 MPI benchmark 永不包含该钩子 |
+| `NANO_NCCL_ENABLE_BENCH_PROFILING` | `OFF` | 将 NVTX/CUDA profiler instrumentation 编译到 all-reduce benchmark；报告带宽时保持 `OFF` |
 
 NUMA 拓扑在运行时从 `/sys/bus/pci/devices/*/numa_node` 自动检测，换机器不需要改源码。
 
@@ -126,6 +127,24 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_correctness
 # 冒烟测试
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_smoke
 ```
+
+### 可选 NVTX/CUDA profiling
+
+构建独立的 profiling binary；请勿将此构建用于性能比较：
+
+```bash
+cmake -S . -B build-profile -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
+  -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=86 \
+  -DNANO_NCCL_ENABLE_BENCH_PROFILING=ON
+cmake --build build-profile -j$(nproc)
+nsys profile --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop --output=bench-nvtx-profile \
+  ./build-profile/benchmarks/nano_nccl_all_reduce_bench \
+  --algo ring_simple --transport auto --dtype float -b 262144 -e 262144 -f 2 -w 1 -n 2
+nsys stats --report nvtx_pushpop_sum bench-nvtx-profile.nsys-rep
+```
+
+对于每个消息大小，capture 包含一个外层 `all_reduce size=<bytes>B` range，以及每个测量 iteration 一个 `all_reduce size=<bytes>B iteration=<iteration>` range。warmup 位于 capture 之外。CUDA 12.8 会针对 `<nvToolsExt.h>` 输出 NVTX 2 deprecation notice；这不会导致 capture 无效。
 
 ## 公共 C++ API
 

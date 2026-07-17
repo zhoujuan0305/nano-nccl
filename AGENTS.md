@@ -154,6 +154,7 @@ For MPI/socket launches, set `NANO_NCCL_SOCKET_IFNAME` to an interface with exac
 - Step counter persists across iterations (matching NCCL `conn->step`); `run_batch` uses CUDA events for cross-stream barriers instead of per-iteration `cudaStreamSynchronize`, aligning with NCCL `BenchTime` timing methodology.
 - `kSimpleFifoSliceSteps = 2` (two slices per chunk), matching the active Simple protocol constants.
 - Wait cache (`send_head_cache`/`recv_tail_cache`) matches NCCL `connStepCache`, avoiding reloading step counter from host memory on every wait.
+- Optional benchmark profiling is guarded by `NANO_NCCL_ENABLE_BENCH_PROFILING`; when `OFF`, the default performance path compiles no NVTX or CUDA profiler calls and has no iteration-time profiling condition. When `ON`, every size starts capture after warmup, creates an outer `all_reduce size=<bytes>B` range plus `all_reduce size=<bytes>B iteration=<iteration>` per-iteration ranges, synchronizes, stops capture, then validates. CUDA 12.8 warns that NVTX 2 `<nvToolsExt.h>` is deprecated; the supported range API remains in use.
 
 ## Build
 
@@ -163,6 +164,16 @@ cmake .. -DCMAKE_BUILD_TYPE=Release \
   -DNANO_NCCL_NRANKS=<your_gpu_count> \
   -DNANO_NCCL_CUDA_ARCH=<your_cuda_arch>
 make -j$(nproc)
+```
+
+Optional benchmark profiling build (CUDA 12.8):
+
+```bash
+cmake -S . -B build-profile -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
+  -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=86 \
+  -DNANO_NCCL_ENABLE_BENCH_PROFILING=ON
+cmake --build build-profile -j$(nproc)
 ```
 
 Optional two-host MPI/socket build (both hosts must build the same commit and use the same Open MPI 4.1.2 ABI):
@@ -188,7 +199,7 @@ Build artifacts:
 
 When `BUILD_TESTING` is enabled (the default), `ctest --test-dir build
 --output-on-failure` also runs the static BF16 capability-validation regression
-check.
+and benchmark profiling static regressions.
 
 ## Acceptance
 
@@ -197,6 +208,8 @@ Current status: **REVALIDATION PENDING** (2026-07-16)
 Candidate path: `ring_simple` (Ring + Simple protocol, `--transport auto`)
 
 Use `-w 5 -n 20` for all future performance measurements and NCCL comparisons.
+
+Only default-OFF binaries may provide candidate performance results; profiling-enabled binaries are observability-only.
 
 The prior full `PASS` table is retired: its BF16 figures conflicted with the
 README and predated the BF16 validation-cache fix. A same-round BF16 comparison
