@@ -22,6 +22,18 @@ if(BUILD_TESTING)
                 ${CMAKE_CURRENT_SOURCE_DIR}/communicator_bf16_validation_static.py
                 ${CMAKE_SOURCE_DIR}/src/collective/all_reduce/communicator.cu
     )
+    add_test(
+        NAME nano_nccl_bench_profiling_static
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/bench_profiling_static.py
+                ${CMAKE_SOURCE_DIR}/CMakeLists.txt
+                 ${CMAKE_SOURCE_DIR}/src/CMakeLists.txt
+                 ${CMAKE_SOURCE_DIR}/benchmarks/CMakeLists.txt
+                 ${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
+                 ${CMAKE_SOURCE_DIR}/src/collective/all_reduce/ring_simple.cu
+                 ${CMAKE_SOURCE_DIR}/src/collective/all_reduce/bench_profiling.h
+                 ${CMAKE_SOURCE_DIR}/benchmarks/all_reduce_bench.cu
+    )
 endif()
 
 if(NANO_NCCL_ENABLE_MPI)

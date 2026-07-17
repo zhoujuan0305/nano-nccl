@@ -1,5 +1,9 @@
 #include "collective/all_reduce/ring_simple.h"
 
+#if defined(NANO_NCCL_ENABLE_BENCH_PROFILING)
+#include "collective/all_reduce/bench_profiling.h"
+#endif
+
 #include "core/buffer.h"
 #include "core/stream.h"
 #include "nano_nccl/communicator.h"
@@ -127,7 +131,7 @@ public:
         sync_streams(raw_streams());
     }
 
-    void run_batch(std::size_t count, int iters) {
+    void run_batch(std::size_t count, int iters, std::size_t bytes) {
         cudaEvent_t iter_events[kRanks];
         for (int rank = 0; rank < kRanks; ++rank) {
             CUDA_CHECK_THROW(cudaSetDevice(rank));
@@ -146,6 +150,10 @@ public:
                     }
                 }
             }
+#if defined(NANO_NCCL_ENABLE_BENCH_PROFILING)
+            bench_profiling::NvtxRange iteration_range(
+                bench_profiling::all_reduce_iteration_range_name(bytes, iteration));
+#endif
             communicator_->all_reduce(make_args(count));
             for (int rank = 0; rank < kRanks; ++rank) {
                 CUDA_CHECK_THROW(cudaSetDevice(rank));
@@ -228,11 +236,22 @@ int run_ring_simple_bench_typed(const BenchConfig& config,
             for (int iteration = 0; iteration < config.warmup_iters; ++iteration) {
                 runner.run_once(count);
             }
+            double time_us;
+#if defined(NANO_NCCL_ENABLE_BENCH_PROFILING)
+            bench_profiling::ProfilerSession profiler;
+            {
+                bench_profiling::NvtxRange size_range(
+                    bench_profiling::all_reduce_size_range_name(bytes));
+#endif
             auto start = std::chrono::steady_clock::now();
-            runner.run_batch(count, config.iters);
+            runner.run_batch(count, config.iters, bytes);
             auto end = std::chrono::steady_clock::now();
-            double time_us = std::chrono::duration<double, std::micro>(end - start).count() /
-                             static_cast<double>(config.iters);
+            time_us = std::chrono::duration<double, std::micro>(end - start).count() /
+                      static_cast<double>(config.iters);
+#if defined(NANO_NCCL_ENABLE_BENCH_PROFILING)
+            }
+            profiler.stop();
+#endif
 
             float max_abs_error = 0.0f;
             float epsilon = config.epsilon <= 0.0f ? DTypeTraits<kDType>::kDefaultEpsilon

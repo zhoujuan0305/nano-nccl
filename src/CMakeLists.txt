@@ -35,6 +35,12 @@ endfunction()
 
 add_nano_nccl_library(nano_nccl)
 
+if(NANO_NCCL_ENABLE_BENCH_PROFILING)
+    target_compile_definitions(nano_nccl PRIVATE
+        NANO_NCCL_ENABLE_BENCH_PROFILING=1)
+    target_link_libraries(nano_nccl PRIVATE CUDA::nvToolsExt)
+endif()
+
 if(NANO_NCCL_SOCKET_TEST_FAULT_INJECTION)
     add_nano_nccl_library(nano_nccl_test_fault)
     target_compile_definitions(nano_nccl_test_fault PRIVATE

@@ -23,6 +23,7 @@ set(NANO_NCCL_FIFO_BUFF_BYTES 33554432 CACHE STRING "FIFO buffer size in bytes")
 option(NANO_NCCL_ENABLE_MPI "Build the optional MPI communicator bootstrap adapter" OFF)
 option(NANO_NCCL_SOCKET_TEST_FAULT_INJECTION
        "Build a test-only MPI socket fault-injection library" OFF)
+option(NANO_NCCL_ENABLE_BENCH_PROFILING "Enable NVTX and CUDA profiler instrumentation in the all-reduce benchmark" OFF)
 
 if(NANO_NCCL_SOCKET_TEST_FAULT_INJECTION AND NOT NANO_NCCL_ENABLE_MPI)
     message(FATAL_ERROR

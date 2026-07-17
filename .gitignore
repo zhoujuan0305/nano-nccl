@@ -33,3 +33,7 @@ __pycache__/
 
 # Logs
 *.log
+
+# Nsight Systems captures
+*.nsys-rep
+*.sqlite

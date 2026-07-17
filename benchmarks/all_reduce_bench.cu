@@ -1,4 +1,7 @@
 #include "nano_nccl/all_reduce.h"
+#if defined(NANO_NCCL_ENABLE_BENCH_PROFILING)
+#include "collective/all_reduce/bench_profiling.h"
+#endif
 #if defined(NANO_NCCL_ENABLE_MPI)
 #include "nano_nccl/mpi.h"
 #include "nano_nccl/traits.h"
@@ -20,6 +23,10 @@
 #include <cuda_runtime.h>
 #if defined(NANO_NCCL_ENABLE_MPI)
 #include <mpi.h>
+#endif
+
+#if defined(NANO_NCCL_ENABLE_BENCH_PROFILING)
+namespace bench_profiling = nano_nccl::collective::all_reduce::bench_profiling;
 #endif
 
 namespace {
@@ -151,13 +158,28 @@ int run_mpi_bench_typed(const nano_nccl::BenchConfig& config,
                 launch_and_wait();
             }
             mpi_ok(MPI_Barrier(MPI_COMM_WORLD), "MPI_Barrier(benchmark start)");
+            double local_time_us = 0.0;
+#if defined(NANO_NCCL_ENABLE_BENCH_PROFILING)
+            bench_profiling::ProfilerSession profiler;
+            {
+                bench_profiling::NvtxRange size_range(
+                    bench_profiling::all_reduce_size_range_name(bytes));
+#endif
             const auto start = std::chrono::steady_clock::now();
             for (int iteration = 0; iteration < config.iters; ++iteration) {
+#if defined(NANO_NCCL_ENABLE_BENCH_PROFILING)
+                bench_profiling::NvtxRange iteration_range(
+                    bench_profiling::all_reduce_iteration_range_name(bytes, iteration));
+#endif
                 launch_and_wait();
             }
             const auto end = std::chrono::steady_clock::now();
-            const double local_time_us = std::chrono::duration<double, std::micro>(end - start).count() /
-                                         static_cast<double>(config.iters);
+            local_time_us = std::chrono::duration<double, std::micro>(end - start).count() /
+                            static_cast<double>(config.iters);
+#if defined(NANO_NCCL_ENABLE_BENCH_PROFILING)
+            }
+            profiler.stop();
+#endif
             double max_time_us = 0.0;
             mpi_ok(MPI_Allreduce(&local_time_us, &max_time_us, 1, MPI_DOUBLE, MPI_MAX,
                                  MPI_COMM_WORLD), "MPI_Allreduce(max elapsed)");
