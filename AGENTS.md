@@ -16,7 +16,7 @@ Future expansion axes:
 
 - **dtype**: `float`/FP16/BF16 → `double`/`int8`
 - **reduce op**: `sum` → `max`/`min`/`prod`
-- **rank count**: 4 → 2/8/16 (templated, host-side dispatch)
+- **rank count**: 4 → 2/8/16 (runtime parameter, no template specialization needed)
 - **collective**: `all_reduce` → `all_gather`/`reduce_scatter`/`broadcast`
 - **transport**: SHM FIFO/P2P FIFO → network
 
@@ -103,7 +103,7 @@ Directory responsibilities:
 | Namespace | snake_case, layered | `nano_nccl::core`, `nano_nccl::transport::shm` |
 | File | snake_case | `buffer.h`, `ring_simple.cu` |
 | Algorithm name | snake_case | `ring_simple` |
-| Kernel template | snake_case + template params | `ring_simple_kernel<NRanks, T, RedOp>` |
+| Kernel template | snake_case + template params | `ring_simple_kernel<T, RedOp>` |
 
 Namespace layering maps 1:1 to directory structure:
 
@@ -132,7 +132,7 @@ Namespace layering maps 1:1 to directory structure:
 
 **Hybrid polymorphism: device templates + host runtime**
 
-- **Device kernel** is templated: `template<int NRanks, typename T, typename RedOp> __global__ void ring_simple_kernel(...)`. dtype, reduce op, and rank count are compile-time parameters, enabling loop unrolling and zero virtual-call overhead.
+- **Device kernel** is templated: `template<typename T, typename RedOp> __global__ void ring_simple_kernel(...)` with `int nranks` as a runtime argument. dtype and reduce op are compile-time parameters; rank count is runtime (benchmarked lossless vs. template specialization on 4× A6000: geomean busbw ratio 1.003/0.997/0.998 for float/fp16/bf16 across 256 KiB – 64 MiB).
 - **Host side** uses runtime parameters to select algo/transport/collective, does not require compiling all combinations.
 - **Transport**: SHM FIFO, device P2P FIFO, or MPI/socket for cross-process ring edges. SHM GPUs read/write mapped host memory directly over PCIe (`cudaHostAllocMapped`), with no proxy thread or `cudaMemcpy`; FIFO buffers are allocated on the receiver NUMA node to avoid cross-NUMA bandwidth loss. P2P FIFO buffers are allocated on the receiver GPU and require bidirectional CUDA peer access between every ring-neighbor pair. Socket uses an IPv4 listener chosen by `NANO_NCCL_SOCKET_IFNAME`; it is a trusted-network transport without TLS or auto reconnect.
 
@@ -248,6 +248,6 @@ This is a single-host acceptance criterion only; no multi-host socket performanc
 
 - **New dtype**: implement pack/unpack trait in `include/nano_nccl/traits.h`, add template instantiation in `ring_simple.cu`; current `float`, FP16, and BF16 support `sum`, and BF16 requires SM80+
 - **New reduce op**: implement RedOp trait in `include/nano_nccl/traits.h`, add template instantiation in `ring_simple.cu`
-- **New rank count**: add `switch(nranks)` branch in host-side dispatch in `ring_simple.cu`, instantiate kernel for that `NRanks`
+- **New rank count**: pass the new rank count to `ring_simple_kernel` as runtime `nranks` argument; `kRanks` (from `NANO_NCCL_NRANKS`) still controls host-side buffer sizing and array dimensions
 - **New collective**: create subdirectory under `src/collective/`, implement collective interface
 - **New transport**: create a subdirectory under `src/transport/` and implement the transport interface (for example, a network transport)
