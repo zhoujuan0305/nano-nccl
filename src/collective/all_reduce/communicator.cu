@@ -562,8 +562,8 @@ private:
                 ? p2p_control.base_steps : shm_control.base_steps;
 
             CUDA_CHECK_THROW(cudaSetDevice(devices_[rank]));
-            ring_simple_kernel<kRanks, T, RedOp::Sum>
-                <<<kChannels, kBlockThreads, 0, args.streams[rank]>>>(kernel_args);
+            ring_simple_kernel<T, RedOp::Sum>
+                <<<kChannels, kBlockThreads, 0, args.streams[rank]>>>(kernel_args, kRanks);
             CUDA_CHECK_THROW(cudaGetLastError());
             record_completion(rank, args.streams[rank]);
         }

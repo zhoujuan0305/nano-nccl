@@ -255,7 +255,7 @@ __global__ void abort_aware_send_wait(
     nano_nccl::transport::SimpleChannelArgs<float> args, int* result) {
     std::uint64_t cache = 0;
     __shared__ int wait_status;
-    bool ready = nano_nccl::kernels::wait_send_credit<nano_nccl::kRanks, float>(
+    bool ready = nano_nccl::kernels::wait_send_credit<float>(
         args, 0, &cache, &wait_status);
     if (threadIdx.x == 0) result[0] = ready ? 0 : 1;
 }
@@ -264,7 +264,7 @@ __global__ void abort_after_send_wait_starts(
     nano_nccl::transport::SimpleChannelArgs<float> args, int* result) {
     std::uint64_t cache = 0;
     __shared__ int wait_status;
-    bool ready = nano_nccl::kernels::wait_send_credit<nano_nccl::kRanks, float>(
+    bool ready = nano_nccl::kernels::wait_send_credit<float>(
         args, 8, &cache, &wait_status);
     if (threadIdx.x == 0) result[0] = ready ? 0 : 1;
 }
@@ -273,7 +273,7 @@ __global__ void abort_after_recv_wait_starts(
     nano_nccl::transport::SimpleChannelArgs<float> args, int* result) {
     std::uint64_t cache = 0;
     __shared__ int wait_status;
-    bool ready = nano_nccl::kernels::wait_recv_ready<nano_nccl::kRanks, float>(
+    bool ready = nano_nccl::kernels::wait_recv_ready<float>(
         args, 0, &cache, &wait_status);
     if (threadIdx.x == 0) result[0] = ready ? 0 : 1;
 }
@@ -283,7 +283,7 @@ __global__ void publish_socket_slice(
     std::uint64_t step = 0;
     std::uint64_t cache = 0;
     __shared__ int wait_status;
-    nano_nccl::kernels::direct_send<nano_nccl::kRanks, float,
+    nano_nccl::kernels::direct_send<float,
                                     nano_nccl::RedOp::Sum>(
         args, input, 4, &step, &cache, blockDim.x, &wait_status);
 }
