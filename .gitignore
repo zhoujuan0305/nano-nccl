@@ -37,3 +37,6 @@ __pycache__/
 # Nsight Systems captures
 *.nsys-rep
 *.sqlite
+
+# Nsight Compute captures
+*.ncu-rep
