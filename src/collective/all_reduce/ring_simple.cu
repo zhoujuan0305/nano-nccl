@@ -32,18 +32,19 @@ using nano_nccl::core::Stream;
 
 float input_value(int rank, std::size_t index) {
     int bucket = static_cast<int>(index % 251);
-    return static_cast<float>(rank + 1) * 0.125f +
+    int rank_weight = (rank + static_cast<int>(index % kRanks)) % kRanks;
+    return static_cast<float>(rank_weight + 1) * 0.125f +
            static_cast<float>(bucket) * 0.00025f;
 }
 
 std::string select_auto_algo(std::size_t /*bytes*/) { return "ring_simple"; }
 
-template <DType kDType>
+template <DType kDType, RedOp kRedOp>
 void fill_inputs(
     std::vector<typename DTypeTraits<kDType>::type> host_inputs[kRanks],
     std::vector<float>* expected, std::size_t count) {
     using T = typename DTypeTraits<kDType>::type;
-    expected->assign(count, 0.0f);
+    expected->resize(count);
     for (int rank = 0; rank < kRanks; ++rank) {
         host_inputs[rank].resize(count);
         for (std::size_t index = 0; index < count; ++index) {
@@ -52,9 +53,19 @@ void fill_inputs(
         }
     }
     for (std::size_t index = 0; index < count; ++index) {
-        for (int rank = 0; rank < kRanks; ++rank) {
-            (*expected)[index] += DTypeTraits<kDType>::to_float(host_inputs[rank][index]);
+        float value = DTypeTraits<kDType>::to_float(host_inputs[0][index]);
+        for (int rank = 1; rank < kRanks; ++rank) {
+            float next = DTypeTraits<kDType>::to_float(host_inputs[rank][index]);
+            if constexpr (kRedOp == RedOp::Sum || kRedOp == RedOp::Avg) {
+                value += next;
+            } else if constexpr (kRedOp == RedOp::Max) {
+                value = std::fmax(value, next);
+            } else {
+                value = std::fmin(value, next);
+            }
         }
+        if constexpr (kRedOp == RedOp::Avg) value /= static_cast<float>(kRanks);
+        (*expected)[index] = value;
     }
 }
 
@@ -96,7 +107,7 @@ void sync_streams(Stream* streams[kRanks]) {
     }
 }
 
-template <typename T, DType kDType>
+template <typename T, DType kDType, RedOp kRedOp>
 class AllReduceBenchRunner {
 public:
     explicit AllReduceBenchRunner(std::size_t max_count, TransportKind transport) {
@@ -181,7 +192,7 @@ private:
         CollectiveArgs args;
         args.count = count;
         args.dtype = kDType;
-        args.redop = RedOp::Sum;
+        args.redop = kRedOp;
         for (int rank = 0; rank < kRanks; ++rank) {
             args.send_buffers.push_back(inputs_[rank]->get());
             args.recv_buffers.push_back(outputs_[rank]->get());
@@ -203,7 +214,7 @@ private:
     TransportKind resolved_transport_ = TransportKind::Shm;
 };
 
-template <DType kDType>
+template <DType kDType, RedOp kRedOp>
 int run_ring_simple_bench_typed(const BenchConfig& config,
                                 std::vector<BenchResult>* results) {
     using T = typename DTypeTraits<kDType>::type;
@@ -220,12 +231,13 @@ int run_ring_simple_bench_typed(const BenchConfig& config,
             }
         }
 
-        AllReduceBenchRunner<T, kDType> runner(sizes.back() / sizeof(T), config.transport);
+        AllReduceBenchRunner<T, kDType, kRedOp> runner(
+            sizes.back() / sizeof(T), config.transport);
         for (std::size_t bytes : sizes) {
             std::size_t count = bytes / sizeof(T);
             std::vector<T> host_inputs[kRanks];
             std::vector<float> expected;
-            fill_inputs<kDType>(host_inputs, &expected, count);
+            fill_inputs<kDType, kRedOp>(host_inputs, &expected, count);
             runner.load_inputs(host_inputs, count);
             std::string algo = config.algo == "auto" ? select_auto_algo(bytes) : config.algo;
             if (algo != "ring_simple") {
@@ -260,6 +272,7 @@ int run_ring_simple_bench_typed(const BenchConfig& config,
             BenchResult result;
             result.algo = algo;
             result.dtype = kDType;
+            result.redop = kRedOp;
             result.transport = runner.transport();
             result.bytes = bytes;
             result.count = count;
@@ -279,15 +292,32 @@ int run_ring_simple_bench_typed(const BenchConfig& config,
 
 }  // namespace
 
+template <DType kDType>
+int run_ring_simple_bench_redop(const BenchConfig& config,
+                                std::vector<BenchResult>* results) {
+    switch (config.redop) {
+        case RedOp::Sum:
+            return run_ring_simple_bench_typed<kDType, RedOp::Sum>(config, results);
+        case RedOp::Avg:
+            return run_ring_simple_bench_typed<kDType, RedOp::Avg>(config, results);
+        case RedOp::Max:
+            return run_ring_simple_bench_typed<kDType, RedOp::Max>(config, results);
+        case RedOp::Min:
+            return run_ring_simple_bench_typed<kDType, RedOp::Min>(config, results);
+    }
+    std::fprintf(stderr, "unsupported reduction operation\n");
+    return 2;
+}
+
 int run_ring_simple_bench(const BenchConfig& config,
                           std::vector<BenchResult>* results) {
     switch (config.dtype) {
         case DType::Float:
-            return run_ring_simple_bench_typed<DType::Float>(config, results);
+            return run_ring_simple_bench_redop<DType::Float>(config, results);
         case DType::Float16:
-            return run_ring_simple_bench_typed<DType::Float16>(config, results);
+            return run_ring_simple_bench_redop<DType::Float16>(config, results);
         case DType::BFloat16:
-            return run_ring_simple_bench_typed<DType::BFloat16>(config, results);
+            return run_ring_simple_bench_redop<DType::BFloat16>(config, results);
     }
     std::fprintf(stderr, "unsupported dtype\\n");
     return 2;

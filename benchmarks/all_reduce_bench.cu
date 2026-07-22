@@ -49,9 +49,10 @@ bool read_int_arg(int argc, char** argv, int* index, int* out) {
 
 void usage(const char* argv0) {
     std::fprintf(stderr,
-                 "Usage: %s [--algo auto|ring_simple] "
-                 "[--dtype float|fp16|bf16] "
-                 "[--transport auto|shm|p2p] "
+                  "Usage: %s [--algo auto|ring_simple] "
+                  "[--dtype float|fp16|bf16] "
+                  "[--redop sum|avg|max|min] "
+                  "[--transport auto|shm|p2p] "
                  "[-b bytes] [-e bytes] [-f factor] [-w warmup] [-n iters]\n",
                  argv0);
 }
@@ -126,10 +127,25 @@ int run_mpi_bench_typed(const nano_nccl::BenchConfig& config,
             std::vector<std::vector<T>> host_inputs(devices.size(),
                                                      std::vector<T>(count));
             std::vector<T> host_output(count);
-            float expected = 0.0f;
-            for (int global_rank = 0; global_rank < nano_nccl::kRanks; ++global_rank) {
-                expected += Traits::to_float(Traits::from_float(
+            float expected = Traits::to_float(Traits::from_float(1.0f));
+            for (int global_rank = 1; global_rank < nano_nccl::kRanks; ++global_rank) {
+                float value = Traits::to_float(Traits::from_float(
                     static_cast<float>(global_rank + 1)));
+                switch (config.redop) {
+                    case nano_nccl::RedOp::Sum:
+                    case nano_nccl::RedOp::Avg:
+                        expected += value;
+                        break;
+                    case nano_nccl::RedOp::Max:
+                        expected = std::fmax(expected, value);
+                        break;
+                    case nano_nccl::RedOp::Min:
+                        expected = std::fmin(expected, value);
+                        break;
+                }
+            }
+            if (config.redop == nano_nccl::RedOp::Avg) {
+                expected /= static_cast<float>(nano_nccl::kRanks);
             }
             for (std::size_t local_rank = 0; local_rank < devices.size(); ++local_rank) {
                 const float value = static_cast<float>(local_rank_offset +
@@ -146,7 +162,7 @@ int run_mpi_bench_typed(const nano_nccl::BenchConfig& config,
             auto launch_and_wait = [&] {
                 std::vector<const void*> send_const(send_buffers.begin(), send_buffers.end());
                 communicator->all_reduce({send_const, recv_buffers, streams, count, kDType,
-                                          nano_nccl::RedOp::Sum});
+                                           config.redop});
                 for (std::size_t local_rank = 0; local_rank < devices.size(); ++local_rank) {
                     cuda_check(cudaSetDevice(devices[local_rank]), "cudaSetDevice");
                     cuda_check(cudaStreamSynchronize(streams[local_rank]),
@@ -212,6 +228,7 @@ int run_mpi_bench_typed(const nano_nccl::BenchConfig& config,
                 nano_nccl::BenchResult result;
                 result.algo = config.algo == "auto" ? "ring_simple" : config.algo;
                 result.dtype = kDType;
+                result.redop = config.redop;
                 result.transport = transport;
                 result.bytes = bytes;
                 result.count = count;
@@ -317,6 +334,12 @@ int main(int argc, char** argv) {
                 usage(argv[0]);
                 return 2;
             }
+        } else if (std::strcmp(argv[i], "--redop") == 0) {
+            if (i + 1 >= argc ||
+                !nano_nccl::parse_redop(argv[++i], &config.redop)) {
+                usage(argv[0]);
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--transport") == 0) {
             if (i + 1 >= argc ||
                 !nano_nccl::parse_transport(argv[++i], &config.transport)) {
@@ -370,17 +393,19 @@ int main(int argc, char** argv) {
 
     if (mpi_rank == 0) {
         std::printf("# nano-nccl all_reduce_bench\n");
-        std::printf("# algo %s dtype %s transport %s nGpus %d warmup iters: %d iters: %d validation: 1\n",
+        std::printf("# algo %s dtype %s redop %s transport %s nGpus %d warmup iters: %d iters: %d validation: 1\n",
                     config.algo.c_str(), nano_nccl::dtype_name(config.dtype),
+                    nano_nccl::redop_name(config.redop),
                     nano_nccl::transport_name(config.transport),
                     nano_nccl::kRanks, config.warmup_iters, config.iters);
-        std::printf("# %14s %8s %10s %12s %12s %10s %10s %10s %8s %12s\n", "algo",
-                    "dtype", "transport", "size(B)", "count", "time(us)", "algbw",
+        std::printf("# %14s %8s %8s %10s %12s %12s %10s %10s %10s %8s %12s\n", "algo",
+                    "dtype", "redop", "transport", "size(B)", "count", "time(us)", "algbw",
                     "busbw", "#wrong", "max_abs");
         for (const auto& result : results) {
-            std::printf("%14s %8s %10s %12zu %12zu %10.2f %10.2f %10.2f %8d %12.6g\n",
-                        result.algo.c_str(), nano_nccl::dtype_name(result.dtype),
-                        nano_nccl::transport_name(result.transport), result.bytes,
+            std::printf("%14s %8s %8s %10s %12zu %12zu %10.2f %10.2f %10.2f %8d %12.6g\n",
+                         result.algo.c_str(), nano_nccl::dtype_name(result.dtype),
+                         nano_nccl::redop_name(result.redop),
+                         nano_nccl::transport_name(result.transport), result.bytes,
                         result.count, result.time_us, result.algbw, result.busbw,
                         result.wrong, result.max_abs_error);
         }

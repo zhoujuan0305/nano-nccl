@@ -370,8 +370,14 @@ private:
         if (args.count == 0) {
             throw std::runtime_error("collective count must be positive");
         }
-        if (args.redop != RedOp::Sum) {
-            throw std::runtime_error("only sum reduction is supported");
+        switch (args.redop) {
+            case RedOp::Sum:
+            case RedOp::Avg:
+            case RedOp::Max:
+            case RedOp::Min:
+                break;
+            default:
+                throw std::runtime_error("unsupported reduction operation");
         }
         for (int rank = 0; rank < local_rank_count(); ++rank) {
             if (args.send_buffers[rank] == nullptr || args.recv_buffers[rank] == nullptr ||
@@ -488,7 +494,7 @@ private:
         reset_events.destroy();
     }
 
-    template <typename T>
+    template <typename T, RedOp kRedOp>
     void launch_ring_simple(const CollectiveArgs& args, FifoResources<T>* resources) {
         ensure_completion_events();
         for (int rank = 0; rank < local_rank_count(); ++rank) {
@@ -562,7 +568,7 @@ private:
                 ? p2p_control.base_steps : shm_control.base_steps;
 
             CUDA_CHECK_THROW(cudaSetDevice(devices_[rank]));
-            ring_simple_kernel<T, RedOp::Sum>
+            ring_simple_kernel<T, kRedOp>
                 <<<kChannels, kBlockThreads, 0, args.streams[rank]>>>(kernel_args, kRanks);
             CUDA_CHECK_THROW(cudaGetLastError());
             record_completion(rank, args.streams[rank]);
@@ -625,6 +631,25 @@ private:
 
     template <typename T>
     void all_reduce_typed(const CollectiveArgs& args) {
+        switch (args.redop) {
+            case RedOp::Sum:
+                all_reduce_typed<T, RedOp::Sum>(args);
+                return;
+            case RedOp::Avg:
+                all_reduce_typed<T, RedOp::Avg>(args);
+                return;
+            case RedOp::Max:
+                all_reduce_typed<T, RedOp::Max>(args);
+                return;
+            case RedOp::Min:
+                all_reduce_typed<T, RedOp::Min>(args);
+                return;
+        }
+        throw std::runtime_error("unsupported reduction operation");
+    }
+
+    template <typename T, RedOp kRedOp>
+    void all_reduce_typed(const CollectiveArgs& args) {
         FifoResources<T>* resources = nullptr;
         if constexpr (std::is_same_v<T, float>) {
             resources = &float_resources_;
@@ -654,7 +679,7 @@ private:
                 reset_control(args.streams);
                 control_initialized_ = true;
             }
-            launch_ring_simple(args, resources);
+            launch_ring_simple<T, kRedOp>(args, resources);
         } catch (...) {
             has_untracked_launch_ = true;
             throw;

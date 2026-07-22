@@ -8,19 +8,23 @@ Current capabilities:
 
 - Single-node multi-GPU performance path (tested with `CUDA_VISIBLE_DEVICES=0,1,2,3`; rank count configurable via CMake `NANO_NCCL_NRANKS`)
 - Optional MPI/socket multi-host, out-of-place `all_reduce` correctness path; Open MPI 4.1.2 and the same MPI ABI are required on all hosts
-- `float`, FP16, and BF16 dtypes with the `sum` reduce op, out-of-place; BF16 requires SM80+
+- `float`, FP16, and BF16 dtypes with `sum`, `avg`, `max`, and `min` reduce ops, out-of-place; `avg` is `sum / nranks`, `max`/`min` propagate NaN, and BF16 requires SM80+
 - Ring + Simple protocol, with SHM FIFO, device P2P FIFO, and optional MPI/socket transports
 - The BF16 device-capability validation is cached after its first successful use; the full A6000 single-host performance gate is pending revalidation (see Acceptance section below)
 
 Future expansion axes:
 
 - **dtype**: `float`/FP16/BF16 → `double`/`int8`
-- **reduce op**: `sum` → `max`/`min`/`prod`
+- **reduce op**: `sum`/`avg`/`max`/`min` → `prod`
 - **rank count**: 4 → 2/8/16 (runtime parameter, no template specialization needed)
 - **collective**: `all_reduce` → `all_gather`/`reduce_scatter`/`broadcast`
 - **transport**: SHM FIFO/P2P FIFO → network
 
 `all_gather` and `reduce_scatter` are unsupported. There is no multi-host performance gate, and socket has no TLS or automatic reconnect; use it only on a trusted network. Do not claim general NCCL replacement capability until expansion is complete.
+
+## Sensitive Information
+
+Do not write hostnames, IP addresses, physical interface names, MAC addresses, GPU UUIDs, absolute user home paths, credentials, or tokens to files that can be committed to Git. Use placeholders such as `<host-a>`, `<interface>`, and `<path-to-nccl-lib>` in documentation, examples, tests, and logs.
 
 ## Directory Structure
 
@@ -246,7 +250,7 @@ This is a single-host acceptance criterion only; no multi-host socket performanc
 
 ## Extension Guide
 
-- **New dtype**: implement pack/unpack trait in `include/nano_nccl/traits.h`, add template instantiation in `ring_simple.cu`; current `float`, FP16, and BF16 support `sum`, and BF16 requires SM80+
+- **New dtype**: implement pack/unpack trait in `include/nano_nccl/traits.h`, add template instantiation in `ring_simple.cu`; current `float`, FP16, and BF16 support `sum`/`avg`/`max`/`min`, and BF16 requires SM80+
 - **New reduce op**: implement RedOp trait in `include/nano_nccl/traits.h`, add template instantiation in `ring_simple.cu`
 - **New rank count**: pass the new rank count to `ring_simple_kernel` as runtime `nranks` argument; `kRanks` (from `NANO_NCCL_NRANKS`) still controls host-side buffer sizing and array dimensions
 - **New collective**: create subdirectory under `src/collective/`, implement collective interface

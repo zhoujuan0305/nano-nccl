@@ -1,4 +1,5 @@
 #include "nano_nccl/communicator.h"
+#include "nano_nccl/traits.h"
 
 #include "collective/all_reduce/topology.h"
 #include "core/buffer.h"
@@ -108,17 +109,114 @@ bool synchronize_streams(const std::vector<cudaStream_t>& streams) {
     return true;
 }
 
-bool verify_output(const std::vector<float>& output, int round) {
+bool verify_output(const std::vector<float>& output, int round,
+                   nano_nccl::RedOp redop = nano_nccl::RedOp::Sum) {
     for (std::size_t index = 0; index < kCount; ++index) {
-        float expected = 0.0f;
-        for (int input_rank = 0; input_rank < kRanks; ++input_rank) {
-            expected += input_value(input_rank, index, round);
+        float expected = input_value(0, index, round);
+        for (int input_rank = 1; input_rank < kRanks; ++input_rank) {
+            float value = input_value(input_rank, index, round);
+            switch (redop) {
+                case nano_nccl::RedOp::Sum:
+                    expected += value;
+                    break;
+                case nano_nccl::RedOp::Max:
+                    expected = std::fmax(expected, value);
+                    break;
+                case nano_nccl::RedOp::Avg:
+                    expected += value;
+                    break;
+                case nano_nccl::RedOp::Min:
+                    expected = std::fmin(expected, value);
+                    break;
+                default:
+                    std::fprintf(stderr, "unsupported reference redop\n");
+                    return false;
+            }
+        }
+        if (redop == nano_nccl::RedOp::Avg) {
+            expected /= static_cast<float>(kRanks);
         }
         if (std::fabs(output[index] - expected) > 1e-6f) {
             std::fprintf(stderr, "wrong round=%d index=%zu actual=%g expected=%g\n",
                          round, index, output[index], expected);
             return false;
         }
+    }
+    return true;
+}
+
+bool bf16_supported() {
+    for (int device = 0; device < kRanks; ++device) {
+        cudaDeviceProp props{};
+        if (cudaGetDeviceProperties(&props, device) != cudaSuccess || props.major < 8) {
+            return false;
+        }
+    }
+    return true;
+}
+
+template <nano_nccl::DType kDType>
+bool run_nan_propagation_test(nano_nccl::Communicator* communicator,
+                              const std::vector<cudaStream_t>& streams) {
+    using Traits = nano_nccl::DTypeTraits<kDType>;
+    using T = typename Traits::type;
+    // Four channels each receive eight elements, preserving the packed16 path.
+    constexpr std::size_t kNanCount = 32;
+    constexpr std::size_t kNanIndices[] = {3, 11, 19, 27};
+    std::vector<const void*> send_buffers(kRanks);
+    std::vector<void*> recv_buffers(kRanks);
+    std::vector<std::vector<T>> inputs(kRanks, std::vector<T>(kNanCount));
+    std::vector<T> output(kNanCount);
+
+    for (int rank = 0; rank < kRanks; ++rank) {
+        for (std::size_t index = 0; index < kNanCount; ++index) {
+            inputs[rank][index] = Traits::from_float(static_cast<float>(rank + 1));
+        }
+        if (rank == 1) {
+            for (std::size_t index : kNanIndices) {
+                inputs[rank][index] = Traits::from_float(NAN);
+            }
+        }
+        if (cudaSetDevice(rank) != cudaSuccess ||
+            cudaMalloc(const_cast<void**>(&send_buffers[rank]), kNanCount * sizeof(T)) !=
+                cudaSuccess ||
+            cudaMalloc(&recv_buffers[rank], kNanCount * sizeof(T)) != cudaSuccess ||
+            cudaMemcpyAsync(const_cast<void*>(send_buffers[rank]), inputs[rank].data(),
+                            kNanCount * sizeof(T), cudaMemcpyHostToDevice,
+                            streams[rank]) != cudaSuccess) {
+            return false;
+        }
+    }
+
+    for (nano_nccl::RedOp redop : {nano_nccl::RedOp::Max, nano_nccl::RedOp::Min}) {
+        try {
+            communicator->all_reduce({send_buffers, recv_buffers, streams, kNanCount,
+                                      kDType, redop});
+        } catch (const std::runtime_error&) {
+            return false;
+        }
+        if (!synchronize_streams(streams)) return false;
+        try {
+            communicator->check_async_error();
+        } catch (const std::runtime_error&) {
+            return false;
+        }
+        for (int rank = 0; rank < kRanks; ++rank) {
+            if (cudaSetDevice(rank) != cudaSuccess ||
+                cudaMemcpy(output.data(), recv_buffers[rank], kNanCount * sizeof(T),
+                           cudaMemcpyDeviceToHost) != cudaSuccess) {
+                return false;
+            }
+            for (std::size_t index : kNanIndices) {
+                if (!std::isnan(Traits::to_float(output[index]))) return false;
+            }
+        }
+    }
+
+    for (int rank = 0; rank < kRanks; ++rank) {
+        cudaSetDevice(rank);
+        cudaFree(const_cast<void*>(send_buffers[rank]));
+        cudaFree(recv_buffers[rank]);
     }
     return true;
 }
@@ -493,8 +591,8 @@ int main(int argc, char** argv) {
         null_stream_args.streams[2] = nullptr;
         auto zero_count_args = args;
         zero_count_args.count = 0;
-        auto non_sum_args = args;
-        non_sum_args.redop = static_cast<nano_nccl::RedOp>(1);
+        auto invalid_redop_args = args;
+        invalid_redop_args.redop = static_cast<nano_nccl::RedOp>(99);
         auto in_place_args = args;
         in_place_args.recv_buffers[3] = const_cast<void*>(in_place_args.send_buffers[3]);
         auto invalid_dtype_args = args;
@@ -507,8 +605,8 @@ int main(int argc, char** argv) {
                                             "non-null") ||
             !all_reduce_throws_with_message(communicator.get(), zero_count_args,
                                             "positive") ||
-            !all_reduce_throws_with_message(communicator.get(), non_sum_args,
-                                            "sum") ||
+             !all_reduce_throws_with_message(communicator.get(), invalid_redop_args,
+                                             "reduction") ||
             !all_reduce_throws_with_message(communicator.get(), in_place_args,
                                             "in-place") ||
             !all_reduce_throws_with_message(communicator.get(), invalid_dtype_args,
@@ -547,6 +645,68 @@ int main(int argc, char** argv) {
                                       kCount * sizeof(float), cudaMemcpyDeviceToHost));
                 if (!verify_output(output, round)) return 1;
             }
+        }
+
+        for (int rank = 0; rank < kRanks; ++rank) {
+            for (std::size_t index = 0; index < kCount; ++index) {
+                inputs[rank][index] = input_value(rank, index, 1);
+            }
+            CUDA_CHECK(cudaSetDevice(rank));
+            CUDA_CHECK(cudaMemcpyAsync(const_cast<void*>(send_buffers[rank]),
+                                       inputs[rank].data(), kCount * sizeof(float),
+                                       cudaMemcpyHostToDevice, streams[rank]));
+        }
+        auto max_args = args;
+        max_args.redop = nano_nccl::RedOp::Max;
+        communicator->all_reduce(max_args);
+        if (!synchronize_streams(streams)) {
+            std::fprintf(stderr, "max all_reduce stream synchronization failed\n");
+            return 1;
+        }
+        communicator->check_async_error();
+        for (int rank = 0; rank < kRanks; ++rank) {
+            CUDA_CHECK(cudaSetDevice(rank));
+            CUDA_CHECK(cudaMemcpy(output.data(), recv_buffers[rank],
+                                   kCount * sizeof(float), cudaMemcpyDeviceToHost));
+            if (!verify_output(output, 1, nano_nccl::RedOp::Max)) return 1;
+        }
+
+        auto avg_args = args;
+        avg_args.redop = nano_nccl::RedOp::Avg;
+        communicator->all_reduce(avg_args);
+        if (!synchronize_streams(streams)) {
+            std::fprintf(stderr, "avg all_reduce stream synchronization failed\n");
+            return 1;
+        }
+        communicator->check_async_error();
+        for (int rank = 0; rank < kRanks; ++rank) {
+            CUDA_CHECK(cudaSetDevice(rank));
+            CUDA_CHECK(cudaMemcpy(output.data(), recv_buffers[rank],
+                                   kCount * sizeof(float), cudaMemcpyDeviceToHost));
+            if (!verify_output(output, 1, nano_nccl::RedOp::Avg)) return 1;
+        }
+
+        auto min_args = args;
+        min_args.redop = nano_nccl::RedOp::Min;
+        communicator->all_reduce(min_args);
+        if (!synchronize_streams(streams)) {
+            std::fprintf(stderr, "min all_reduce stream synchronization failed\n");
+            return 1;
+        }
+        communicator->check_async_error();
+        for (int rank = 0; rank < kRanks; ++rank) {
+            CUDA_CHECK(cudaSetDevice(rank));
+            CUDA_CHECK(cudaMemcpy(output.data(), recv_buffers[rank],
+                                   kCount * sizeof(float), cudaMemcpyDeviceToHost));
+            if (!verify_output(output, 1, nano_nccl::RedOp::Min)) return 1;
+        }
+
+        if (!run_nan_propagation_test<nano_nccl::DType::Float>(communicator.get(), streams) ||
+            !run_nan_propagation_test<nano_nccl::DType::Float16>(communicator.get(), streams) ||
+            (bf16_supported() &&
+             !run_nan_propagation_test<nano_nccl::DType::BFloat16>(communicator.get(), streams))) {
+            std::fprintf(stderr, "max/min NaN propagation failed\n");
+            return 1;
         }
 
         StreamGate stream_gate;

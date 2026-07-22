@@ -40,13 +40,36 @@ struct DTypeTraits<DType::BFloat16> {
     static float to_float(type value) { return __bfloat162float(value); }
 };
 
-// redop trait：apply 提供 element-wise 规约。当前只 Sum 特化。
+// redop trait：apply 提供 element-wise 规约。
 template <RedOp, typename T>
 struct RedOpTraits;
 
 template <typename T>
 struct RedOpTraits<RedOp::Sum, T> {
     static __device__ __forceinline__ T apply(T a, T b) { return a + b; }
+};
+
+template <typename T>
+struct RedOpTraits<RedOp::Avg, T> {
+    static __device__ __forceinline__ T apply(T a, T b) { return a + b; }
+};
+
+template <typename T>
+struct RedOpTraits<RedOp::Max, T> {
+    static __device__ __forceinline__ T apply(T a, T b) {
+        if (a != a) return a;
+        if (b != b) return b;
+        return a > b ? a : b;
+    }
+};
+
+template <typename T>
+struct RedOpTraits<RedOp::Min, T> {
+    static __device__ __forceinline__ T apply(T a, T b) {
+        if (a != a) return a;
+        if (b != b) return b;
+        return a < b ? a : b;
+    }
 };
 
 }  // namespace nano_nccl

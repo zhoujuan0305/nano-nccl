@@ -8,29 +8,7 @@
 
 ## 性能
 
-下表给出 out-of-place `busbw` 绝对值（GB/s，`-w 5 -n 20`）。
-
-### 单机：4× RTX A6000
-
-CUDA 12.8，`CUDA_VISIBLE_DEVICES=0,1,2,3`，`--transport auto` 解析为 `mixed`。NCCL 使用 `Ring` + `Simple`、4 channels 和 `NCCL_BUFFSIZE=33554432`。各 size 单元格为 `nano-nccl / NCCL` 的 busbw（GB/s）。
-
-| dtype | 256 KiB | 1 MiB | 4 MiB | 16 MiB | 64 MiB | nano/NCCL 几何平均 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| float | 6.88 / 6.43 | 14.80 / 14.14 | 19.30 / 19.50 | 22.47 / 22.61 | 23.29 / 22.95 | 1.023 |
-| fp16 | 6.84 / 6.33 | 14.43 / 14.29 | 19.32 / 19.70 | 22.44 / 22.73 | 23.29 / 23.17 | 1.012 |
-| bf16 | 6.83 / 6.41 | 14.73 / 14.33 | 19.38 / 19.95 | 22.48 / 22.77 | 23.31 / 22.74 | 1.015 |
-
-### 两机：2×4 RTX A6000，经 TCP socket
-
-每台机器一个管理四张 GPU 的 MPI 进程，使用 `eno2`、CUDA 12.8、Open MPI 4.1.2。nano-nccl 使用 `--algo ring_simple --transport auto`，解析为 `mixed`（跨机边为 socket）。NCCL 2.25.1 使用 `Ring` + `Simple`、4 channels、`NCCL_SOCKET_IFNAME=eno2`、`NCCL_IB_DISABLE=1`。
-
-| size | nano-nccl time (us) | nano busbw (GB/s) | NCCL time (us) | NCCL busbw (GB/s) | nano/NCCL |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 256 KiB | 4203.72 | 0.109130 | 3989.82 | 0.114981 | 0.949116 |
-| 1 MiB | 16030.16 | 0.114472 | 16012.80 | 0.114596 | 0.998917 |
-| 4 MiB | 66742.16 | 0.109976 | 63165.10 | 0.116204 | 0.946405 |
-| 16 MiB | 275982.46 | 0.106384 | 252055.00 | 0.116483 | 0.913301 |
-| 64 MiB | 1107119.12 | 0.106078 | 1019285.00 | 0.115219 | 0.920664 |
+[详细的单机与双机性能结果](performance.md)记录了测试拓扑、环境、全部 dtype/reduce 操作组合，以及逐点 NCCL 对比。
 
 ---
 
@@ -97,9 +75,9 @@ cmake --build build-mpi -j$(nproc)
 
 ```bash
 mpirun \
-  -np 1 --host 192.168.104.246 -x NANO_NCCL_SOCKET_IFNAME=eno2 \
+  -np 1 --host <host-a> -x NANO_NCCL_SOCKET_IFNAME=<interface> \
     ./build-mpi/tests/nano_nccl_mpi_correctness --dtype float \
-  : -np 1 --host 192.168.104.247 -x NANO_NCCL_SOCKET_IFNAME=eno2 \
+  : -np 1 --host <host-b> -x NANO_NCCL_SOCKET_IFNAME=<interface> \
     ./build-mpi/tests/nano_nccl_mpi_correctness --dtype float
 ```
 
@@ -110,15 +88,15 @@ mpirun \
 ```bash
 # Benchmark（性能 + 正确性）
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
-  --algo ring_simple --dtype float --transport auto \
+  --algo ring_simple --dtype float --redop sum --transport auto \
   -b 262144 -e 67108864 -f 4 -w 5 -n 20
 
 # FP16 和 BF16 的正确性/性能运行（BF16 需要 SM80+）
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
-  --algo ring_simple --dtype fp16 --transport auto \
+  --algo ring_simple --dtype fp16 --redop max --transport auto \
   -b 262144 -e 67108864 -f 4 -w 5 -n 20
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
-  --algo ring_simple --dtype bf16 --transport auto \
+  --algo ring_simple --dtype bf16 --redop avg --transport auto \
   -b 262144 -e 67108864 -f 4 -w 5 -n 20
 
 # 纯正确性测试
@@ -127,6 +105,10 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_correctness
 # 冒烟测试
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_smoke
 ```
+
+`--redop` 接受 `sum`（默认）、`avg`、`max` 与 `min`。`avg` 是逐元素的
+`sum / nranks`。任一操作数为 NaN 时，`max` 和 `min` 都传播 NaN。选择的规约操作
+会编译进 device kernel；rank 数仍是 kernel 的运行时参数。
 
 ### 可选 NVTX/CUDA profiling
 
@@ -193,7 +175,8 @@ communicator->check_async_error();
 单机 adapter 要求 `devices` 正好是可见 device 顺序
 `{0, ..., NANO_NCCL_NRANKS - 1}`。MPI 构建时，`nano_nccl/mpi.h` 提供
 `create_communicator_from_mpi(MPI_COMM_WORLD, config)` 以创建分布式 communicator。
-`all_reduce` 为 out-of-place，支持 `float`、FP16、BF16 和 `sum`。
+`all_reduce` 为 out-of-place，支持 `float`、FP16、BF16，以及 `sum`、`avg`、`max`、`min`。
+`avg` 为 `sum / nranks`；`max` 与 `min` 会传播 NaN。
 `reduce_scatter` 与 `all_gather` 已在公共 interface 中暴露，但当前会抛出
 unsupported-operation 错误。
 
@@ -216,7 +199,7 @@ P2P 是单机通信路径，需要每对完整配置环邻居之间的双向 CUD
 
 - 单机多 GPU 性能路径（已验证 `CUDA_VISIBLE_DEVICES=0,1,2,3`）；可选 MPI/socket 多机 `all_reduce` 正确性路径
 - `float`、FP16（`fp16`）和 BF16（`bf16`）类型；BF16 需要 SM80+
-- `sum` 规约操作
+- `sum`、`avg`、`max`、`min` 规约操作；`avg` 为 `sum / nranks`，`max`/`min` 会传播 NaN
 - out-of-place
 - SHM FIFO、device P2P FIFO 通信路径，以及跨进程 ring edge 的可选 MPI/socket；P2P 仅支持单机
 
@@ -225,8 +208,8 @@ P2P 是单机通信路径，需要每对完整配置环邻居之间的双向 CUD
 未来计划扩展：
 
 - dtype：`double` / `int8`
-- reduce op：`max` / `min` / `prod`
-- rank 数：2 / 8 / 16（模板参数化，host 侧分发）
+- reduce op：`prod`
+- rank 数：2 / 8 / 16（kernel 运行时参数）
 - collective：`all_gather` / `reduce_scatter` / `broadcast`
 - 通信路径：网络
 

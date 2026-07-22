@@ -66,11 +66,30 @@ inline bool parse_dtype(const char* text, DType* dtype) {
     return false;
 }
 
-enum class RedOp { Sum };
+enum class RedOp { Sum, Avg, Max, Min };
+
+inline const char* redop_name(RedOp redop) {
+    switch (redop) {
+        case RedOp::Sum: return "sum";
+        case RedOp::Avg: return "avg";
+        case RedOp::Max: return "max";
+        case RedOp::Min: return "min";
+    }
+    return "unknown";
+}
+
+inline bool parse_redop(const char* text, RedOp* redop) {
+    if (std::strcmp(text, "sum") == 0) { *redop = RedOp::Sum; return true; }
+    if (std::strcmp(text, "avg") == 0) { *redop = RedOp::Avg; return true; }
+    if (std::strcmp(text, "max") == 0) { *redop = RedOp::Max; return true; }
+    if (std::strcmp(text, "min") == 0) { *redop = RedOp::Min; return true; }
+    return false;
+}
 
 struct BenchConfig {
     std::string algo = "ring_simple";
     DType dtype = DType::Float;
+    RedOp redop = RedOp::Sum;
     TransportKind transport = TransportKind::Auto;
     std::size_t min_bytes = 262144;
     std::size_t max_bytes = 67108864;
@@ -83,6 +102,7 @@ struct BenchConfig {
 struct BenchResult {
     std::string algo;
     DType dtype = DType::Float;
+    RedOp redop = RedOp::Sum;
     TransportKind transport = TransportKind::Auto;
     std::size_t bytes = 0;
     std::size_t count = 0;

@@ -66,7 +66,7 @@ bool parse_options(int argc, char** argv, Options* options) {
 template <nano_nccl::DType kDType>
 bool run_collective(nano_nccl::Communicator* communicator,
                     const std::vector<int>& devices, int global_rank_offset,
-                    bool fault_injection, int* wrong_count,
+                    nano_nccl::RedOp redop, bool fault_injection, int* wrong_count,
                     bool* stream_waits_completed, bool* async_socket_failure) {
     using Traits = nano_nccl::DTypeTraits<kDType>;
     using T = typename Traits::type;
@@ -79,15 +79,37 @@ bool run_collective(nano_nccl::Communicator* communicator,
     std::vector<cudaStream_t> streams(devices.size());
     bool ok = true;
 
-    float expected = 0.0f;
-    for (int global_rank = 0; global_rank < nano_nccl::kRanks; ++global_rank) {
-        expected += Traits::to_float(Traits::from_float(static_cast<float>(global_rank + 1)));
+    float expected = Traits::to_float(Traits::from_float(1.0f));
+    for (int global_rank = 1; global_rank < nano_nccl::kRanks; ++global_rank) {
+        float value = Traits::to_float(Traits::from_float(
+            static_cast<float>(global_rank + 1)));
+        switch (redop) {
+            case nano_nccl::RedOp::Sum:
+            case nano_nccl::RedOp::Avg:
+                expected += value;
+                break;
+            case nano_nccl::RedOp::Max:
+                expected = std::fmax(expected, value);
+                break;
+            case nano_nccl::RedOp::Min:
+                expected = std::fmin(expected, value);
+                break;
+        }
     }
+    if (redop == nano_nccl::RedOp::Avg) {
+        expected /= static_cast<float>(nano_nccl::kRanks);
+    }
+    bool requires_nan_propagation = redop == nano_nccl::RedOp::Max ||
+                                    redop == nano_nccl::RedOp::Min;
     for (std::size_t local_rank = 0; local_rank < devices.size(); ++local_rank) {
         const float value = static_cast<float>(global_rank_offset +
                                                static_cast<int>(local_rank) + 1);
         std::fill(host_inputs[local_rank].begin(), host_inputs[local_rank].end(),
                   Traits::from_float(value));
+        if (requires_nan_propagation && global_rank_offset +
+                static_cast<int>(local_rank) == 1) {
+            host_inputs[local_rank][0] = Traits::from_float(NAN);
+        }
         ok = cuda_ok(cudaSetDevice(devices[local_rank]), "cudaSetDevice") && ok;
         ok = cuda_ok(cudaMalloc(const_cast<void**>(&send_buffers[local_rank]),
                                 kCount * sizeof(T)), "cudaMalloc(send)") && ok;
@@ -107,7 +129,7 @@ bool run_collective(nano_nccl::Communicator* communicator,
         if (ok) {
             try {
                 communicator->all_reduce({send_buffers, recv_buffers, streams, kCount,
-                                          kDType, nano_nccl::RedOp::Sum});
+                                           kDType, redop});
             } catch (const std::exception& error) {
                 if (!fault_injection || std::strstr(error.what(), "socket") == nullptr) {
                     throw;
@@ -136,8 +158,18 @@ bool run_collective(nano_nccl::Communicator* communicator,
                     ok = cuda_ok(cudaMemcpy(host_output.data(), recv_buffers[local_rank],
                                              kCount * sizeof(T), cudaMemcpyDeviceToHost),
                                  "cudaMemcpy") && ok;
-                    for (T value : host_output) {
-                        if (std::fabs(Traits::to_float(value) - expected) > epsilon) {
+                    for (std::size_t index = 0; index < kCount; ++index) {
+                        float value = Traits::to_float(host_output[index]);
+                        if ((requires_nan_propagation && index == 0)
+                                ? !std::isnan(value)
+                                : std::fabs(value - expected) > epsilon) {
+                            std::fprintf(stderr,
+                                         "mpi wrong dtype=%s redop=%s local_rank=%zu index=%zu "
+                                         "actual=%g expected=%g expected_nan=%d\n",
+                                         nano_nccl::dtype_name(kDType),
+                                         nano_nccl::redop_name(redop), local_rank, index,
+                                         value, expected,
+                                         requires_nan_propagation && index == 0 ? 1 : 0);
                             ++*wrong_count;
                             break;
                         }
@@ -160,21 +192,21 @@ bool run_collective(nano_nccl::Communicator* communicator,
 }
 
 bool dispatch_collective(nano_nccl::DType dtype, nano_nccl::Communicator* communicator,
-                         const std::vector<int>& devices, int global_rank_offset,
-                         bool fault_injection, int* wrong_count,
+                          const std::vector<int>& devices, int global_rank_offset,
+                          nano_nccl::RedOp redop, bool fault_injection, int* wrong_count,
                          bool* stream_waits_completed, bool* async_socket_failure) {
     switch (dtype) {
         case nano_nccl::DType::Float:
             return run_collective<nano_nccl::DType::Float>(
-                communicator, devices, global_rank_offset, fault_injection, wrong_count,
+                communicator, devices, global_rank_offset, redop, fault_injection, wrong_count,
                 stream_waits_completed, async_socket_failure);
         case nano_nccl::DType::Float16:
             return run_collective<nano_nccl::DType::Float16>(
-                communicator, devices, global_rank_offset, fault_injection, wrong_count,
+                communicator, devices, global_rank_offset, redop, fault_injection, wrong_count,
                 stream_waits_completed, async_socket_failure);
         case nano_nccl::DType::BFloat16:
             return run_collective<nano_nccl::DType::BFloat16>(
-                communicator, devices, global_rank_offset, fault_injection, wrong_count,
+                communicator, devices, global_rank_offset, redop, fault_injection, wrong_count,
                 stream_waits_completed, async_socket_failure);
     }
     return false;
@@ -217,10 +249,20 @@ int main(int argc, char** argv) {
             communicator = nano_nccl::create_communicator_from_mpi(MPI_COMM_WORLD, config);
             ok = communicator->transport() == nano_nccl::TransportKind::Socket ||
                  communicator->transport() == nano_nccl::TransportKind::Mixed;
-            ok = dispatch_collective(options.dtype, communicator.get(), devices,
-                                     local_rank_offset, options.fault_injection,
-                                     &local_wrong, &stream_waits_completed,
-                                     &async_socket_failure) && ok;
+            const nano_nccl::RedOp redops[] = {
+                nano_nccl::RedOp::Sum,
+                nano_nccl::RedOp::Avg,
+                nano_nccl::RedOp::Max,
+                nano_nccl::RedOp::Min,
+            };
+            for (nano_nccl::RedOp redop : redops) {
+                if (options.fault_injection && redop != nano_nccl::RedOp::Sum) break;
+                ok = dispatch_collective(options.dtype, communicator.get(), devices,
+                                         local_rank_offset, redop, options.fault_injection,
+                                         &local_wrong, &stream_waits_completed,
+                                         &async_socket_failure) && ok;
+                if (!ok) break;
+            }
         }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "mpi correctness setup failed: %s\n", error.what());

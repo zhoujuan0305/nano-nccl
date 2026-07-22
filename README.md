@@ -8,29 +8,7 @@ A GPU collective communication library for single-host multi-GPU All Reduce, tar
 
 ## Performance
 
-The tables below report out-of-place `busbw` in GB/s (`-w 5 -n 20`).
-
-### Single host: 4× RTX A6000
-
-CUDA 12.8, `CUDA_VISIBLE_DEVICES=0,1,2,3`, and `--transport auto` (resolved to `mixed`). NCCL used `Ring` + `Simple`, four channels, and `NCCL_BUFFSIZE=33554432`. Each size cell is `nano-nccl / NCCL` bus bandwidth in GB/s.
-
-| dtype | 256 KiB | 1 MiB | 4 MiB | 16 MiB | 64 MiB | nano/NCCL geomean |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| float | 6.88 / 6.43 | 14.80 / 14.14 | 19.30 / 19.50 | 22.47 / 22.61 | 23.29 / 22.95 | 1.023 |
-| fp16 | 6.84 / 6.33 | 14.43 / 14.29 | 19.32 / 19.70 | 22.44 / 22.73 | 23.29 / 23.17 | 1.012 |
-| bf16 | 6.83 / 6.41 | 14.73 / 14.33 | 19.38 / 19.95 | 22.48 / 22.77 | 23.31 / 22.74 | 1.015 |
-
-### Two hosts: 2×4 RTX A6000 over TCP socket
-
-One four-GPU MPI process per host, `eno2`, CUDA 12.8, and Open MPI 4.1.2. nano-nccl used `--algo ring_simple --transport auto` and resolved to `mixed` (socket for cross-host edges). NCCL 2.25.1 used `Ring` + `Simple`, four channels, `NCCL_SOCKET_IFNAME=eno2`, and `NCCL_IB_DISABLE=1`.
-
-| size | nano-nccl time (us) | nano busbw (GB/s) | NCCL time (us) | NCCL busbw (GB/s) | nano/NCCL |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 256 KiB | 4203.72 | 0.109130 | 3989.82 | 0.114981 | 0.949116 |
-| 1 MiB | 16030.16 | 0.114472 | 16012.80 | 0.114596 | 0.998917 |
-| 4 MiB | 66742.16 | 0.109976 | 63165.10 | 0.116204 | 0.946405 |
-| 16 MiB | 275982.46 | 0.106384 | 252055.00 | 0.116483 | 0.913301 |
-| 64 MiB | 1107119.12 | 0.106078 | 1019285.00 | 0.115219 | 0.920664 |
+[Detailed single-host and two-host performance results](performance.md) record the tested topology, environment, all dtype/reduction combinations, and point-by-point NCCL comparisons.
 
 ---
 
@@ -98,9 +76,9 @@ For a two-host, four-GPU-per-host launch, pass the interface export in both MPMD
 
 ```bash
 mpirun \
-  -np 1 --host 192.168.104.246 -x NANO_NCCL_SOCKET_IFNAME=eno2 \
+  -np 1 --host <host-a> -x NANO_NCCL_SOCKET_IFNAME=<interface> \
     ./build-mpi/tests/nano_nccl_mpi_correctness --dtype float \
-  : -np 1 --host 192.168.104.247 -x NANO_NCCL_SOCKET_IFNAME=eno2 \
+  : -np 1 --host <host-b> -x NANO_NCCL_SOCKET_IFNAME=<interface> \
     ./build-mpi/tests/nano_nccl_mpi_correctness --dtype float
 ```
 
@@ -111,15 +89,15 @@ mpirun \
 ```bash
 # Benchmark (perf + correctness)
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
-  --algo ring_simple --dtype float --transport auto \
+  --algo ring_simple --dtype float --redop sum --transport auto \
   -b 262144 -e 67108864 -f 4 -w 5 -n 20
 
 # FP16 and BF16 correctness/performance runs (BF16 requires SM80+)
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
-  --algo ring_simple --dtype fp16 --transport auto \
+  --algo ring_simple --dtype fp16 --redop max --transport auto \
   -b 262144 -e 67108864 -f 4 -w 5 -n 20
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
-  --algo ring_simple --dtype bf16 --transport auto \
+  --algo ring_simple --dtype bf16 --redop avg --transport auto \
   -b 262144 -e 67108864 -f 4 -w 5 -n 20
 
 # Correctness-only test
@@ -128,6 +106,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_correctness
 # Smoke test
 CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_smoke
 ```
+
+`--redop` accepts `sum` (the default), `avg`, `max`, and `min`. `avg` is the
+element-wise `sum / nranks`. `max` and `min` propagate NaN when either operand
+is NaN. The selected reduction operation is compiled into the device kernel;
+the rank count remains a runtime kernel parameter.
 
 ### Optional NVTX/CUDA profiling
 
@@ -196,7 +179,8 @@ The single-host adapter requires `devices` to be the visible-device sequence
 `{0, ..., NANO_NCCL_NRANKS - 1}`. In an MPI build, `nano_nccl/mpi.h` provides
 `create_communicator_from_mpi(MPI_COMM_WORLD, config)` for a distributed
 communicator. `all_reduce` is out-of-place and supports `float`, FP16, BF16,
-and `sum`. `reduce_scatter` and `all_gather` are present in the public interface
+and `sum`, `avg`, `max`, and `min`. `avg` is `sum / nranks`; `max` and `min`
+propagate NaN. `reduce_scatter` and `all_gather` are present in the public interface
 but throw an unsupported-operation error.
 
 ### Transport selection
@@ -223,7 +207,7 @@ Currently supports only:
 
 - Single-node multi-GPU performance path (tested with `CUDA_VISIBLE_DEVICES=0,1,2,3`); optional MPI/socket multi-host `all_reduce` correctness path
 - `float`, FP16 (`fp16`), and BF16 (`bf16`) dtypes; BF16 requires SM80+
-- `sum` reduce op
+- `sum`, `avg`, `max`, and `min` reduce ops; `avg` is `sum / nranks`, and `max`/`min` propagate NaN
 - out-of-place
 - SHM FIFO and device P2P FIFO transports, plus optional MPI/socket for cross-process ring edges; P2P is single-node only
 
@@ -232,8 +216,8 @@ No multi-host performance acceptance gate has been established. This project is 
 Future expansion plans:
 
 - dtype: `double` / `int8`
-- reduce op: `max` / `min` / `prod`
-- rank count: 2 / 8 / 16 (templated, host-side dispatch)
+- reduce op: `prod`
+- rank count: 2 / 8 / 16 (runtime kernel parameter)
 - collective: `all_gather` / `reduce_scatter` / `broadcast`
 - transport: network
 

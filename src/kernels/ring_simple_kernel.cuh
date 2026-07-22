@@ -27,6 +27,21 @@ struct RedOpTraits<RedOp::Sum, __nv_bfloat16> {
     }
 };
 
+template <>
+struct RedOpTraits<RedOp::Avg, __half> {
+    static __device__ __forceinline__ __half apply(__half a, __half b) {
+        return __hadd(a, b);
+    }
+};
+
+template <>
+struct RedOpTraits<RedOp::Avg, __nv_bfloat16> {
+    static __device__ __forceinline__ __nv_bfloat16 apply(__nv_bfloat16 a,
+                                                           __nv_bfloat16 b) {
+        return __hadd(a, b);
+    }
+};
+
 }  // namespace nano_nccl
 
 namespace nano_nccl::kernels {
@@ -101,32 +116,47 @@ __device__ __forceinline__ std::uint32_t bfloat162_to_bits(__nv_bfloat162 value)
            (static_cast<std::uint32_t>(raw.y) << 16);
 }
 
-template <typename T>
+template <typename T, RedOp kRedOp>
 struct Packed16Traits;
 
-template <>
-struct Packed16Traits<__half> {
+template <RedOp kRedOp>
+struct Packed16Traits<__half, kRedOp> {
     static __device__ __forceinline__ std::uint32_t apply(std::uint32_t a,
                                                            std::uint32_t b) {
-        return half2_to_bits(__hadd2(half2_from_bits(a), half2_from_bits(b)));
+        __half2 lhs = half2_from_bits(a);
+        __half2 rhs = half2_from_bits(b);
+        if constexpr (kRedOp == RedOp::Sum || kRedOp == RedOp::Avg) {
+            return half2_to_bits(__hadd2(lhs, rhs));
+        }
+        return half2_to_bits(__halves2half2(
+            RedOpTraits<kRedOp, __half>::apply(__low2half(lhs), __low2half(rhs)),
+            RedOpTraits<kRedOp, __half>::apply(__high2half(lhs), __high2half(rhs))));
     }
 };
 
-template <>
-struct Packed16Traits<__nv_bfloat16> {
+template <RedOp kRedOp>
+struct Packed16Traits<__nv_bfloat16, kRedOp> {
     static __device__ __forceinline__ std::uint32_t apply(std::uint32_t a,
                                                            std::uint32_t b) {
-        return bfloat162_to_bits(
-            __hadd2(bfloat162_from_bits(a), bfloat162_from_bits(b)));
+        __nv_bfloat162 lhs = bfloat162_from_bits(a);
+        __nv_bfloat162 rhs = bfloat162_from_bits(b);
+        if constexpr (kRedOp == RedOp::Sum || kRedOp == RedOp::Avg) {
+            return bfloat162_to_bits(__hadd2(lhs, rhs));
+        }
+        return bfloat162_to_bits(__halves2bfloat162(
+            RedOpTraits<kRedOp, __nv_bfloat16>::apply(
+                __low2bfloat16(lhs), __low2bfloat16(rhs)),
+            RedOpTraits<kRedOp, __nv_bfloat16>::apply(
+                __high2bfloat16(lhs), __high2bfloat16(rhs))));
     }
 };
 
-template <typename T>
+template <typename T, RedOp kRedOp>
 __device__ __forceinline__ uint4 reduce_packed16(uint4 local, uint4 recv) {
-    return make_uint4(Packed16Traits<T>::apply(local.x, recv.x),
-                      Packed16Traits<T>::apply(local.y, recv.y),
-                      Packed16Traits<T>::apply(local.z, recv.z),
-                      Packed16Traits<T>::apply(local.w, recv.w));
+    return make_uint4(Packed16Traits<T, kRedOp>::apply(local.x, recv.x),
+                      Packed16Traits<T, kRedOp>::apply(local.y, recv.y),
+                      Packed16Traits<T, kRedOp>::apply(local.z, recv.z),
+                      Packed16Traits<T, kRedOp>::apply(local.w, recv.w));
 }
 
 template <typename T>
@@ -152,7 +182,7 @@ __device__ inline void copy_volatile_packed16_worker(
     }
 }
 
-template <typename T>
+template <typename T, RedOp kRedOp>
 __device__ inline void reduce_volatile_packed16_worker(
     const T* local, const T* recv, T* dst, std::size_t count, int nworkers) {
     if (threadIdx.x >= nworkers) return;
@@ -160,7 +190,8 @@ __device__ inline void reduce_volatile_packed16_worker(
     const uint4* local4 = reinterpret_cast<const uint4*>(local);
     uint4* dst4 = reinterpret_cast<uint4*>(dst);
     for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
-        dst4[i] = reduce_packed16<T>(local4[i], load_volatile_uint4(recv + 8 * i));
+        dst4[i] = reduce_packed16<T, kRedOp>(local4[i],
+                                              load_volatile_uint4(recv + 8 * i));
     }
 }
 
@@ -178,7 +209,7 @@ __device__ inline void copy_broadcast_volatile_packed16_worker(
     }
 }
 
-template <typename T>
+template <typename T, RedOp kRedOp>
 __device__ inline void reduce_broadcast_volatile_packed16_worker(
     const T* local, const T* recv, T* dst0, T* dst1,
     std::size_t count, int nworkers) {
@@ -188,8 +219,8 @@ __device__ inline void reduce_broadcast_volatile_packed16_worker(
     uint4* dst04 = reinterpret_cast<uint4*>(dst0);
     uint4* dst14 = reinterpret_cast<uint4*>(dst1);
     for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
-        uint4 value = reduce_packed16<T>(local4[i],
-                                         load_volatile_uint4(recv + 8 * i));
+        uint4 value = reduce_packed16<T, kRedOp>(local4[i],
+                                                  load_volatile_uint4(recv + 8 * i));
         dst04[i] = value;
         dst14[i] = value;
     }
@@ -270,6 +301,31 @@ __device__ inline void copy_volatile_worker(const T* src, T* dst,
     }
 }
 
+template <typename T>
+__device__ __forceinline__ T scale_avg(T value, float inverse_nranks) {
+    return value * inverse_nranks;
+}
+
+template <>
+__device__ __forceinline__ __half scale_avg(__half value, float inverse_nranks) {
+    return __hmul(value, __float2half(inverse_nranks));
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16 scale_avg(
+    __nv_bfloat16 value, float inverse_nranks) {
+    return __hmul(value, __float2bfloat16(inverse_nranks));
+}
+
+template <typename T>
+__device__ inline void scale_avg_worker(T* output, std::size_t count,
+                                        float inverse_nranks, int nworkers) {
+    if (threadIdx.x >= nworkers) return;
+    for (std::size_t index = threadIdx.x; index < count; index += nworkers) {
+        output[index] = scale_avg(output[index], inverse_nranks);
+    }
+}
+
 // local + recv 规约后写 dst。reduce 通过 RedOpTraits，未来扩展 max/min 直接换 trait。
 template <typename T, RedOp kRedOp>
 __device__ inline void reduce_volatile_worker(const T* local, const T* recv,
@@ -292,9 +348,10 @@ __device__ inline void reduce_volatile_worker(const T* local, const T* recv,
             }
             return;
         }
-    } else if constexpr (kIsPacked16<T> && kRedOp == RedOp::Sum) {
+    } else if constexpr (kIsPacked16<T>) {
         if (aligned_packed16(local, recv, dst, count)) {
-            reduce_volatile_packed16_worker(local, recv, dst, count, nworkers);
+            reduce_volatile_packed16_worker<T, kRedOp>(local, recv, dst, count,
+                                                        nworkers);
             return;
         }
     }
@@ -361,11 +418,11 @@ __device__ inline void reduce_broadcast_volatile_worker(
             }
             return;
         }
-    } else if constexpr (kIsPacked16<T> && kRedOp == RedOp::Sum) {
+    } else if constexpr (kIsPacked16<T>) {
         if (aligned_packed16(local, recv, dst0, count) &&
             aligned_packed16(local, recv, dst1, count)) {
-            reduce_broadcast_volatile_packed16_worker(local, recv, dst0, dst1,
-                                                       count, nworkers);
+            reduce_broadcast_volatile_packed16_worker<T, kRedOp>(
+                local, recv, dst0, dst1, count, nworkers);
             return;
         }
     }
@@ -767,6 +824,10 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
         elem_offset += loop_count;
     }
 
+    if constexpr (kRedOp == RedOp::Avg) {
+        scale_avg_worker(args.output + part_offset, part_count,
+                         1.0f / static_cast<float>(nranks), nworkers);
+    }
     __syncthreads();
     if (threadIdx.x == 0) {
         args.control.base_steps[channel] = send_step;

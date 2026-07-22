@@ -25,8 +25,9 @@ bool report_results(const std::vector<nano_nccl::BenchResult>& results,
                     nano_nccl::TransportKind expected_transport,
                     int* total_wrong) {
     for (const auto& result : results) {
-        std::printf("correctness algo=%s dtype=%s transport=%s bytes=%zu wrong=%d max_abs=%g\n",
+        std::printf("correctness algo=%s dtype=%s redop=%s transport=%s bytes=%zu wrong=%d max_abs=%g\n",
                     result.algo.c_str(), nano_nccl::dtype_name(result.dtype),
+                    nano_nccl::redop_name(result.redop),
                     nano_nccl::transport_name(result.transport), result.bytes,
                     result.wrong, result.max_abs_error);
         if (result.transport != expected_transport) {
@@ -44,9 +45,11 @@ bool report_results(const std::vector<nano_nccl::BenchResult>& results,
 }
 
 int run_dtype(nano_nccl::BenchConfig* config, nano_nccl::DType dtype,
+              nano_nccl::RedOp redop,
               nano_nccl::TransportKind requested_transport,
               nano_nccl::TransportKind expected_transport, int* total_wrong) {
     config->dtype = dtype;
+    config->redop = redop;
     config->transport = requested_transport;
     std::vector<nano_nccl::BenchResult> results;
     int rc = nano_nccl::run_all_reduce_bench(*config, &results);
@@ -59,7 +62,8 @@ int run_dtype(nano_nccl::BenchConfig* config, nano_nccl::DType dtype,
 }
 
 int run_bf16_if_supported(nano_nccl::BenchConfig* config,
-                          nano_nccl::TransportKind requested_transport,
+                           nano_nccl::RedOp redop,
+                           nano_nccl::TransportKind requested_transport,
                           nano_nccl::TransportKind expected_transport,
                           int* total_wrong) {
     int first_bf16_unsupported_device = -1;
@@ -73,8 +77,8 @@ int run_bf16_if_supported(nano_nccl::BenchConfig* config,
         }
     }
     if (first_bf16_unsupported_device < 0) {
-        return run_dtype(config, nano_nccl::DType::BFloat16,
-                         requested_transport, expected_transport, total_wrong);
+        return run_dtype(config, nano_nccl::DType::BFloat16, redop,
+                          requested_transport, expected_transport, total_wrong);
     }
 
     std::printf(
@@ -96,27 +100,46 @@ int run_dtype_matrix(nano_nccl::BenchConfig* config,
         nano_nccl::DType::Float,
         nano_nccl::DType::Float16,
     };
-    for (nano_nccl::DType dtype : dtypes) {
-        if (run_dtype(config, dtype, requested_transport,
-                      expected_transport, total_wrong) != 0) {
+    const nano_nccl::RedOp redops[] = {
+        nano_nccl::RedOp::Sum,
+        nano_nccl::RedOp::Avg,
+        nano_nccl::RedOp::Max,
+        nano_nccl::RedOp::Min,
+    };
+    for (nano_nccl::RedOp redop : redops) {
+        for (nano_nccl::DType dtype : dtypes) {
+            if (run_dtype(config, dtype, redop, requested_transport,
+                          expected_transport, total_wrong) != 0) {
+                return 1;
+            }
+        }
+        if (run_bf16_if_supported(config, redop, requested_transport,
+                                  expected_transport, total_wrong) != 0) {
             return 1;
         }
     }
-    return run_bf16_if_supported(config, requested_transport,
-                                 expected_transport, total_wrong);
+    return 0;
 }
 
 int run_packed16_scalar_matrix(nano_nccl::BenchConfig* config,
                                nano_nccl::TransportKind requested_transport,
                                nano_nccl::TransportKind expected_transport,
                                int* total_wrong) {
-    if (run_dtype(config, nano_nccl::DType::Float16, requested_transport,
-                  expected_transport, total_wrong) != 0) {
-        return 1;
+    const nano_nccl::RedOp redops[] = {
+        nano_nccl::RedOp::Sum,
+        nano_nccl::RedOp::Avg,
+        nano_nccl::RedOp::Max,
+        nano_nccl::RedOp::Min,
+    };
+    for (nano_nccl::RedOp redop : redops) {
+        if (run_dtype(config, nano_nccl::DType::Float16, redop,
+                      requested_transport, expected_transport, total_wrong) != 0 ||
+            run_bf16_if_supported(config, redop, requested_transport,
+                                  expected_transport, total_wrong) != 0) {
+            return 1;
+        }
     }
-
-    return run_bf16_if_supported(config, requested_transport,
-                                 expected_transport, total_wrong);
+    return 0;
 }
 
 int run_transport_matrix(nano_nccl::BenchConfig* config,
