@@ -116,6 +116,48 @@ __device__ __forceinline__ std::uint32_t bfloat162_to_bits(__nv_bfloat162 value)
            (static_cast<std::uint32_t>(raw.y) << 16);
 }
 
+template <typename T>
+__device__ __forceinline__ T scale_avg(T value, float inverse_nranks) {
+    return value * inverse_nranks;
+}
+
+template <>
+__device__ __forceinline__ __half scale_avg(__half value, float inverse_nranks) {
+    return __hmul(value, __float2half(inverse_nranks));
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16 scale_avg(
+    __nv_bfloat16 value, float inverse_nranks) {
+    return __hmul(value, __float2bfloat16(inverse_nranks));
+}
+
+template <typename T>
+__device__ __forceinline__ std::uint32_t scale_avg_packed16(
+    std::uint32_t bits, float inverse_nranks) {
+    if constexpr (std::is_same_v<T, __half>) {
+        __half2 value = half2_from_bits(bits);
+        return half2_to_bits(__halves2half2(
+            scale_avg(__low2half(value), inverse_nranks),
+            scale_avg(__high2half(value), inverse_nranks)));
+    } else {
+        __nv_bfloat162 value = bfloat162_from_bits(bits);
+        return bfloat162_to_bits(__halves2bfloat162(
+            scale_avg(__low2bfloat16(value), inverse_nranks),
+            scale_avg(__high2bfloat16(value), inverse_nranks)));
+    }
+}
+
+template <typename T>
+__device__ __forceinline__ uint4 scale_avg_packed16(
+    uint4 value, float inverse_nranks) {
+    return make_uint4(
+        scale_avg_packed16<T>(value.x, inverse_nranks),
+        scale_avg_packed16<T>(value.y, inverse_nranks),
+        scale_avg_packed16<T>(value.z, inverse_nranks),
+        scale_avg_packed16<T>(value.w, inverse_nranks));
+}
+
 template <typename T, RedOp kRedOp>
 struct Packed16Traits;
 
@@ -212,7 +254,7 @@ __device__ inline void copy_broadcast_volatile_packed16_worker(
 template <typename T, RedOp kRedOp>
 __device__ inline void reduce_broadcast_volatile_packed16_worker(
     const T* local, const T* recv, T* dst0, T* dst1,
-    std::size_t count, int nworkers) {
+    std::size_t count, float inverse_nranks, int nworkers) {
     if (threadIdx.x >= nworkers) return;
     std::size_t vec_count = count / 8;
     const uint4* local4 = reinterpret_cast<const uint4*>(local);
@@ -221,6 +263,9 @@ __device__ inline void reduce_broadcast_volatile_packed16_worker(
     for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
         uint4 value = reduce_packed16<T, kRedOp>(local4[i],
                                                   load_volatile_uint4(recv + 8 * i));
+        if constexpr (kRedOp == RedOp::Avg) {
+            value = scale_avg_packed16<T>(value, inverse_nranks);
+        }
         dst04[i] = value;
         dst14[i] = value;
     }
@@ -301,31 +346,6 @@ __device__ inline void copy_volatile_worker(const T* src, T* dst,
     }
 }
 
-template <typename T>
-__device__ __forceinline__ T scale_avg(T value, float inverse_nranks) {
-    return value * inverse_nranks;
-}
-
-template <>
-__device__ __forceinline__ __half scale_avg(__half value, float inverse_nranks) {
-    return __hmul(value, __float2half(inverse_nranks));
-}
-
-template <>
-__device__ __forceinline__ __nv_bfloat16 scale_avg(
-    __nv_bfloat16 value, float inverse_nranks) {
-    return __hmul(value, __float2bfloat16(inverse_nranks));
-}
-
-template <typename T>
-__device__ inline void scale_avg_worker(T* output, std::size_t count,
-                                        float inverse_nranks, int nworkers) {
-    if (threadIdx.x >= nworkers) return;
-    for (std::size_t index = threadIdx.x; index < count; index += nworkers) {
-        output[index] = scale_avg(output[index], inverse_nranks);
-    }
-}
-
 // local + recv 规约后写 dst。reduce 通过 RedOpTraits，未来扩展 max/min 直接换 trait。
 template <typename T, RedOp kRedOp>
 __device__ inline void reduce_volatile_worker(const T* local, const T* recv,
@@ -396,7 +416,7 @@ __device__ inline void copy_broadcast_volatile_worker(
 template <typename T, RedOp kRedOp>
 __device__ inline void reduce_broadcast_volatile_worker(
     const T* local, const T* recv, T* dst0, T* dst1,
-    std::size_t count, int nworkers) {
+    std::size_t count, float inverse_nranks, int nworkers) {
     if (threadIdx.x >= nworkers) return;
     if constexpr (std::is_same_v<T, float>) {
         if (aligned_vec4(local, recv, dst0, count) &&
@@ -413,6 +433,12 @@ __device__ inline void reduce_broadcast_volatile_worker(
                     RedOpTraits<kRedOp, T>::apply(a.y, b.y),
                     RedOpTraits<kRedOp, T>::apply(a.z, b.z),
                     RedOpTraits<kRedOp, T>::apply(a.w, b.w));
+                if constexpr (kRedOp == RedOp::Avg) {
+                    v.x = scale_avg(v.x, inverse_nranks);
+                    v.y = scale_avg(v.y, inverse_nranks);
+                    v.z = scale_avg(v.z, inverse_nranks);
+                    v.w = scale_avg(v.w, inverse_nranks);
+                }
                 dst04[i] = v;
                 dst14[i] = v;
             }
@@ -422,13 +448,16 @@ __device__ inline void reduce_broadcast_volatile_worker(
         if (aligned_packed16(local, recv, dst0, count) &&
             aligned_packed16(local, recv, dst1, count)) {
             reduce_broadcast_volatile_packed16_worker<T, kRedOp>(
-                local, recv, dst0, dst1, count, nworkers);
+                local, recv, dst0, dst1, count, inverse_nranks, nworkers);
             return;
         }
     }
     volatile const T* recv_v = reinterpret_cast<volatile const T*>(recv);
     for (std::size_t i = threadIdx.x; i < count; i += nworkers) {
         T v = RedOpTraits<kRedOp, T>::apply(local[i], recv_v[i]);
+        if constexpr (kRedOp == RedOp::Avg) {
+            v = scale_avg(v, inverse_nranks);
+        }
         dst0[i] = v;
         dst1[i] = v;
     }
@@ -605,7 +634,7 @@ __device__ inline bool recv_reduce_copy_send(
     transport::SimpleChannelArgs<T> args, const T* local,
     T* out, std::size_t nelem, std::uint64_t* recv_step,
     std::uint64_t* send_step, std::uint64_t* recv_tail_cache,
-    std::uint64_t* send_head_cache, int nworkers, int* wait_status) {
+    std::uint64_t* send_head_cache, float inverse_nranks, int nworkers, int* wait_status) {
     std::size_t slice_size =
         transport::shm::slice_elems<T>(nelem, args.step_elems);
     std::size_t slice_offset = 0;
@@ -630,7 +659,7 @@ __device__ inline bool recv_reduce_copy_send(
         if (work != 0) {
             reduce_broadcast_volatile_worker<T, kRedOp>(
                 local + slice_offset, recv, out + slice_offset, dst, work,
-                nworkers);
+                inverse_nranks, nworkers);
         }
         __syncthreads();
         post_recv_credit<T>(args, *recv_step);
@@ -762,6 +791,10 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
     std::uint64_t send_head_cache = base_step;
     std::uint64_t recv_tail_cache = base_step;
     int ring_ix = args.rank;
+    float inverse_nranks = 1.0f;
+    if constexpr (kRedOp == RedOp::Avg) {
+        inverse_nranks = 1.0f / static_cast<float>(nranks);
+    }
 
     for (std::size_t elem_offset = 0; elem_offset < part_count;) {
         std::size_t rem_count = part_count - elem_offset;
@@ -799,7 +832,7 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
         work = transport::shm::nelem(loop_chunk, rem_count, chunk_offset);
         if (!recv_reduce_copy_send<T, kRedOp>(
             channel_args, args.input + offset, args.output + offset, work,
-            &recv_step, &send_step, &recv_tail_cache, &send_head_cache,
+            &recv_step, &send_step, &recv_tail_cache, &send_head_cache, inverse_nranks,
             nworkers, &s_wait_status)) return;
 
         for (int j = 1; j < nranks - 1; ++j) {
@@ -824,10 +857,6 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
         elem_offset += loop_count;
     }
 
-    if constexpr (kRedOp == RedOp::Avg) {
-        scale_avg_worker(args.output + part_offset, part_count,
-                         1.0f / static_cast<float>(nranks), nworkers);
-    }
     __syncthreads();
     if (threadIdx.x == 0) {
         args.control.base_steps[channel] = send_step;

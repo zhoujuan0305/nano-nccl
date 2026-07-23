@@ -23,6 +23,12 @@ if(BUILD_TESTING)
                 ${CMAKE_SOURCE_DIR}/src/collective/all_reduce/communicator.cu
     )
     add_test(
+        NAME nano_nccl_avg_scale_fusion_static
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/avg_scale_fusion_static.py
+                ${CMAKE_SOURCE_DIR}/src/kernels/ring_simple_kernel.cuh
+    )
+    add_test(
         NAME nano_nccl_bench_profiling_static
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/bench_profiling_static.py
