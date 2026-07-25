@@ -62,6 +62,7 @@ class SocketSendProxy {
 public:
     SocketSendProxy(SocketConnection connection, SocketProxyFifo fifo,
                     SocketSendControl control, SocketProxyIdentity identity,
+                    int fifo_numa_node,
                     std::shared_ptr<SocketAsyncErrorState> errors);
     ~SocketSendProxy();
 
@@ -81,6 +82,7 @@ private:
     SocketProxyFifo fifo_;
     SocketSendControl control_;
     SocketProxyIdentity identity_;
+    int fifo_numa_node_;
     std::shared_ptr<SocketAsyncErrorState> errors_;
     std::atomic<bool> stop_requested_{false};
     std::thread thread_;
@@ -91,6 +93,7 @@ class SocketRecvProxy {
 public:
     SocketRecvProxy(SocketConnection connection, SocketProxyFifo fifo,
                     SocketRecvControl control, SocketProxyIdentity identity,
+                    int fifo_numa_node,
                     std::shared_ptr<SocketAsyncErrorState> errors);
     ~SocketRecvProxy();
 
@@ -110,6 +113,7 @@ private:
     SocketProxyFifo fifo_;
     SocketRecvControl control_;
     SocketProxyIdentity identity_;
+    int fifo_numa_node_;
     std::shared_ptr<SocketAsyncErrorState> errors_;
     std::atomic<bool> stop_requested_{false};
     std::thread thread_;

@@ -8,6 +8,8 @@ int gpu_numa_node(int gpu);
 // 封装 libnuma numa_set_preferred；node<0 表示恢复默认策略。
 void numa_set_prefer(int node);
 
+void pin_current_thread_to_numa_node(int node);
+
 // libnuma 可用性封装；不可用时返回 false。
 bool numa_available_();
 

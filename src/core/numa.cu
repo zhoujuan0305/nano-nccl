@@ -1,6 +1,11 @@
 #include "core/numa.h"
 
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
+#include <memory>
+#include <stdexcept>
+#include <string>
 
 #include <cuda_runtime.h>
 #include <numa.h>
@@ -37,6 +42,24 @@ int gpu_numa_node(int gpu) {
 void numa_set_prefer(int node) {
     if (numa_available() >= 0) {
         numa_set_preferred(node);
+    }
+}
+
+void pin_current_thread_to_numa_node(int node) {
+    if (node < 0 || numa_available() < 0) return;
+    std::unique_ptr<bitmask, decltype(&numa_free_cpumask)> cpus(
+        numa_allocate_cpumask(), numa_free_cpumask);
+    if (cpus == nullptr) {
+        throw std::runtime_error("numa_allocate_cpumask failed");
+    }
+    if (numa_node_to_cpus(node, cpus.get()) != 0 ||
+        numa_bitmask_weight(cpus.get()) == 0) {
+        throw std::runtime_error("NUMA node has no available CPUs");
+    }
+    if (numa_sched_setaffinity(0, cpus.get()) != 0) {
+        const int error = errno;
+        throw std::runtime_error("numa_sched_setaffinity failed: " +
+                                 std::string(std::strerror(error)));
     }
 }
 

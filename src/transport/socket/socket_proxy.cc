@@ -1,4 +1,5 @@
 #include "transport/socket/socket_proxy.h"
+#include "core/numa.h"
 #include "transport/socket/socket_protocol.h"
 
 #include <atomic>
@@ -192,9 +193,10 @@ std::string SocketAsyncErrorState::message() const {
 
 SocketSendProxy::SocketSendProxy(
     SocketConnection connection, SocketProxyFifo fifo, SocketSendControl control,
-    SocketProxyIdentity identity, std::shared_ptr<SocketAsyncErrorState> errors)
+    SocketProxyIdentity identity, int fifo_numa_node,
+    std::shared_ptr<SocketAsyncErrorState> errors)
     : connection_(std::move(connection)), fifo_(fifo), control_(control),
-      identity_(identity), errors_(std::move(errors)) {
+      identity_(identity), fifo_numa_node_(fifo_numa_node), errors_(std::move(errors)) {
     validate_fifo(fifo_);
     if (connection_.fd() < 0 || control_.send_head == nullptr ||
         control_.send_tail == nullptr || errors_ == nullptr) {
@@ -240,6 +242,7 @@ void SocketSendProxy::join() noexcept {
 
 void SocketSendProxy::run() noexcept {
     try {
+        core::pin_current_thread_to_numa_node(fifo_numa_node_);
         set_tcp_nodelay(connection_.fd());
 #if defined(NANO_NCCL_SOCKET_TEST_FAULT_INJECTION)
         const std::uint64_t fault_after_slices = socket_fault_after_slices();
@@ -281,9 +284,10 @@ void SocketSendProxy::run() noexcept {
 
 SocketRecvProxy::SocketRecvProxy(
     SocketConnection connection, SocketProxyFifo fifo, SocketRecvControl control,
-    SocketProxyIdentity identity, std::shared_ptr<SocketAsyncErrorState> errors)
+    SocketProxyIdentity identity, int fifo_numa_node,
+    std::shared_ptr<SocketAsyncErrorState> errors)
     : connection_(std::move(connection)), fifo_(fifo), control_(control),
-      identity_(identity), errors_(std::move(errors)) {
+      identity_(identity), fifo_numa_node_(fifo_numa_node), errors_(std::move(errors)) {
     validate_fifo(fifo_);
     if (connection_.fd() < 0 || control_.recv_head == nullptr ||
         control_.recv_tail == nullptr || errors_ == nullptr) {
@@ -329,6 +333,7 @@ void SocketRecvProxy::join() noexcept {
 
 void SocketRecvProxy::run() noexcept {
     try {
+        core::pin_current_thread_to_numa_node(fifo_numa_node_);
         set_tcp_nodelay(connection_.fd());
         while (!stop_requested_.load(std::memory_order_acquire) &&
                !errors_->has_error()) {

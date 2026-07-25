@@ -281,7 +281,11 @@ private:
                 throw std::runtime_error("socket connection has invalid ring identity");
             }
             const int edge = hello.source_global_rank;
+            const int receiver = (edge + 1) % kRanks;
             if (collective::all_reduce::is_local_global_rank(topology_, edge)) {
+                const int local = collective::all_reduce::local_rank_for_global_rank(
+                    topology_, edge);
+                const int fifo_numa_node = core::gpu_numa_node(devices_[local]);
                 auto& resources = *socket_send_resources_[hello.channel][edge];
                 transport::socket::SocketProxyFifo fifo{
                     resources.fifo->host_ptr(),
@@ -295,8 +299,12 @@ private:
                     transport::socket::SocketSendControl{
                         resources.control.host_ptr(), resources.control.host_ptr() + 1},
                     transport::socket::SocketProxyIdentity{
-                        edge, (edge + 1) % kRanks, hello.channel}, socket_errors_));
+                        edge, (edge + 1) % kRanks, hello.channel}, fifo_numa_node,
+                    socket_errors_));
             } else {
+                const int local = collective::all_reduce::local_rank_for_global_rank(
+                    topology_, receiver);
+                const int fifo_numa_node = core::gpu_numa_node(devices_[local]);
                 auto& resources = *socket_recv_resources_[hello.channel][edge];
                 transport::socket::SocketProxyFifo fifo{
                     resources.fifo->host_ptr(),
@@ -310,7 +318,8 @@ private:
                     transport::socket::SocketRecvControl{
                         resources.control.host_ptr(), resources.control.host_ptr() + 1},
                     transport::socket::SocketProxyIdentity{
-                        edge, (edge + 1) % kRanks, hello.channel}, socket_errors_));
+                        edge, (edge + 1) % kRanks, hello.channel}, fifo_numa_node,
+                    socket_errors_));
             }
         }
         for (const auto& proxy : socket_send_proxies_) proxy->start();

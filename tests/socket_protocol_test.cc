@@ -1,3 +1,4 @@
+#include "core/numa.h"
 #include "transport/socket/socket_protocol.h"
 #include "transport/socket/socket_proxy.h"
 
@@ -14,6 +15,8 @@
 #include <thread>
 
 #include <arpa/inet.h>
+#include <numa.h>
+#include <sched.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -58,6 +61,30 @@ private:
 
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+int current_numa_node() {
+    const int cpu = sched_getcpu();
+    if (cpu < 0) throw std::runtime_error("sched_getcpu failed");
+    const int node = numa_node_of_cpu(cpu);
+    if (node < 0) throw std::runtime_error("numa_node_of_cpu failed");
+    return node;
+}
+
+void pins_current_thread_to_its_numa_node() {
+    if (numa_available() < 0) return;
+    const int node = current_numa_node();
+    nano_nccl::core::pin_current_thread_to_numa_node(node);
+
+    cpu_set_t allowed{};
+    require(sched_getaffinity(0, sizeof(allowed), &allowed) == 0,
+            "sched_getaffinity failed");
+    for (int candidate = 0; candidate < CPU_SETSIZE; ++candidate) {
+        if (CPU_ISSET(candidate, &allowed)) {
+            require(numa_node_of_cpu(candidate) == node,
+                    "thread affinity includes a different NUMA node");
+        }
+    }
 }
 
 void sends_big_endian_header_and_payload() {
@@ -166,11 +193,11 @@ void proxies_copy_fifo_slice_and_publish_counters() {
     nano_nccl::transport::socket::SocketSendProxy sender(
         nano_nccl::transport::socket::SocketConnection(sockets.release_first()),
         {send_fifo.data(), send_fifo.size(), 1, &send_size},
-        {&send_head, &send_tail}, identity, errors);
+        {&send_head, &send_tail}, identity, current_numa_node(), errors);
     nano_nccl::transport::socket::SocketRecvProxy receiver(
         nano_nccl::transport::socket::SocketConnection(sockets.release_second()),
         {recv_fifo.data(), recv_fifo.size(), 1, &recv_size},
-        {&recv_head, &recv_tail}, identity, errors);
+        {&recv_head, &recv_tail}, identity, current_numa_node(), errors);
 
     receiver.start();
     sender.start();
@@ -199,7 +226,7 @@ void closed_peer_records_contextual_proxy_error() {
     nano_nccl::transport::socket::SocketRecvProxy receiver(
         nano_nccl::transport::socket::SocketConnection(sockets.release_second()),
         {recv_fifo.data(), recv_fifo.size(), 1, &recv_size},
-        {&recv_head, &recv_tail}, {7, 8, 2}, errors);
+        {&recv_head, &recv_tail}, {7, 8, 2}, current_numa_node(), errors);
     receiver.start();
     sockets.close_first();
     require(wait_for([&] { return errors->has_error(); }),
@@ -235,11 +262,12 @@ void protocol_error_shuts_down_peer_proxy() {
     nano_nccl::transport::socket::SocketRecvProxy failing_receiver(
         nano_nccl::transport::socket::SocketConnection(sockets.release_second()),
         {failing_fifo.data(), failing_fifo.size(), 1, &failing_size},
-        {&failing_head, &failing_tail}, {3, 4, 0}, failing_errors);
+        {&failing_head, &failing_tail}, {3, 4, 0}, current_numa_node(),
+        failing_errors);
     nano_nccl::transport::socket::SocketRecvProxy peer_receiver(
         nano_nccl::transport::socket::SocketConnection(sockets.release_first()),
         {peer_fifo.data(), peer_fifo.size(), 1, &peer_size},
-        {&peer_head, &peer_tail}, {4, 3, 0}, peer_errors);
+        {&peer_head, &peer_tail}, {4, 3, 0}, current_numa_node(), peer_errors);
 
     peer_receiver.start();
     failing_receiver.start();
@@ -264,6 +292,7 @@ void protocol_error_shuts_down_peer_proxy() {
 
 int main() {
     try {
+        pins_current_thread_to_its_numa_node();
         sends_big_endian_header_and_payload();
         zero_size_slice_advances_framing_order();
         rejects_oversized_header_before_payload_copy();
