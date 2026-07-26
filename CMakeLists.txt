@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(nano_nccl LANGUAGES CXX CUDA)
+project(nano_nccl LANGUAGES C CXX CUDA)
 
 include(CTest)
 
@@ -24,16 +24,26 @@ option(NANO_NCCL_ENABLE_MPI "Build the optional MPI communicator bootstrap adapt
 option(NANO_NCCL_SOCKET_TEST_FAULT_INJECTION
        "Build a test-only MPI socket fault-injection library" OFF)
 option(NANO_NCCL_ENABLE_BENCH_PROFILING "Enable NVTX and CUDA profiler instrumentation in the all-reduce benchmark" OFF)
+option(NANO_NCCL_ENABLE_RDMA "Build the optional RDMA (RC send/recv) transport" OFF)
 
 if(NANO_NCCL_SOCKET_TEST_FAULT_INJECTION AND NOT NANO_NCCL_ENABLE_MPI)
     message(FATAL_ERROR
         "NANO_NCCL_SOCKET_TEST_FAULT_INJECTION requires NANO_NCCL_ENABLE_MPI=ON")
 endif()
 
+if(NANO_NCCL_ENABLE_RDMA AND NOT NANO_NCCL_ENABLE_MPI)
+    message(FATAL_ERROR
+        "NANO_NCCL_ENABLE_RDMA requires NANO_NCCL_ENABLE_MPI=ON")
+endif()
+
 find_package(CUDAToolkit REQUIRED)
 find_library(NUMA_LIB numa REQUIRED)
 if(NANO_NCCL_ENABLE_MPI)
-    find_package(MPI REQUIRED)
+    find_package(MPI REQUIRED COMPONENTS C)
+endif()
+
+if(NANO_NCCL_ENABLE_RDMA)
+    find_library(IBVERBS_LIBRARY ibverbs REQUIRED)
 endif()
 
 add_subdirectory(src)

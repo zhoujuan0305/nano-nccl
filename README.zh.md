@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-面向单机多 GPU 的 All Reduce 通信库，目标是达到 NCCL `Ring` + `Simple` + 4 channels 的性能；可选 MPI/socket 路径用于多机正确性运行。
+面向单机多 GPU 的 All Reduce 通信库，目标是达到 NCCL `Ring` + `Simple` + 4 channels 的性能；可选 MPI/socket 与 MPI/RDMA 路径用于多机正确性运行。
 
 ---
 
@@ -14,7 +14,7 @@
 
 ## 构建
 
-依赖：CUDA 12+、CMake 3.18+、libnuma-dev。可选 MPI/socket 构建要求每台机器使用 Open MPI 4.1.2，且所有启动端必须使用相同的 Open MPI ABI。
+依赖：CUDA 12+、CMake 3.18+、libnuma-dev。分布式构建要求每台机器使用 Open MPI 4.1.2，且所有启动端必须使用相同的 MPI ABI。RDMA 构建额外需要 libibverbs-dev。
 
 ```bash
 mkdir -p build && cd build
@@ -42,6 +42,8 @@ cmake .. -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=8
 - `build-mpi/tests/nano_nccl_mpi_correctness` — MPI/socket 正确性测试（MPI 构建）
 - `build-mpi/tests/nano_nccl_mpi_bootstrap` — MPI bootstrap 冒烟测试（MPI 构建）
 - `build-mpi/tests/nano_nccl_socket_protocol` — socket framing 与 proxy 测试（MPI 构建）
+- `build-rdma/tests/nano_nccl_rdma_protocol` — RDMA 协议布局测试（MPI/RDMA 构建）
+- `build-rdma/tests/nano_nccl_rdma_bootstrap` — 本地 RC QP bootstrap 冒烟测试（MPI/RDMA 构建）
 
 启用 `BUILD_TESTING`（默认开启）时，`ctest --test-dir build
 --output-on-failure` 还会运行 BF16 capability-validation 和 benchmark profiling 的静态回归检查。
@@ -56,6 +58,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=8
 | `NANO_NCCL_BLOCK_THREADS` | 512 | 每 block 线程数 |
 | `NANO_NCCL_FIFO_BUFF_BYTES` | 33554432 | FIFO buffer 大小（字节，默认 32 MiB） |
 | `NANO_NCCL_ENABLE_MPI` | `OFF` | 构建 MPI communicator bootstrap 与分布式 benchmark/test |
+| `NANO_NCCL_ENABLE_RDMA` | `OFF` | 构建 RC send/receive RDMA 通信路径；需要 `NANO_NCCL_ENABLE_MPI=ON` 与 libibverbs |
 | `NANO_NCCL_SOCKET_TEST_FAULT_INJECTION` | `OFF` | 为 `nano_nccl_mpi_correctness` 构建独立的仅测试故障注入库；普通 MPI benchmark 永不包含该钩子 |
 | `NANO_NCCL_ENABLE_BENCH_PROFILING` | `OFF` | 将 NVTX/CUDA profiler instrumentation 编译到 all-reduce benchmark；报告带宽时保持 `OFF` |
 
@@ -70,6 +73,24 @@ cmake -S . -B build-mpi -DCMAKE_BUILD_TYPE=Release \
   -DNANO_NCCL_ENABLE_MPI=ON -DNANO_NCCL_NRANKS=8 -DNANO_NCCL_CUDA_ARCH=86
 cmake --build build-mpi -j$(nproc)
 ```
+
+### 可选 MPI/RDMA 构建
+
+每台机器都要从同一个 commit、以全局 GPU 数构建。RDMA 通过注册的 host-pinned FIFO
+执行 RC send/receive；当前不使用 GPUDirect RDMA。MPI binding 使用 MPI C API，因此
+Open MPI 不需要提供已废弃的 C++ binding library。
+
+```bash
+cmake -S . -B build-rdma -DCMAKE_BUILD_TYPE=Release \
+  -DNANO_NCCL_ENABLE_MPI=ON -DNANO_NCCL_ENABLE_RDMA=ON \
+  -DNANO_NCCL_NRANKS=<全局GPU数> -DNANO_NCCL_CUDA_ARCH=<CUDA算力>
+cmake --build build-rdma -j$(nproc)
+```
+
+每个 MPI process 都要设置 `NANO_NCCL_SOCKET_IFNAME=<interface>` 与
+`NANO_NCCL_RDMA_IFNAME=<rdma-interface>`。默认 GID 不可路由时，设置
+`NANO_NCCL_RDMA_GID_INDEX=<gid-index>`。使用 `--transport rdma`；跨进程 ring edge
+使用 RDMA，本机 edge 保留本地通信路径，因此聚合 transport 通常显示为 `mixed`。
 
 两机、每机四张 GPU 时，MPMD 的两个 app context 都要显式导出接口：
 
@@ -183,11 +204,14 @@ unsupported-operation 错误。
 ### 通信路径选择
 
 单机时 `--transport` 接受 `auto`、`shm` 和 `p2p`。分布式 MPI communicator
-接受 `auto`，跨进程 ring edge 会解析为 socket。
+接受 `auto` 与 `rdma`；`auto` 将跨进程 ring edge 解析为 socket，显式 `rdma`
+仅在 MPI/RDMA 构建时为这些 edge 选择 RDMA。
 
 - `auto`（默认值）对每条 ring edge 独立选择：只有具备 direct NVLink 和双向 CUDA peer access 时才选择 P2P；其余 edge 使用 SHM。最终路径可能是 `shm`、`p2p` 或 `mixed`。
 - `shm` 强制使用 mapped host memory 的 SHM FIFO 路径。
 - `p2p` 要求每条 ring edge 都具备所需的双向 peer access。任一方向不可用时，初始化会在第一个不可用方向报错，不会回退。
+- `rdma` 需要 `NANO_NCCL_ENABLE_MPI=ON` 与 `NANO_NCCL_ENABLE_RDMA=ON`。它为跨进程
+  ring edge 使用 RC send/receive RDMA，本机 edge 保持 SHM。
 
 P2P 是单机通信路径，需要每对完整配置环邻居之间的双向 CUDA peer access；它不是多机或网络通信路径。socket 使用可信、仅 IPv4 的 TCP 网络边界，不提供 TLS 或自动重连。
 
@@ -197,11 +221,11 @@ P2P 是单机通信路径，需要每对完整配置环邻居之间的双向 CUD
 
 当前仅支持：
 
-- 单机多 GPU 性能路径（已验证 `CUDA_VISIBLE_DEVICES=0,1,2,3`）；可选 MPI/socket 多机 `all_reduce` 正确性路径
+- 单机多 GPU 性能路径（已验证 `CUDA_VISIBLE_DEVICES=0,1,2,3`）；可选 MPI/socket 与 MPI/RDMA 多机 `all_reduce` 正确性路径
 - `float`、FP16（`fp16`）和 BF16（`bf16`）类型；BF16 需要 SM80+
 - `sum`、`avg`、`max`、`min` 规约操作；`avg` 为 `sum / nranks`，`max`/`min` 会传播 NaN
 - out-of-place
-- SHM FIFO、device P2P FIFO 通信路径，以及跨进程 ring edge 的可选 MPI/socket；P2P 仅支持单机
+- SHM FIFO、device P2P FIFO 通信路径，以及跨进程 ring edge 的可选 MPI/socket 或 MPI/RDMA；P2P 仅支持单机
 
 尚未建立多机性能验收 gate。本项目不是通用 NCCL 替代品。
 
@@ -211,7 +235,6 @@ P2P 是单机通信路径，需要每对完整配置环邻居之间的双向 CUD
 - reduce op：`prod`
 - rank 数：2 / 8 / 16（kernel 运行时参数）
 - collective：`all_gather` / `reduce_scatter` / `broadcast`
-- 通信路径：网络
 
 ---
 

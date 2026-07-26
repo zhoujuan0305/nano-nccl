@@ -49,9 +49,9 @@ if(NANO_NCCL_SOCKET_TEST_FAULT_INJECTION)
 endif()
 
 if(NANO_NCCL_ENABLE_MPI)
-    set(nano_nccl_mpi_include_dirs ${MPI_CXX_INCLUDE_DIRS})
+    set(nano_nccl_mpi_include_dirs ${MPI_C_INCLUDE_DIRS})
     execute_process(
-        COMMAND ${MPI_CXX_COMPILER} --showme:incdirs
+        COMMAND ${MPI_C_COMPILER} --showme:incdirs
         RESULT_VARIABLE nano_nccl_mpi_showme_status
         OUTPUT_VARIABLE nano_nccl_mpi_showme_include_dirs
         OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -74,7 +74,19 @@ if(NANO_NCCL_ENABLE_MPI)
         ${nano_nccl_mpi_include_dirs}
     )
     target_compile_options(nano_nccl_mpi PRIVATE -O3)
-    target_link_libraries(nano_nccl_mpi PUBLIC nano_nccl MPI::MPI_CXX)
+    target_compile_definitions(nano_nccl_mpi PUBLIC OMPI_SKIP_MPICXX)
+    target_link_libraries(nano_nccl_mpi PUBLIC nano_nccl MPI::MPI_C)
+
+    if(NANO_NCCL_ENABLE_RDMA)
+        # target_sources 由各 rdma 源文件任务渐进追加:
+        #   Task 4 -> rdma_endpoint.cc, Task 5 -> rdma_qp.cc, Task 6 -> rdma_proxy.cc
+        target_sources(nano_nccl PRIVATE transport/rdma/rdma_endpoint.cc)
+        target_sources(nano_nccl PRIVATE transport/rdma/rdma_qp.cc)
+        target_sources(nano_nccl PRIVATE transport/rdma/rdma_proxy.cc)
+        target_link_libraries(nano_nccl PRIVATE ${IBVERBS_LIBRARY})
+        target_compile_definitions(nano_nccl PUBLIC NANO_NCCL_ENABLE_RDMA=1)
+        target_link_libraries(nano_nccl_mpi PRIVATE ${IBVERBS_LIBRARY})
+    endif()
 
     if(NANO_NCCL_SOCKET_TEST_FAULT_INJECTION)
         add_library(nano_nccl_mpi_test_fault STATIC
@@ -86,8 +98,9 @@ if(NANO_NCCL_ENABLE_MPI)
             ${nano_nccl_mpi_include_dirs}
         )
         target_compile_options(nano_nccl_mpi_test_fault PRIVATE -O3)
+        target_compile_definitions(nano_nccl_mpi_test_fault PUBLIC OMPI_SKIP_MPICXX)
         target_link_libraries(nano_nccl_mpi_test_fault PUBLIC
-            nano_nccl_test_fault MPI::MPI_CXX
+            nano_nccl_test_fault MPI::MPI_C
         )
     endif()
 endif()

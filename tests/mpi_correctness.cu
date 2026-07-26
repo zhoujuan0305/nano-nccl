@@ -44,6 +44,7 @@ bool visible_devices(std::vector<int>* devices) {
 
 struct Options {
     nano_nccl::DType dtype = nano_nccl::DType::Float;
+    nano_nccl::TransportKind transport = nano_nccl::TransportKind::Auto;
     bool fault_injection = false;
 };
 
@@ -52,6 +53,13 @@ bool parse_options(int argc, char** argv, Options* options) {
         if (std::strcmp(argv[index], "--dtype") == 0) {
             if (index + 1 == argc ||
                 !nano_nccl::parse_dtype(argv[++index], &options->dtype)) {
+                return false;
+            }
+        } else if (std::strcmp(argv[index], "--transport") == 0) {
+            if (index + 1 == argc ||
+                !nano_nccl::parse_transport(argv[++index], &options->transport) ||
+                (options->transport != nano_nccl::TransportKind::Auto &&
+                 options->transport != nano_nccl::TransportKind::Rdma)) {
                 return false;
             }
         } else if (std::strcmp(argv[index], "--fault-injection") == 0) {
@@ -217,7 +225,9 @@ bool dispatch_collective(nano_nccl::DType dtype, nano_nccl::Communicator* commun
 int main(int argc, char** argv) {
     Options options;
     if (!parse_options(argc, argv, &options)) {
-        std::fprintf(stderr, "Usage: %s [--dtype float|fp16|bf16] [--fault-injection]\n", argv[0]);
+        std::fprintf(stderr,
+                     "Usage: %s [--dtype float|fp16|bf16] "
+                     "[--transport auto|rdma] [--fault-injection]\n", argv[0]);
         return EXIT_FAILURE;
     }
     if (!mpi_ok(MPI_Init(&argc, &argv), "MPI_Init")) return EXIT_FAILURE;
@@ -245,10 +255,15 @@ int main(int argc, char** argv) {
         if (ok) {
             nano_nccl::CommunicatorConfig config;
             config.devices = devices;
-            config.transport = nano_nccl::TransportKind::Auto;
+            config.transport = options.transport;
             communicator = nano_nccl::create_communicator_from_mpi(MPI_COMM_WORLD, config);
-            ok = communicator->transport() == nano_nccl::TransportKind::Socket ||
-                 communicator->transport() == nano_nccl::TransportKind::Mixed;
+            if (options.transport == nano_nccl::TransportKind::Rdma) {
+                ok = communicator->transport() == nano_nccl::TransportKind::Rdma ||
+                     communicator->transport() == nano_nccl::TransportKind::Mixed;
+            } else {
+                ok = communicator->transport() == nano_nccl::TransportKind::Socket ||
+                     communicator->transport() == nano_nccl::TransportKind::Mixed;
+            }
             const nano_nccl::RedOp redops[] = {
                 nano_nccl::RedOp::Sum,
                 nano_nccl::RedOp::Avg,

@@ -99,10 +99,12 @@ bool is_expected_hello(const SocketHello& hello, const ProcessTopology& topology
     int source_process = process_for_global_rank(process_counts, hello.source_global_rank);
     int destination_process = process_for_global_rank(
         process_counts, hello.destination_global_rank);
+    TransportKind edge_kind = topology.edge_kinds[hello.source_global_rank];
     return source_process != destination_process &&
            (source_process == mpi_rank || destination_process == mpi_rank) &&
            mpi_rank == std::max(source_process, destination_process) &&
-           topology.edge_kinds[hello.source_global_rank] == TransportKind::Socket;
+           (edge_kind == TransportKind::Socket ||
+            edge_kind == TransportKind::Rdma);
 }
 
 }  // namespace
@@ -177,9 +179,20 @@ std::unique_ptr<Communicator> create_communicator_from_mpi(
                 topology.edge_kinds[edge] = TransportKind::Shm;
             }
         }
+    } else if (config.transport == TransportKind::Rdma) {
+#if defined(NANO_NCCL_ENABLE_RDMA)
+        for (int edge = 0; edge < global_count; ++edge) {
+            if (topology.edge_kinds[edge] == TransportKind::Socket) {
+                topology.edge_kinds[edge] = TransportKind::Rdma;
+            }
+        }
+#else
+        throw std::invalid_argument(
+            "rdma transport requires NANO_NCCL_ENABLE_RDMA=ON");
+#endif
     } else {
         throw std::invalid_argument(
-            "distributed communicators require auto or socket transport");
+            "distributed communicators require auto, socket, or rdma transport");
     }
     collective::all_reduce::validate_process_topology(topology);
 
@@ -193,7 +206,13 @@ std::unique_ptr<Communicator> create_communicator_from_mpi(
     std::vector<SocketConnection> connections;
     int expected_accepts = 0;
     for (int edge = 0; edge < global_count; ++edge) {
-        if (topology.edge_kinds[edge] != TransportKind::Socket) continue;
+        // Both Socket and Rdma edges walk through this TCP bootstrap. Rdma
+        // re-uses the same fds afterwards for the RdmaPeerInfo swap inside
+        // Communicator::Impl::setup_rdma_transport().
+        if (topology.edge_kinds[edge] != TransportKind::Socket &&
+            topology.edge_kinds[edge] != TransportKind::Rdma) {
+            continue;
+        }
         int receiver = (edge + 1) % global_count;
         int source_process = process_for_global_rank(process_counts, edge);
         int destination_process = process_for_global_rank(process_counts, receiver);

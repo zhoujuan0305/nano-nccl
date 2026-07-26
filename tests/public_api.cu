@@ -306,6 +306,17 @@ bool run_topology_test() {
     validate_process_topology(two_process[0]);
     validate_process_topology(two_process[1]);
 
+    ProcessTopology rdma_process = two_process[0];
+    for (TransportKind& kind : rdma_process.edge_kinds) {
+        if (kind == TransportKind::Socket) kind = TransportKind::Rdma;
+    }
+    validate_process_topology(rdma_process);
+    if (rdma_process.edge_kinds[1] != TransportKind::Rdma ||
+        rdma_process.edge_kinds[3] != TransportKind::Rdma ||
+        rdma_process.edge_kinds[0] != TransportKind::Shm) {
+        return false;
+    }
+
     ProcessTopology second_process = two_process[1];
     auto resolved = nano_nccl::transport::p2p::resolve_ring_transport(
         TransportKind::Auto, second_process);

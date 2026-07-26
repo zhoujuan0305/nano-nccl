@@ -4,8 +4,6 @@ All results below are out-of-place all-reduce measurements. Bandwidth is `busbw`
 
 ## Test Topology And Environment
 
-Measurements were taken from 2026-07-22 through 2026-07-25.
-
 Both hosts use two-socket Intel Xeon Platinum 8462Y+ CPUs (32 cores per socket, two threads per core), 4x NVIDIA RTX A6000 GPUs (SM86), CUDA 12.8.61, NCCL 2.30.7 built from source, nccl-tests 2.19.6, and Open MPI 4.1.2.
 
 | Node | OS kernel | GPU driver | GPUs |
@@ -273,6 +271,136 @@ All measurements use a Release build with `NANO_NCCL_ENABLE_BENCH_PROFILING=OFF`
 | 16 MiB | 252270.61 | 0.12 | 250287.00 | 0.12 | 0.99 |
 | 64 MiB | 1007692.38 | 0.12 | 1000984.00 | 0.12 | 0.99 |
 
+## Two Hosts: 8 Ranks Over RDMA
+
+The nano-nccl runs explicitly request `--transport rdma`. Their aggregate transport output is `mixed` because local ring edges retain their local transport while cross-host edges use RDMA. NCCL uses RDMA. No two-host performance acceptance threshold has been established.
+
+### Float
+
+#### Sum
+
+| Size | nano time (us) | nano busbw | NCCL time (us) | NCCL busbw | nano/NCCL |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 KiB | 462.79 | 0.99 | 541.05 | 0.85 | 1.17 |
+| 1 MiB | 620.00 | 2.96 | 269.69 | 6.80 | 0.43 |
+| 4 MiB | 1423.53 | 5.16 | 674.38 | 10.88 | 0.47 |
+| 16 MiB | 3217.55 | 9.12 | 2562.40 | 11.46 | 0.80 |
+| 64 MiB | 10627.07 | 11.05 | 10231.20 | 11.48 | 0.96 |
+
+#### Avg
+
+| Size | nano time (us) | nano busbw | NCCL time (us) | NCCL busbw | nano/NCCL |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 KiB | 380.07 | 1.21 | 197.87 | 2.32 | 0.52 |
+| 1 MiB | 738.61 | 2.48 | 268.01 | 6.85 | 0.36 |
+| 4 MiB | 1324.61 | 5.54 | 675.50 | 10.87 | 0.51 |
+| 16 MiB | 3244.73 | 9.05 | 2562.79 | 11.46 | 0.79 |
+| 64 MiB | 10626.01 | 11.05 | 10221.80 | 11.49 | 0.96 |
+
+#### Max
+
+| Size | nano time (us) | nano busbw | NCCL time (us) | NCCL busbw | nano/NCCL |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 KiB | 1051.56 | 0.44 | 176.10 | 2.61 | 0.17 |
+| 1 MiB | 556.63 | 3.30 | 245.01 | 7.49 | 0.44 |
+| 4 MiB | 1433.85 | 5.12 | 653.45 | 11.23 | 0.46 |
+| 16 MiB | 3267.64 | 8.99 | 2553.76 | 11.50 | 0.78 |
+| 64 MiB | 11185.24 | 10.50 | 10222.10 | 11.49 | 0.91 |
+
+#### Min
+
+| Size | nano time (us) | nano busbw | NCCL time (us) | NCCL busbw | nano/NCCL |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 KiB | 489.53 | 0.94 | 177.72 | 2.58 | 0.36 |
+| 1 MiB | 603.85 | 3.04 | 251.18 | 7.31 | 0.42 |
+| 4 MiB | 879.71 | 8.34 | 652.04 | 11.26 | 0.74 |
+| 16 MiB | 3219.60 | 9.12 | 2553.63 | 11.50 | 0.79 |
+| 64 MiB | 10632.64 | 11.05 | 10219.90 | 11.49 | 0.96 |
+
+### FP16
+
+#### Sum
+
+| Size | nano time (us) | nano busbw | NCCL time (us) | NCCL busbw | nano/NCCL |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 KiB | 767.16 | 0.60 | 178.75 | 2.57 | 0.23 |
+| 1 MiB | 793.63 | 2.31 | 250.08 | 7.34 | 0.32 |
+| 4 MiB | 1322.24 | 5.55 | 653.25 | 11.24 | 0.49 |
+| 16 MiB | 3264.23 | 8.99 | 2552.86 | 11.50 | 0.78 |
+| 64 MiB | 11180.63 | 10.50 | 10219.20 | 11.49 | 0.91 |
+
+#### Avg
+
+| Size | nano time (us) | nano busbw | NCCL time (us) | NCCL busbw | nano/NCCL |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 KiB | 854.63 | 0.54 | 178.57 | 2.57 | 0.21 |
+| 1 MiB | 596.55 | 3.08 | 270.59 | 6.78 | 0.45 |
+| 4 MiB | 1320.48 | 5.56 | 675.75 | 10.86 | 0.51 |
+| 16 MiB | 2696.97 | 10.89 | 2560.14 | 11.47 | 0.95 |
+| 64 MiB | 11193.81 | 10.49 | 10220.50 | 11.49 | 0.91 |
+
+#### Max
+
+| Size | nano time (us) | nano busbw | NCCL time (us) | NCCL busbw | nano/NCCL |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 KiB | 979.43 | 0.47 | 176.85 | 2.59 | 0.18 |
+| 1 MiB | 557.25 | 3.29 | 253.81 | 7.23 | 0.46 |
+| 4 MiB | 804.40 | 9.12 | 653.27 | 11.24 | 0.81 |
+| 16 MiB | 3226.48 | 9.10 | 2554.56 | 11.49 | 0.79 |
+| 64 MiB | 11208.52 | 10.48 | 10220.20 | 11.49 | 0.91 |
+
+#### Min
+
+| Size | nano time (us) | nano busbw | NCCL time (us) | NCCL busbw | nano/NCCL |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 KiB | 955.21 | 0.48 | 198.03 | 2.32 | 0.21 |
+| 1 MiB | 652.37 | 2.81 | 262.95 | 6.98 | 0.40 |
+| 4 MiB | 794.06 | 9.24 | 676.16 | 10.86 | 0.85 |
+| 16 MiB | 2694.35 | 10.90 | 2552.31 | 11.50 | 0.95 |
+| 64 MiB | 11161.83 | 10.52 | 10301.20 | 11.40 | 0.92 |
+
+### BF16
+
+#### Sum
+
+| Size | nano time (us) | nano busbw | NCCL time (us) | NCCL busbw | nano/NCCL |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 KiB | 863.30 | 0.53 | 529.20 | 0.87 | 0.61 |
+| 1 MiB | 455.09 | 4.03 | 250.68 | 7.32 | 0.55 |
+| 4 MiB | 797.97 | 9.20 | 651.14 | 11.27 | 0.82 |
+| 16 MiB | 2703.33 | 10.86 | 2554.46 | 11.49 | 0.94 |
+| 64 MiB | 11162.84 | 10.52 | 10284.80 | 11.42 | 0.92 |
+
+#### Avg
+
+| Size | nano time (us) | nano busbw | NCCL time (us) | NCCL busbw | nano/NCCL |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 KiB | 886.01 | 0.52 | 198.93 | 2.31 | 0.22 |
+| 1 MiB | 570.10 | 3.22 | 256.37 | 7.16 | 0.45 |
+| 4 MiB | 1322.45 | 5.55 | 652.39 | 11.25 | 0.49 |
+| 16 MiB | 2697.94 | 10.88 | 2563.22 | 11.45 | 0.95 |
+| 64 MiB | 11252.97 | 10.44 | 10434.10 | 11.26 | 0.93 |
+
+#### Max
+
+| Size | nano time (us) | nano busbw | NCCL time (us) | NCCL busbw | nano/NCCL |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 KiB | 836.83 | 0.55 | 184.09 | 2.49 | 0.22 |
+| 1 MiB | 456.99 | 4.02 | 252.15 | 7.28 | 0.55 |
+| 4 MiB | 1306.60 | 5.62 | 651.25 | 11.27 | 0.50 |
+| 16 MiB | 3260.97 | 9.00 | 2552.37 | 11.50 | 0.78 |
+| 64 MiB | 11178.50 | 10.51 | 10224.50 | 11.49 | 0.91 |
+
+#### Min
+
+| Size | nano time (us) | nano busbw | NCCL time (us) | NCCL busbw | nano/NCCL |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 KiB | 866.01 | 0.53 | 199.33 | 2.30 | 0.23 |
+| 1 MiB | 455.84 | 4.03 | 268.03 | 6.85 | 0.59 |
+| 4 MiB | 1992.90 | 3.68 | 676.06 | 10.86 | 0.34 |
+| 16 MiB | 3225.10 | 9.10 | 2553.65 | 11.50 | 0.79 |
+| 64 MiB | 10607.48 | 11.07 | 10229.20 | 11.48 | 0.96 |
+
 ## Reproduction
 
 Build nano-nccl with CUDA 12.8, SM86, Release mode, and profiling disabled. The single-host binary uses four ranks. The distributed binary on both hosts uses eight global ranks and the same Open MPI 4.1.2 prefix.
@@ -294,4 +422,50 @@ NCCL_MAX_NCHANNELS=4 NCCL_BUFFSIZE=33554432 \
   -d <float|half|bfloat16> -o <sum|avg|max|min>
 ```
 
-For two hosts, launch one 4-GPU process on each host with an Open MPI 4.1.2 launcher, set `NANO_NCCL_SOCKET_IFNAME=<interface>` for nano-nccl, and set `NCCL_SOCKET_IFNAME=<interface>`, `NCCL_IB_DISABLE=1`, `NCCL_ALGO=Ring`, `NCCL_PROTO=Simple`, `NCCL_MIN_NCHANNELS=4`, `NCCL_MAX_NCHANNELS=4`, and `NCCL_BUFFSIZE=33554432` for NCCL. Both commands must set `LD_LIBRARY_PATH` to the matching NCCL and Open MPI library directories.
+For two hosts over TCP Socket, launch one 4-GPU process on each host with an Open MPI 4.1.2 launcher, set `NANO_NCCL_SOCKET_IFNAME=<interface>` for nano-nccl, and set `NCCL_SOCKET_IFNAME=<interface>`, `NCCL_IB_DISABLE=1`, `NCCL_ALGO=Ring`, `NCCL_PROTO=Simple`, `NCCL_MIN_NCHANNELS=4`, `NCCL_MAX_NCHANNELS=4`, and `NCCL_BUFFSIZE=33554432` for NCCL. Both commands must set `LD_LIBRARY_PATH` to the matching NCCL and Open MPI library directories.
+
+For RDMA, build nano-nccl with MPI and RDMA enabled on both hosts. Launch one 4-GPU process per host; both hosts must use matching local NCCL and nccl-tests builds. Set `NANO_NCCL_SOCKET_IFNAME=<interface>` for bootstrap and `NANO_NCCL_RDMA_IFNAME=<rdma-interface>` for nano-nccl. Set `NCCL_SOCKET_IFNAME=<interface>` and `NCCL_IB_HCA=<rdma-hca>` for NCCL. The former is a network interface and the latter is an HCA name. The command clears any inherited `NCCL_IB_DISABLE` value.
+
+```bash
+cmake -S . -B build-perf-rdma -DCMAKE_BUILD_TYPE=Release \
+  -DNANO_NCCL_ENABLE_MPI=ON -DNANO_NCCL_ENABLE_RDMA=ON \
+  -DNANO_NCCL_NRANKS=8 -DNANO_NCCL_CUDA_ARCH=86 \
+  -DNANO_NCCL_ENABLE_BENCH_PROFILING=OFF
+cmake --build build-perf-rdma -j<jobs>
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+LD_LIBRARY_PATH=<path-to-nccl-lib>:$LD_LIBRARY_PATH \
+NANO_NCCL_SOCKET_IFNAME=<interface> NANO_NCCL_RDMA_IFNAME=<rdma-interface> \
+mpirun --host <host-a>:1 -np 1 -x CUDA_VISIBLE_DEVICES -x LD_LIBRARY_PATH \
+  -x NANO_NCCL_SOCKET_IFNAME -x NANO_NCCL_RDMA_IFNAME \
+  build-perf-rdma/benchmarks/nano_nccl_all_reduce_bench \
+  --algo ring_simple --transport rdma --dtype <float|fp16|bf16> \
+  --redop <sum|avg|max|min> -b 262144 -e 67108864 -f 4 -w 5 -n 20 : \
+  --host <host-b>:1 -np 1 -x CUDA_VISIBLE_DEVICES -x LD_LIBRARY_PATH \
+  -x NANO_NCCL_SOCKET_IFNAME -x NANO_NCCL_RDMA_IFNAME \
+  build-perf-rdma/benchmarks/nano_nccl_all_reduce_bench \
+  --algo ring_simple --transport rdma --dtype <float|fp16|bf16> \
+  --redop <sum|avg|max|min> -b 262144 -e 67108864 -f 4 -w 5 -n 20
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+LD_LIBRARY_PATH=<path-to-nccl-lib>:$LD_LIBRARY_PATH \
+NCCL_SOCKET_IFNAME=<interface> NCCL_IB_HCA=<rdma-hca> \
+NCCL_ALGO=Ring NCCL_PROTO=Simple NCCL_MIN_NCHANNELS=4 \
+NCCL_MAX_NCHANNELS=4 NCCL_BUFFSIZE=33554432 \
+env -u NCCL_IB_DISABLE mpirun --host <host-a>:1 -np 1 -x CUDA_VISIBLE_DEVICES -x LD_LIBRARY_PATH \
+  -x NCCL_SOCKET_IFNAME -x NCCL_IB_HCA -x NCCL_ALGO -x NCCL_PROTO \
+  -x NCCL_MIN_NCHANNELS -x NCCL_MAX_NCHANNELS -x NCCL_BUFFSIZE \
+  <path-to-nccl-tests>/build/all_reduce_perf \
+  -b 262144 -e 67108864 -f 4 -g 4 -w 5 -n 20 \
+  -d <float|half|bfloat16> -o <sum|avg|max|min> : \
+  --host <host-b>:1 -np 1 -x CUDA_VISIBLE_DEVICES -x LD_LIBRARY_PATH \
+  -x NCCL_SOCKET_IFNAME -x NCCL_IB_HCA -x NCCL_ALGO -x NCCL_PROTO \
+  -x NCCL_MIN_NCHANNELS -x NCCL_MAX_NCHANNELS -x NCCL_BUFFSIZE \
+  <path-to-nccl-tests>/build/all_reduce_perf \
+  -b 262144 -e 67108864 -f 4 -g 4 -w 5 -n 20 \
+  -d <float|half|bfloat16> -o <sum|avg|max|min>
+```

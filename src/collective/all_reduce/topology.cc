@@ -8,7 +8,7 @@ namespace {
 
 bool is_resolved_edge_kind(TransportKind kind) {
     return kind == TransportKind::Shm || kind == TransportKind::P2p ||
-           kind == TransportKind::Socket;
+           kind == TransportKind::Socket || kind == TransportKind::Rdma;
 }
 
 }  // namespace

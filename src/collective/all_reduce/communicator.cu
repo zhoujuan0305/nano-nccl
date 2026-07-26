@@ -11,10 +11,19 @@
 #include "transport/p2p/p2p_step_counters.h"
 #include "transport/p2p/p2p_topology.h"
 #include "transport/shm/shm_fifo.h"
+#if defined(NANO_NCCL_ENABLE_RDMA)
+#include "transport/rdma/rdma_endpoint.h"
+#include "transport/rdma/rdma_proxy.h"
+#include "transport/rdma/rdma_qp.h"
+#include "transport/socket/socket_protocol.h"
+
+#include <infiniband/verbs.h>
+#endif
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <stdexcept>
@@ -175,12 +184,20 @@ public:
         completion_recorded_.resize(devices_.size());
         fallback_in_flight_.resize(devices_.size());
         setup_socket_transport();
+#if defined(NANO_NCCL_ENABLE_RDMA)
+        setup_rdma_transport();
+#endif
     }
 
     ~Impl() {
         if (socket_errors_ != nullptr && socket_errors_->has_error()) {
             socket_abort_.host_ptr()[0] = 1;
         }
+#if defined(NANO_NCCL_ENABLE_RDMA)
+        if (rdma_errors_ != nullptr && rdma_errors_->has_error()) {
+            rdma_abort_.host_ptr()[0] = 1;
+        }
+#endif
         release_lifetime_tracking();
         for (const auto& proxy : socket_send_proxies_) proxy->drain();
         for (const auto& proxy : socket_recv_proxies_) proxy->drain();
@@ -188,6 +205,14 @@ public:
         for (const auto& proxy : socket_recv_proxies_) proxy->shutdown();
         for (const auto& proxy : socket_send_proxies_) proxy->join();
         for (const auto& proxy : socket_recv_proxies_) proxy->join();
+#if defined(NANO_NCCL_ENABLE_RDMA)
+        for (const auto& proxy : rdma_send_proxies_) proxy->drain();
+        for (const auto& proxy : rdma_recv_proxies_) proxy->drain();
+        for (const auto& proxy : rdma_send_proxies_) proxy->shutdown();
+        for (const auto& proxy : rdma_recv_proxies_) proxy->shutdown();
+        for (const auto& proxy : rdma_send_proxies_) proxy->join();
+        for (const auto& proxy : rdma_recv_proxies_) proxy->join();
+#endif
     }
 
     void all_reduce(const CollectiveArgs& args) {
@@ -216,6 +241,11 @@ public:
         if (socket_errors_ != nullptr && socket_errors_->has_error()) {
             throw std::runtime_error(socket_errors_->message());
         }
+#if defined(NANO_NCCL_ENABLE_RDMA)
+        if (rdma_errors_ != nullptr && rdma_errors_->has_error()) {
+            throw std::runtime_error(rdma_errors_->message());
+        }
+#endif
     }
 
 private:
@@ -273,6 +303,12 @@ private:
         }
 
         auto connections = socket_fds_.release_connections();
+#if defined(NANO_NCCL_ENABLE_RDMA)
+        // The RDMA path reuses the bootstrap TCP fds for the QP info swap,
+        // so Rdma-edged connections are handed back to socket_fds_ here for
+        // setup_rdma_transport() to drain.
+        std::vector<transport::socket::SocketConnection> rdma_residual;
+#endif
         for (auto& connection : connections) {
             const auto hello = connection.hello();
             if (hello.channel < 0 || hello.channel >= kChannels ||
@@ -282,6 +318,12 @@ private:
             }
             const int edge = hello.source_global_rank;
             const int receiver = (edge + 1) % kRanks;
+#if defined(NANO_NCCL_ENABLE_RDMA)
+            if (transport_plan_.edge_kind(edge) == TransportKind::Rdma) {
+                rdma_residual.push_back(std::move(connection));
+                continue;
+            }
+#endif
             if (collective::all_reduce::is_local_global_rank(topology_, edge)) {
                 const int local = collective::all_reduce::local_rank_for_global_rank(
                     topology_, edge);
@@ -324,7 +366,220 @@ private:
         }
         for (const auto& proxy : socket_send_proxies_) proxy->start();
         for (const auto& proxy : socket_recv_proxies_) proxy->start();
+#if defined(NANO_NCCL_ENABLE_RDMA)
+        // Re-assign the Rdma-edged residual back into socket_fds_ so that
+        // setup_rdma_transport() can call socket_fds_.release_connections()
+        // on the same SocketFdOwner instance.
+        socket_fds_ = collective::all_reduce::SocketFdOwner::from_connections(
+            std::move(rdma_residual));
+#endif
     }
+
+#if defined(NANO_NCCL_ENABLE_RDMA)
+    // 1:1 mirror of SocketChannelResources plus the RC QP, the FIFO MR and
+    // the peer info cached for the proxy construction. The MR is owned by
+    // the unique_ptr below (RdmaMrDeleter); QP ownership transfers into the
+    // proxy during setup_rdma_transport. fifo/control/payload_bytes mirror
+    // the socket resource layout so a future kernel-wire-up task can reuse
+    // the same slot indexing.
+    struct IbvMrDeleter {
+        void operator()(ibv_mr* mr) const noexcept {
+            if (mr != nullptr) ibv_dereg_mr(mr);
+        }
+    };
+    using RdmaMrPtr = std::unique_ptr<ibv_mr, IbvMrDeleter>;
+
+    struct RdmaChannelResources {
+        std::unique_ptr<MappedBuffer<std::uint8_t>> fifo;
+        MappedU64Array control;
+        MappedU32Array payload_bytes;
+        RdmaMrPtr registered;            // dereg's fifo_mr_raw on destruction
+        ibv_mr* fifo_mr_raw = nullptr;  // owned by registered; read-only view
+        std::unique_ptr<transport::rdma::RdmaQp> qp;
+        transport::rdma::RdmaPeerInfo peer_info{};
+    };
+
+    std::unique_ptr<RdmaChannelResources> make_rdma_resources(int device) {
+        auto resources = std::make_unique<RdmaChannelResources>();
+        resources->fifo = std::make_unique<MappedBuffer<std::uint8_t>>(
+            transport::kSimpleFifoBuffBytes, core::gpu_numa_node(device), devices_);
+        resources->control.reset(2, core::gpu_numa_node(device), devices_);
+        resources->payload_bytes.reset(transport::kSimpleFifoSteps,
+                                       core::gpu_numa_node(device), devices_);
+        return resources;
+    }
+
+    void setup_rdma_transport() {
+        if (!topology_.distributed) return;
+        bool has_rdma_edge = false;
+        for (int edge = 0; edge < kRanks; ++edge) {
+            if (transport_plan_.edge_kind(edge) == TransportKind::Rdma) {
+                has_rdma_edge = true;
+                break;
+            }
+        }
+        if (!has_rdma_edge) return;
+
+        rdma_endpoint_ = std::make_shared<transport::rdma::RdmaEndpoint>(
+            transport::rdma::RdmaEndpoint::create_from_environment());
+        rdma_send_resources_.resize(kChannels);
+        rdma_recv_resources_.resize(kChannels);
+        for (int channel = 0; channel < kChannels; ++channel) {
+            rdma_send_resources_[channel].resize(kRanks);
+            rdma_recv_resources_[channel].resize(kRanks);
+        }
+        rdma_abort_.reset(1, -1, devices_);
+        rdma_errors_ = std::make_shared<transport::rdma::RdmaAsyncErrorState>(
+            rdma_abort_.host_ptr());
+
+        // 1. For each Rdma edge: allocate send/recv FIFO + control, create RC
+        //    QP, register the FIFO MR with bidirectional access flags.
+        for (int edge = 0; edge < kRanks; ++edge) {
+            if (transport_plan_.edge_kind(edge) != TransportKind::Rdma) continue;
+            int receiver = (edge + 1) % kRanks;
+            if (collective::all_reduce::is_local_global_rank(topology_, edge)) {
+                int local = collective::all_reduce::local_rank_for_global_rank(
+                    topology_, edge);
+                for (int channel = 0; channel < kChannels; ++channel) {
+                    rdma_send_resources_[channel][edge] =
+                        make_rdma_resources(devices_[local]);
+                    auto& r = *rdma_send_resources_[channel][edge];
+                    r.qp = std::make_unique<transport::rdma::RdmaQp>(
+                        transport::rdma::RdmaQp::create_init(*rdma_endpoint_, 256, 8));
+                    ibv_mr* mr = ibv_reg_mr(rdma_endpoint_->pd(), r.fifo->host_ptr(),
+                        transport::kSimpleFifoBuffBytes,
+                        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                        IBV_ACCESS_REMOTE_READ);
+                    if (mr == nullptr) {
+                        throw std::runtime_error(std::string("ibv_reg_mr rdma send fifo: ") +
+                                                 std::strerror(errno));
+                    }
+                    r.fifo_mr_raw = mr;
+                    r.registered = RdmaMrPtr(mr);
+                }
+            }
+            if (collective::all_reduce::is_local_global_rank(topology_, receiver)) {
+                int local = collective::all_reduce::local_rank_for_global_rank(
+                    topology_, receiver);
+                for (int channel = 0; channel < kChannels; ++channel) {
+                    rdma_recv_resources_[channel][edge] =
+                        make_rdma_resources(devices_[local]);
+                    auto& r = *rdma_recv_resources_[channel][edge];
+                    r.qp = std::make_unique<transport::rdma::RdmaQp>(
+                        transport::rdma::RdmaQp::create_init(*rdma_endpoint_, 256, 8));
+                    ibv_mr* mr = ibv_reg_mr(rdma_endpoint_->pd(), r.fifo->host_ptr(),
+                        transport::kSimpleFifoBuffBytes,
+                        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                        IBV_ACCESS_REMOTE_READ);
+                    if (mr == nullptr) {
+                        throw std::runtime_error(std::string("ibv_reg_mr rdma recv fifo: ") +
+                                                 std::strerror(errno));
+                    }
+                    r.fifo_mr_raw = mr;
+                    r.registered = RdmaMrPtr(mr);
+                }
+            }
+        }
+
+        // 2. Iterate the TCP fds left in socket_fds_ by setup_socket_transport.
+        //    Each fd is a ring edge; Rdma edges swap RdmaPeerInfo (28 bytes),
+        //    then transition RTR/RTS on both sides before the fd closes.
+        auto connections = socket_fds_.release_connections();
+        std::vector<transport::socket::SocketConnection> rdma_ready_connections;
+        for (auto& connection : connections) {
+            const auto hello = connection.hello();
+            if (hello.channel < 0 || hello.channel >= kChannels ||
+                hello.source_global_rank < 0 || hello.source_global_rank >= kRanks ||
+                hello.destination_global_rank != (hello.source_global_rank + 1) % kRanks) {
+                throw std::runtime_error("rdma connection has invalid ring identity");
+            }
+            const int edge = hello.source_global_rank;
+            if (transport_plan_.edge_kind(edge) != TransportKind::Rdma) continue;
+            const int receiver = (edge + 1) % kRanks;
+            const int fd = connection.fd();
+
+            // Decide local role: sender (edge rank lives here) or receiver.
+            const bool is_send =
+                collective::all_reduce::is_local_global_rank(topology_, edge);
+            const bool is_recv =
+                collective::all_reduce::is_local_global_rank(topology_, receiver);
+            if (!is_send && !is_recv) continue;  // defensive; should not happen
+
+            const int local = collective::all_reduce::local_rank_for_global_rank(
+                topology_, is_send ? edge : receiver);
+            const int fifo_numa_node = core::gpu_numa_node(devices_[local]);
+
+            RdmaChannelResources& r = is_send
+                ? *rdma_send_resources_[hello.channel][edge]
+                : *rdma_recv_resources_[hello.channel][edge];
+
+            // Build local RdmaPeerInfo: qpn from QP, port LID / gid_index /
+            // gid from the shared endpoint.
+            transport::rdma::RdmaPeerInfo local_info = r.qp->local_info();
+            local_info.port_lid = rdma_endpoint_->port_lid();
+            local_info.gid_index = rdma_endpoint_->gid_index();
+            std::memcpy(local_info.gid, rdma_endpoint_->gid(), 16);
+
+            transport::rdma::RdmaPeerInfo remote_info{};
+            transport::socket::send_all(fd, &local_info, sizeof(local_info));
+            transport::socket::recv_all(fd, &remote_info, sizeof(remote_info));
+
+            // v1 one-shot bootstrap: both PSNs start at 0.
+            constexpr std::uint32_t kLocalPsn = 0;
+            r.qp->transition_to_rtr(remote_info, rdma_endpoint_->gid_index());
+            r.qp->transition_to_rts(kLocalPsn, remote_info.psn);
+
+            // Move QP ownership into the proxy; the proxy RAII handles the
+            // qp/cq destruction. SocketConnection closes fd on scope exit.
+            auto qp_taken = std::move(r.qp);
+
+            transport::rdma::RdmaProxyFifo fifo{
+                r.fifo->host_ptr(),
+                transport::kSimpleFifoBuffBytes / transport::kSimpleFifoSteps,
+                transport::kSimpleFifoSteps,
+                r.payload_bytes.host_ptr(),
+                transport::shm::kSimpleFifoSliceSteps,
+            };
+            transport::rdma::RdmaProxyIdentity identity{
+                edge, receiver, hello.channel};
+            if (is_send) {
+                rdma_send_proxies_.push_back(
+                    std::make_unique<transport::rdma::RdmaSendProxy>(
+                        std::move(*qp_taken), r.fifo_mr_raw, fifo,
+                        transport::rdma::RdmaSendControl{
+                            r.control.host_ptr(), r.control.host_ptr() + 1},
+                        identity, fifo_numa_node, rdma_errors_));
+            } else {
+                rdma_recv_proxies_.push_back(
+                    std::make_unique<transport::rdma::RdmaRecvProxy>(
+                        std::move(*qp_taken), r.fifo_mr_raw, fifo,
+                        transport::rdma::RdmaRecvControl{
+                            r.control.host_ptr(), r.control.host_ptr() + 1},
+                        identity, fifo_numa_node, rdma_errors_));
+            }
+            rdma_ready_connections.push_back(std::move(connection));
+            // qp_taken (moved-from state) destructs here; r.qp holds nullptr.
+        }
+
+        // 3. Start receive proxies first. start() posts the next expected
+        //    Simple-protocol slot before launching its worker; a peer-ready
+        //    byte proves the first sender WQE cannot hit an empty RQ.
+        for (const auto& proxy : rdma_recv_proxies_) proxy->start();
+        const std::uint8_t ready = 1;
+        for (const auto& connection : rdma_ready_connections) {
+            std::uint8_t peer_ready = 0;
+            transport::socket::send_all(connection.fd(), &ready, sizeof(ready));
+            transport::socket::recv_all(connection.fd(), &peer_ready, sizeof(peer_ready));
+            if (peer_ready != ready) {
+                throw std::runtime_error("rdma peer did not confirm recv readiness");
+            }
+        }
+        rdma_ready_connections.clear();
+
+        // Both sides confirmed pre-posted recv WQEs; send proxies can now run.
+        for (const auto& proxy : rdma_send_proxies_) proxy->start();
+    }
+#endif
 
     class ResetEvents {
     public:
@@ -536,6 +791,10 @@ private:
                 bool recv_p2p = transport_plan_.edge_kind(recv_edge) == TransportKind::P2p;
                 bool send_socket = transport_plan_.edge_kind(send_edge) == TransportKind::Socket;
                 bool recv_socket = transport_plan_.edge_kind(recv_edge) == TransportKind::Socket;
+#if defined(NANO_NCCL_ENABLE_RDMA)
+                bool send_rdma = transport_plan_.edge_kind(send_edge) == TransportKind::Rdma;
+                bool recv_rdma = transport_plan_.edge_kind(recv_edge) == TransportKind::Rdma;
+#endif
                 if (send_socket) {
                     auto& socket = *socket_send_resources_[channel][send_edge];
                     kernel_args.send_fifo[channel] = reinterpret_cast<T*>(
@@ -544,6 +803,16 @@ private:
                     kernel_args.control.send_tail[channel] = socket.control.device_ptr(devices_[rank]) + 1;
                     kernel_args.send_payload_bytes[channel] =
                         socket.payload_bytes.device_ptr(devices_[rank]);
+#if defined(NANO_NCCL_ENABLE_RDMA)
+                } else if (send_rdma) {
+                    auto& rdma = *rdma_send_resources_[channel][send_edge];
+                    kernel_args.send_fifo[channel] = reinterpret_cast<T*>(
+                        rdma.fifo->device_ptr(devices_[rank]));
+                    kernel_args.control.send_head[channel] = rdma.control.device_ptr(devices_[rank]);
+                    kernel_args.control.send_tail[channel] = rdma.control.device_ptr(devices_[rank]) + 1;
+                    kernel_args.send_payload_bytes[channel] =
+                        rdma.payload_bytes.device_ptr(devices_[rank]);
+#endif
                 } else {
                     kernel_args.send_fifo[channel] = send_p2p
                         ? resources->p2p_fifo->edge_ptr(channel, send_edge)
@@ -561,6 +830,16 @@ private:
                     kernel_args.control.recv_tail[channel] = socket.control.device_ptr(devices_[rank]) + 1;
                     kernel_args.recv_payload_bytes[channel] =
                         socket.payload_bytes.device_ptr(devices_[rank]);
+#if defined(NANO_NCCL_ENABLE_RDMA)
+                } else if (recv_rdma) {
+                    auto& rdma = *rdma_recv_resources_[channel][recv_edge];
+                    kernel_args.recv_fifo[channel] = reinterpret_cast<const T*>(
+                        rdma.fifo->device_ptr(devices_[rank]));
+                    kernel_args.control.recv_head[channel] = rdma.control.device_ptr(devices_[rank]);
+                    kernel_args.control.recv_tail[channel] = rdma.control.device_ptr(devices_[rank]) + 1;
+                    kernel_args.recv_payload_bytes[channel] =
+                        rdma.payload_bytes.device_ptr(devices_[rank]);
+#endif
                 } else {
                     kernel_args.recv_fifo[channel] = recv_p2p
                         ? resources->p2p_fifo->edge_ptr(channel, recv_edge)
@@ -571,8 +850,15 @@ private:
                         ? p2p_control.recv_head[channel] : shm_control.recv_head[channel];
                 }
             }
+#if defined(NANO_NCCL_ENABLE_RDMA)
+            kernel_args.abort = rdma_errors_ != nullptr
+                ? rdma_abort_.device_ptr(devices_[rank])
+                : (socket_errors_ == nullptr
+                    ? nullptr : socket_abort_.device_ptr(devices_[rank]));
+#else
             kernel_args.abort = socket_errors_ == nullptr
                 ? nullptr : socket_abort_.device_ptr(devices_[rank]);
+#endif
             kernel_args.control.base_steps = p2p_control.base_steps != nullptr
                 ? p2p_control.base_steps : shm_control.base_steps;
 
@@ -704,6 +990,15 @@ private:
     std::shared_ptr<transport::socket::SocketAsyncErrorState> socket_errors_;
     std::vector<std::unique_ptr<transport::socket::SocketSendProxy>> socket_send_proxies_;
     std::vector<std::unique_ptr<transport::socket::SocketRecvProxy>> socket_recv_proxies_;
+#if defined(NANO_NCCL_ENABLE_RDMA)
+    std::shared_ptr<transport::rdma::RdmaEndpoint> rdma_endpoint_;
+    std::vector<std::vector<std::unique_ptr<RdmaChannelResources>>> rdma_send_resources_;
+    std::vector<std::vector<std::unique_ptr<RdmaChannelResources>>> rdma_recv_resources_;
+    MappedU32Array rdma_abort_;
+    std::shared_ptr<transport::rdma::RdmaAsyncErrorState> rdma_errors_;
+    std::vector<std::unique_ptr<transport::rdma::RdmaSendProxy>> rdma_send_proxies_;
+    std::vector<std::unique_ptr<transport::rdma::RdmaRecvProxy>> rdma_recv_proxies_;
+#endif
     MappedU64Array simple_fifo_steps_;
     MappedU64Array simple_fifo_base_step_;
     std::unique_ptr<transport::p2p::P2pStepCounters> p2p_steps_;

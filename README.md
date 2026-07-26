@@ -2,7 +2,7 @@
 
 [中文说明](README.zh.md)
 
-A GPU collective communication library for single-host multi-GPU All Reduce, targeting NCCL `Ring` + `Simple` + 4 channels performance. An optional MPI/socket path supports multi-host correctness runs.
+A GPU collective communication library for single-host multi-GPU All Reduce, targeting NCCL `Ring` + `Simple` + 4 channels performance. Optional MPI/socket and MPI/RDMA paths support multi-host correctness runs.
 
 ---
 
@@ -14,7 +14,7 @@ A GPU collective communication library for single-host multi-GPU All Reduce, tar
 
 ## Build
 
-Dependencies: CUDA 12+, CMake 3.18+, libnuma-dev. The optional MPI/socket build requires Open MPI 4.1.2 on every host; every launched host must use the same Open MPI ABI.
+Dependencies: CUDA 12+, CMake 3.18+, libnuma-dev. Distributed builds require Open MPI 4.1.2 on every host with the same MPI ABI. RDMA builds additionally require libibverbs-dev.
 
 ```bash
 mkdir -p build && cd build
@@ -42,6 +42,8 @@ Build artifacts:
 - `build-mpi/tests/nano_nccl_mpi_correctness` — MPI/socket correctness test (MPI build)
 - `build-mpi/tests/nano_nccl_mpi_bootstrap` — MPI bootstrap smoke test (MPI build)
 - `build-mpi/tests/nano_nccl_socket_protocol` — socket framing and proxy test (MPI build)
+- `build-rdma/tests/nano_nccl_rdma_protocol` — RDMA protocol-layout test (MPI/RDMA build)
+- `build-rdma/tests/nano_nccl_rdma_bootstrap` — local RC QP bootstrap smoke test (MPI/RDMA build)
 
 When `BUILD_TESTING` is enabled (the default), `ctest --test-dir build
 --output-on-failure` also runs the static BF16 capability-validation regression
@@ -57,6 +59,7 @@ and benchmark profiling static regressions.
 | `NANO_NCCL_BLOCK_THREADS` | 512 | Threads per block |
 | `NANO_NCCL_FIFO_BUFF_BYTES` | 33554432 | FIFO buffer size in bytes (32 MiB) |
 | `NANO_NCCL_ENABLE_MPI` | `OFF` | Build the MPI communicator bootstrap and distributed benchmark/test |
+| `NANO_NCCL_ENABLE_RDMA` | `OFF` | Build the RC send/receive RDMA transport; requires `NANO_NCCL_ENABLE_MPI=ON` and libibverbs |
 | `NANO_NCCL_SOCKET_TEST_FAULT_INJECTION` | `OFF` | Build a separate test-only fault-injection library for `nano_nccl_mpi_correctness`; ordinary MPI benchmarks never include the hook |
 | `NANO_NCCL_ENABLE_BENCH_PROFILING` | `OFF` | Compile NVTX/CUDA-profiler instrumentation into the all-reduce benchmark; keep `OFF` for reported bandwidth |
 
@@ -71,6 +74,27 @@ cmake -S . -B build-mpi -DCMAKE_BUILD_TYPE=Release \
   -DNANO_NCCL_ENABLE_MPI=ON -DNANO_NCCL_NRANKS=8 -DNANO_NCCL_CUDA_ARCH=86
 cmake --build build-mpi -j$(nproc)
 ```
+
+### Optional MPI/RDMA build
+
+Build the same commit on every host with the global GPU count. RDMA uses RC
+send/receive over registered host-pinned FIFO memory; GPUDirect RDMA is not
+used. The MPI binding uses the MPI C API, so an Open MPI installation need not
+ship the retired C++ binding library.
+
+```bash
+cmake -S . -B build-rdma -DCMAKE_BUILD_TYPE=Release \
+  -DNANO_NCCL_ENABLE_MPI=ON -DNANO_NCCL_ENABLE_RDMA=ON \
+  -DNANO_NCCL_NRANKS=<global_gpu_count> -DNANO_NCCL_CUDA_ARCH=<cuda_arch>
+cmake --build build-rdma -j$(nproc)
+```
+
+Set `NANO_NCCL_SOCKET_IFNAME=<interface>` and
+`NANO_NCCL_RDMA_IFNAME=<rdma-interface>` in every MPI process. Set
+`NANO_NCCL_RDMA_GID_INDEX=<gid-index>` when the default GID entry is not
+routable. Use `--transport rdma`; cross-process ring edges use RDMA and local
+edges retain their local transport, so the reported aggregate transport is
+normally `mixed`.
 
 For a two-host, four-GPU-per-host launch, pass the interface export in both MPMD app contexts:
 
@@ -186,7 +210,9 @@ but throw an unsupported-operation error.
 ### Transport selection
 
 `--transport` accepts `auto`, `shm`, and `p2p` on a single host. Distributed
-MPI communicators accept `auto`; cross-process ring edges resolve to socket.
+MPI communicators accept `auto` and `rdma`; `auto` resolves cross-process ring
+edges to socket, while explicit `rdma` selects RDMA for those edges only when
+built with MPI/RDMA support.
 
 - `auto` (the default) selects P2P independently for each ring edge only when
   it has a direct NVLink and CUDA peer access in both directions; other edges
@@ -194,6 +220,9 @@ MPI communicators accept `auto`; cross-process ring edges resolve to socket.
 - `shm` forces the mapped-host-memory SHM FIFO path.
 - `p2p` requires that every ring edge has the required bidirectional peer
   access and fails during setup on the first unavailable direction.
+- `rdma` requires `NANO_NCCL_ENABLE_MPI=ON` and `NANO_NCCL_ENABLE_RDMA=ON`.
+  It uses RC send/receive RDMA for cross-process ring edges and keeps local
+  edges as SHM.
 
 P2P is a single-node transport. It requires CUDA peer access for the complete
 configured ring; it is not a multi-node or network transport. Socket uses a
@@ -205,11 +234,11 @@ trusted, IPv4-only TCP network boundary and has no TLS or auto reconnect.
 
 Currently supports only:
 
-- Single-node multi-GPU performance path (tested with `CUDA_VISIBLE_DEVICES=0,1,2,3`); optional MPI/socket multi-host `all_reduce` correctness path
+- Single-node multi-GPU performance path (tested with `CUDA_VISIBLE_DEVICES=0,1,2,3`); optional MPI/socket and MPI/RDMA multi-host `all_reduce` correctness paths
 - `float`, FP16 (`fp16`), and BF16 (`bf16`) dtypes; BF16 requires SM80+
 - `sum`, `avg`, `max`, and `min` reduce ops; `avg` is `sum / nranks`, and `max`/`min` propagate NaN
 - out-of-place
-- SHM FIFO and device P2P FIFO transports, plus optional MPI/socket for cross-process ring edges; P2P is single-node only
+- SHM FIFO and device P2P FIFO transports, plus optional MPI/socket or MPI/RDMA for cross-process ring edges; P2P is single-node only
 
 No multi-host performance acceptance gate has been established. This project is not a general NCCL replacement.
 
@@ -219,7 +248,6 @@ Future expansion plans:
 - reduce op: `prod`
 - rank count: 2 / 8 / 16 (runtime kernel parameter)
 - collective: `all_gather` / `reduce_scatter` / `broadcast`
-- transport: network
 
 ---
 

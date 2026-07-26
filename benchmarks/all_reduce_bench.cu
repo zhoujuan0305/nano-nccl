@@ -52,7 +52,7 @@ void usage(const char* argv0) {
                   "Usage: %s [--algo auto|ring_simple] "
                   "[--dtype float|fp16|bf16] "
                   "[--redop sum|avg|max|min] "
-                  "[--transport auto|shm|p2p] "
+                   "[--transport auto|shm|p2p|rdma] "
                  "[-b bytes] [-e bytes] [-f factor] [-w warmup] [-n iters]\n",
                  argv0);
 }

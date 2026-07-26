@@ -7,10 +7,10 @@ This project is a GPU collective communication library targeting NCCL-equivalent
 Current capabilities:
 
 - Single-node multi-GPU performance path (tested with `CUDA_VISIBLE_DEVICES=0,1,2,3`; rank count configurable via CMake `NANO_NCCL_NRANKS`)
-- Optional MPI/socket multi-host, out-of-place `all_reduce` correctness path; Open MPI 4.1.2 and the same MPI ABI are required on all hosts
+- Optional MPI/socket and MPI/RDMA multi-host, out-of-place `all_reduce` correctness paths; Open MPI 4.1.2 and the same MPI ABI are required on all hosts. MPI targets use the MPI C API and do not require Open MPI's retired C++ binding library.
 - `float`, FP16, and BF16 dtypes with `sum`, `avg`, `max`, and `min` reduce ops, out-of-place; `avg` is `sum / nranks`, `max`/`min` propagate NaN, and BF16 requires SM80+
-- Ring + Simple protocol, with SHM FIFO, device P2P FIFO, and optional MPI/socket transports
-- The BF16 device-capability validation is cached after its first successful use; the full A6000 single-host performance gate is pending revalidation (see Acceptance section below)
+- Ring + Simple protocol, with SHM FIFO, device P2P FIFO, optional MPI/socket transport, and optional MPI/RDMA transport
+- MPI/RDMA correctness is validated across `float`, FP16, and BF16; `sum`, `avg`, `max`, and `min`; and 256 KiB through 64 MiB. The BF16 device-capability validation is cached after its first successful use; the full A6000 single-host performance gate is pending revalidation (see Acceptance section below)
 
 Future expansion axes:
 
@@ -20,7 +20,7 @@ Future expansion axes:
 - **collective**: `all_reduce` → `all_gather`/`reduce_scatter`/`broadcast`
 - **transport**: SHM FIFO/P2P FIFO → network
 
-`all_gather` and `reduce_scatter` are unsupported. There is no multi-host performance gate, and socket has no TLS or automatic reconnect; use it only on a trusted network. Do not claim general NCCL replacement capability until expansion is complete.
+`all_gather` and `reduce_scatter` are unsupported. There is no multi-host performance gate. Socket has no TLS or automatic reconnect; use it only on a trusted network. RDMA v1 uses RC send/receive over registered host-pinned FIFO memory and does not use GPUDirect RDMA. Do not claim general NCCL replacement capability until expansion is complete.
 
 ## Sensitive Information
 
@@ -54,10 +54,15 @@ nano-nccl/
 │   │   ├── shm/
 │   │       ├── shm_fifo.h / .cu       # SHM FIFO buffer management
 │   │       └── shm_step.h             # step counter (wait/post)
-│   │   └── socket/
+│   │   ├── socket/
 │   │       ├── socket_endpoint.h / .cc # IPv4 endpoint and HELLO exchange
 │   │       ├── socket_protocol.h       # framed socket slice protocol
 │   │       └── socket_proxy.h / .cc    # host send/receive proxy threads
+│   │   └── rdma/
+│   │       ├── rdma_endpoint.h / .cc   # HCA selection, PD/CQ allocation
+│   │       ├── rdma_qp.h / .cc         # RC QP lifecycle
+│   │       ├── rdma_protocol.h          # QP bootstrap peer information
+│   │       └── rdma_proxy.h / .cc       # host send/receive proxy threads
 │   ├── collective/
 │   │   ├── collective.h               # Collective interface (seam for all_gather etc.)
 │   │   └── all_reduce/
@@ -115,6 +120,7 @@ Namespace layering maps 1:1 to directory structure:
 - `nano_nccl::transport::p2p` — device FIFO, P2P ring validation
 - `nano_nccl::transport::shm` — SHM FIFO, step counter
 - `nano_nccl::transport::socket` — IPv4 endpoints and socket proxy threads
+- `nano_nccl::transport::rdma` — RoCE/IB endpoint, RC QP, and send/recv proxy threads
 - `nano_nccl::collective::all_reduce` — all_reduce host-side orchestration
 - `nano_nccl::kernels` — device kernel templates
 
@@ -138,11 +144,11 @@ Namespace layering maps 1:1 to directory structure:
 
 - **Device kernel** is templated: `template<typename T, typename RedOp> __global__ void ring_simple_kernel(...)` with `int nranks` as a runtime argument. dtype and reduce op are compile-time parameters; rank count is runtime (benchmarked lossless vs. template specialization on 4× A6000: geomean busbw ratio 1.003/0.997/0.998 for float/fp16/bf16 across 256 KiB – 64 MiB).
 - **Host side** uses runtime parameters to select algo/transport/collective, does not require compiling all combinations.
-- **Transport**: SHM FIFO, device P2P FIFO, or MPI/socket for cross-process ring edges. SHM GPUs read/write mapped host memory directly over PCIe (`cudaHostAllocMapped`), with no proxy thread or `cudaMemcpy`; FIFO buffers are allocated on the receiver NUMA node to avoid cross-NUMA bandwidth loss. P2P FIFO buffers are allocated on the receiver GPU and require bidirectional CUDA peer access between every ring-neighbor pair. Socket uses an IPv4 listener chosen by `NANO_NCCL_SOCKET_IFNAME`; it is a trusted-network transport without TLS or auto reconnect.
+- **Transport**: SHM FIFO, device P2P FIFO, MPI/socket, or optional MPI/RDMA for cross-process ring edges. SHM GPUs read/write mapped host memory directly over PCIe (`cudaHostAllocMapped`), with no proxy thread or `cudaMemcpy`; FIFO buffers are allocated on the receiver NUMA node to avoid cross-NUMA bandwidth loss. P2P FIFO buffers are allocated on the receiver GPU and require bidirectional CUDA peer access between every ring-neighbor pair. Socket uses an IPv4 listener chosen by `NANO_NCCL_SOCKET_IFNAME`; it is a trusted-network transport without TLS or auto reconnect. RDMA uses RC send/recv over a host-pinned, registered FIFO; it is selected only by explicit `--transport rdma` and requires the MPI/RDMA build plus `NANO_NCCL_RDMA_IFNAME`.
 
 ### Transport selection
 
-The benchmark `--transport` option accepts `auto`, `shm`, and `p2p`. `auto`
+The benchmark `--transport` option accepts `auto`, `shm`, `p2p`, and `rdma`. `auto`
 (the default) resolves each ring edge independently: it selects P2P for an edge
 only when that edge has an active, direct NVLink and CUDA peer access in both
 directions (`rank i -> rank (i + 1) % nranks` and the reverse); all other edges
@@ -150,6 +156,14 @@ use SHM. Its aggregate transport is `shm`, `p2p`, or `mixed` according to the
 resolved edge plan. `shm` always selects SHM. Explicit `p2p` validates those
 directions and fails on the first unavailable direction; it does not fall back.
 P2P is single-node only and is not a network transport.
+
+`rdma` requires `NANO_NCCL_ENABLE_MPI=ON` and `NANO_NCCL_ENABLE_RDMA=ON` at
+build time. It resolves cross-process ring edges to RC send/recv RDMA and
+keeps local edges as SHM. Set `NANO_NCCL_RDMA_IFNAME=<rdma-interface>` in every
+MPI process; set `NANO_NCCL_RDMA_GID_INDEX` when the default GID table entry is
+not routable for the target RoCE deployment. QP information and receive-ready
+coordination reuse the trusted TCP bootstrap connection. GPUDirect RDMA is not
+used in this version.
 
 For MPI/socket launches, set `NANO_NCCL_SOCKET_IFNAME` to an interface with exactly one usable IPv4 address in every MPMD app context. `NANO_NCCL_SOCKET_TEST_FAULT_INJECTION=ON` builds a separate test-only library for `nano_nccl_mpi_correctness`; ordinary MPI benchmarks always link the library without the `NANO_NCCL_SOCKET_FAIL_AFTER_SLICES` hook.
 
@@ -254,4 +268,5 @@ This is a single-host acceptance criterion only; no multi-host socket performanc
 - **New reduce op**: implement RedOp trait in `include/nano_nccl/traits.h`, add template instantiation in `ring_simple.cu`
 - **New rank count**: pass the new rank count to `ring_simple_kernel` as runtime `nranks` argument; `kRanks` (from `NANO_NCCL_NRANKS`) still controls host-side buffer sizing and array dimensions
 - **New collective**: create subdirectory under `src/collective/`, implement collective interface
-- **New transport**: create a subdirectory under `src/transport/` and implement the transport interface (for example, a network transport)
+- **New transport**: create a subdirectory under `src/transport/` and implement the transport interface (for example, RoCE RC send/recv); RDMA v1 uses registered host FIFO memory, while RDMA write and GPUDirect RDMA remain future work
+- **RDMA build**: `cmake -S . -B build-rdma -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_ENABLE_MPI=ON -DNANO_NCCL_ENABLE_RDMA=ON -DNANO_NCCL_NRANKS=<ranks> -DNANO_NCCL_CUDA_ARCH=<arch>`; requires `libibverbs-dev` and reuses the TCP bootstrap connection for `RdmaPeerInfo` exchange and receive-ready coordination
