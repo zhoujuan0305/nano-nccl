@@ -444,8 +444,10 @@ private:
                     rdma_send_resources_[channel][edge] =
                         make_rdma_resources(devices_[local]);
                     auto& r = *rdma_send_resources_[channel][edge];
+                    constexpr int kRdmaProxyWr = 16;
                     r.qp = std::make_unique<transport::rdma::RdmaQp>(
-                        transport::rdma::RdmaQp::create_init(*rdma_endpoint_, 256, 8));
+                        transport::rdma::RdmaQp::create_init(
+                            *rdma_endpoint_, kRdmaProxyWr, kRdmaProxyWr));
                     ibv_mr* mr = ibv_reg_mr(rdma_endpoint_->pd(), r.fifo->host_ptr(),
                         transport::kSimpleFifoBuffBytes,
                         IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
@@ -465,8 +467,10 @@ private:
                     rdma_recv_resources_[channel][edge] =
                         make_rdma_resources(devices_[local]);
                     auto& r = *rdma_recv_resources_[channel][edge];
+                    constexpr int kRdmaProxyWr = 16;
                     r.qp = std::make_unique<transport::rdma::RdmaQp>(
-                        transport::rdma::RdmaQp::create_init(*rdma_endpoint_, 256, 8));
+                        transport::rdma::RdmaQp::create_init(
+                            *rdma_endpoint_, kRdmaProxyWr, kRdmaProxyWr));
                     ibv_mr* mr = ibv_reg_mr(rdma_endpoint_->pd(), r.fifo->host_ptr(),
                         transport::kSimpleFifoBuffBytes,
                         IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |

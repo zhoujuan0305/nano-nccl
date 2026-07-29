@@ -89,5 +89,16 @@ if(NANO_NCCL_ENABLE_MPI)
         target_compile_definitions(nano_nccl_rdma_bootstrap PRIVATE NANO_NCCL_ENABLE_RDMA=1)
         add_test(NAME nano_nccl_rdma_bootstrap COMMAND nano_nccl_rdma_bootstrap)
         set_tests_properties(nano_nccl_rdma_bootstrap PROPERTIES SKIP_RETURN_CODE 77)
+
+        add_executable(nano_nccl_rdma_proxy rdma_proxy_test.cc)
+        target_link_libraries(nano_nccl_rdma_proxy PRIVATE nano_nccl_mpi ${IBVERBS_LIBRARY})
+        target_compile_definitions(nano_nccl_rdma_proxy PRIVATE NANO_NCCL_ENABLE_RDMA=1)
+        add_test(NAME nano_nccl_rdma_proxy COMMAND nano_nccl_rdma_proxy)
+        set_tests_properties(nano_nccl_rdma_proxy PROPERTIES SKIP_RETURN_CODE 77)
+
+        add_test(NAME nano_nccl_rdma_proxy_multi_flight_static
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/rdma_proxy_multi_flight_static.py
+                         ${CMAKE_SOURCE_DIR}/src/transport/rdma/rdma_proxy.cc)
     endif()
 endif()

@@ -78,7 +78,8 @@ cmake --build build-mpi -j$(nproc)
 ### Optional MPI/RDMA build
 
 Build the same commit on every host with the global GPU count. RDMA uses RC
-send/receive over registered host-pinned FIFO memory; GPUDirect RDMA is not
+send/receive over registered host-pinned FIFO memory; the host proxy
+multi-flights SEND/RECV up to Simple FIFO slice depth. GPUDirect RDMA is not
 used. The MPI binding uses the MPI C API, so an Open MPI installation need not
 ship the retired C++ binding library.
 
@@ -221,8 +222,8 @@ built with MPI/RDMA support.
 - `p2p` requires that every ring edge has the required bidirectional peer
   access and fails during setup on the first unavailable direction.
 - `rdma` requires `NANO_NCCL_ENABLE_MPI=ON` and `NANO_NCCL_ENABLE_RDMA=ON`.
-  It uses RC send/receive RDMA for cross-process ring edges and keeps local
-  edges as SHM.
+  It uses multi-flight RC send/receive RDMA (up to Simple FIFO slice depth) for
+  cross-process ring edges and keeps local edges as SHM.
 
 P2P is a single-node transport. It requires CUDA peer access for the complete
 configured ring; it is not a multi-node or network transport. Socket uses a

@@ -77,7 +77,8 @@ cmake --build build-mpi -j$(nproc)
 ### 可选 MPI/RDMA 构建
 
 每台机器都要从同一个 commit、以全局 GPU 数构建。RDMA 通过注册的 host-pinned FIFO
-执行 RC send/receive；当前不使用 GPUDirect RDMA。MPI binding 使用 MPI C API，因此
+执行 RC send/receive；host proxy 可按 Simple FIFO slice 深度 multi-flight 提交
+SEND/RECV。当前不使用 GPUDirect RDMA。MPI binding 使用 MPI C API，因此
 Open MPI 不需要提供已废弃的 C++ binding library。
 
 ```bash
@@ -211,7 +212,8 @@ unsupported-operation 错误。
 - `shm` 强制使用 mapped host memory 的 SHM FIFO 路径。
 - `p2p` 要求每条 ring edge 都具备所需的双向 peer access。任一方向不可用时，初始化会在第一个不可用方向报错，不会回退。
 - `rdma` 需要 `NANO_NCCL_ENABLE_MPI=ON` 与 `NANO_NCCL_ENABLE_RDMA=ON`。它为跨进程
-  ring edge 使用 RC send/receive RDMA，本机 edge 保持 SHM。
+  ring edge 使用 multi-flight RC send/receive RDMA（深度不超过 Simple FIFO
+  slice），本机 edge 保持 SHM。
 
 P2P 是单机通信路径，需要每对完整配置环邻居之间的双向 CUDA peer access；它不是多机或网络通信路径。socket 使用可信、仅 IPv4 的 TCP 网络边界，不提供 TLS 或自动重连。
 

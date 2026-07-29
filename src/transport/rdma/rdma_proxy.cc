@@ -20,6 +20,7 @@ void validate_fifo(const RdmaProxyFifo& fifo) {
     if (fifo.data == nullptr || fifo.slot_sizes == nullptr ||
         fifo.slot_bytes == 0 || fifo.slot_count == 0 ||
         fifo.step_increment == 0 ||
+        fifo.slot_count % fifo.step_increment != 0 ||
         fifo.slot_count > std::numeric_limits<std::size_t>::max() /
                               fifo.slot_bytes) {
         throw std::runtime_error("rdma proxy has invalid FIFO storage");
@@ -89,6 +90,14 @@ std::string RdmaAsyncErrorState::message() const {
     return message_;
 }
 
+std::size_t RdmaSendProxy::max_inflight() const {
+    if (fifo_.step_increment == 0 ||
+        fifo_.slot_count % fifo_.step_increment != 0) {
+        throw std::runtime_error("rdma send proxy FIFO step_increment invalid");
+    }
+    return fifo_.slot_count / fifo_.step_increment;
+}
+
 RdmaSendProxy::RdmaSendProxy(RdmaQp qp, ibv_mr* fifo_mr, RdmaProxyFifo fifo,
                              RdmaSendControl control, RdmaProxyIdentity identity,
                              int fifo_numa_node,
@@ -102,7 +111,11 @@ RdmaSendProxy::RdmaSendProxy(RdmaQp qp, ibv_mr* fifo_mr, RdmaProxyFifo fifo,
         errors_ == nullptr) {
         throw std::runtime_error("rdma send proxy has invalid state");
     }
-    step_.store(load_counter(control_.send_head), std::memory_order_relaxed);
+    max_inflight_ = max_inflight();
+    const std::uint64_t head = load_counter(control_.send_head);
+    next_post_step_ = head;
+    next_complete_step_ = head;
+    step_.store(head, std::memory_order_relaxed);
 }
 
 RdmaSendProxy::~RdmaSendProxy() {
@@ -145,60 +158,68 @@ void RdmaSendProxy::join() noexcept {
 void RdmaSendProxy::run() noexcept {
     try {
         core::pin_current_thread_to_numa_node(fifo_numa_node_);
+        constexpr int kPollBatch = 16;
+        ibv_wc wcs[kPollBatch];
+        const std::size_t max_if = max_inflight_;
         while (!stop_requested_.load(std::memory_order_acquire) &&
                !errors_->has_error()) {
-            const std::uint64_t step = step_.load(std::memory_order_relaxed);
-            if (load_counter(control_.send_tail) <= step) {
-                std::this_thread::yield();
-                continue;
-            }
-            const std::size_t slot = step % fifo_.slot_count;
-            const std::uint32_t payload_bytes =
-                load_size(fifo_.slot_sizes + slot);
-            if (payload_bytes > fifo_.slot_bytes) {
-                throw std::runtime_error(
-                    "rdma proxy send payload exceeds FIFO capacity");
-            }
-
-            ibv_sge sge{};
-            sge.addr = reinterpret_cast<std::uintptr_t>(
-                fifo_.data + slot * fifo_.slot_bytes);
-            sge.length = payload_bytes;
-            sge.lkey = fifo_mr_->lkey;
-
-            ibv_send_wr wr{};
-            wr.wr_id = RdmaQp::slot_to_wr_id(slot);
-            wr.sg_list = &sge;
-            wr.num_sge = 1;
-            wr.opcode = IBV_WR_SEND;
-            wr.send_flags = 0;
-            wr.next = nullptr;
-
-            ibv_send_wr* bad = nullptr;
-            const int post_ret = ibv_post_send(qp_.qp(), &wr, &bad);
-            if (post_ret != 0) {
-                throw std::runtime_error(std::string("ibv_post_send: ") +
-                                         std::strerror(post_ret));
-            }
-
-            ibv_wc wc{};
-            int n = 0;
-            while ((n = ibv_poll_cq(qp_.cq(), 1, &wc)) == 0) {
-                if (stop_requested_.load(std::memory_order_acquire) ||
-                    errors_->has_error()) {
-                    break;
+            bool did_work = false;
+            while (inflight_ < max_if &&
+                   load_counter(control_.send_tail) > next_post_step_) {
+                const std::size_t slot = next_post_step_ % fifo_.slot_count;
+                const std::uint32_t payload_bytes =
+                    load_size(fifo_.slot_sizes + slot);
+                if (payload_bytes > fifo_.slot_bytes) {
+                    throw std::runtime_error(
+                        "rdma proxy send payload exceeds FIFO capacity");
                 }
+
+                ibv_sge sge{};
+                sge.addr = reinterpret_cast<std::uintptr_t>(
+                    fifo_.data + slot * fifo_.slot_bytes);
+                sge.length = payload_bytes;
+                sge.lkey = fifo_mr_->lkey;
+
+                ibv_send_wr wr{};
+                wr.wr_id = RdmaQp::slot_to_wr_id(slot);
+                wr.sg_list = &sge;
+                wr.num_sge = 1;
+                wr.opcode = IBV_WR_SEND;
+                wr.send_flags = 0;
+                wr.next = nullptr;
+
+                ibv_send_wr* bad = nullptr;
+                const int post_ret = ibv_post_send(qp_.qp(), &wr, &bad);
+                if (post_ret != 0) {
+                    throw std::runtime_error(std::string("ibv_post_send: ") +
+                                             std::strerror(post_ret));
+                }
+                next_post_step_ += fifo_.step_increment;
+                ++inflight_;
+                did_work = true;
             }
+
+            const int n = ibv_poll_cq(qp_.cq(), kPollBatch, wcs);
             if (n < 0) {
                 throw std::runtime_error("ibv_poll_cq failed");
             }
-            if (n == 0) {
-                // stop/error 在轮询期间到达：WQE 由 QP 销毁时的 flush 收尾。
-                break;
+            for (int i = 0; i < n; ++i) {
+                check_wc(wcs[i], identity_, next_complete_step_, errors_.get());
+                const std::uint64_t slot = RdmaQp::wr_id_to_slot(wcs[i].wr_id);
+                if (slot != next_complete_step_ % fifo_.slot_count) {
+                    throw std::runtime_error(
+                        "rdma send completion has unexpected FIFO slot");
+                }
+                store_counter(control_.send_head,
+                              next_complete_step_ + fifo_.step_increment);
+                next_complete_step_ += fifo_.step_increment;
+                step_.store(next_complete_step_, std::memory_order_release);
+                --inflight_;
+                did_work = true;
             }
-            check_wc(wc, identity_, step, errors_.get());
-            store_counter(control_.send_head, step + fifo_.step_increment);
-            step_.store(step + fifo_.step_increment, std::memory_order_release);
+            if (!did_work) {
+                std::this_thread::yield();
+            }
         }
     } catch (const std::exception& error) {
         if (!stop_requested_.load(std::memory_order_acquire)) {
@@ -206,6 +227,14 @@ void RdmaSendProxy::run() noexcept {
                                     error.what());
         }
     }
+}
+
+std::size_t RdmaRecvProxy::max_inflight() const {
+    if (fifo_.step_increment == 0 ||
+        fifo_.slot_count % fifo_.step_increment != 0) {
+        throw std::runtime_error("rdma recv proxy FIFO step_increment invalid");
+    }
+    return fifo_.slot_count / fifo_.step_increment;
 }
 
 RdmaRecvProxy::RdmaRecvProxy(RdmaQp qp, ibv_mr* fifo_mr, RdmaProxyFifo fifo,
@@ -221,7 +250,11 @@ RdmaRecvProxy::RdmaRecvProxy(RdmaQp qp, ibv_mr* fifo_mr, RdmaProxyFifo fifo,
         errors_ == nullptr) {
         throw std::runtime_error("rdma recv proxy has invalid state");
     }
-    step_.store(load_counter(control_.recv_tail), std::memory_order_relaxed);
+    max_inflight_ = max_inflight();
+    const std::uint64_t tail = load_counter(control_.recv_tail);
+    next_post_step_ = tail;
+    next_complete_step_ = tail;
+    step_.store(tail, std::memory_order_relaxed);
 }
 
 RdmaRecvProxy::~RdmaRecvProxy() {
@@ -234,9 +267,14 @@ void RdmaRecvProxy::start() {
         throw std::runtime_error("rdma recv proxy already started");
     }
     // Simple 每个 slice 以 step_increment 前进；预投递必须与 kernel 的
-    // slot 序列一致，而不能按 0,1,2,... 顺序消耗 receive WQE。
-    pre_post_recv(step_.load(std::memory_order_relaxed) % fifo_.slot_count);
-    recv_posted_ = true;
+    // slot 序列一致，并在 credit 与 max_inflight 约束下尽可能填满 RQ。
+    while (inflight_ < max_inflight_ &&
+           load_counter(control_.recv_head) + fifo_.slot_count >=
+               next_post_step_ + fifo_.step_increment) {
+        pre_post_recv(next_post_step_ % fifo_.slot_count);
+        next_post_step_ += fifo_.step_increment;
+        ++inflight_;
+    }
     thread_ = std::thread(&RdmaRecvProxy::run, this);
 }
 
@@ -287,57 +325,42 @@ void RdmaRecvProxy::pre_post_recv(std::uint64_t slot) {
 void RdmaRecvProxy::run() noexcept {
     try {
         core::pin_current_thread_to_numa_node(fifo_numa_node_);
+        constexpr int kPollBatch = 16;
+        ibv_wc wcs[kPollBatch];
+        const std::size_t max_if = max_inflight_;
         while (!stop_requested_.load(std::memory_order_acquire) &&
                !errors_->has_error()) {
-            const std::uint64_t step = step_.load(std::memory_order_relaxed);
-            // 背压：recv_head + slot_count >= step + step_increment 才能继续，
-            // 否则环形 slot 上一轮的数据还没被消费者读走，会原地覆写。
-            if (load_counter(control_.recv_head) + fifo_.slot_count <
-                step + fifo_.step_increment) {
-                std::this_thread::yield();
-                continue;
+            bool did_work = false;
+            while (inflight_ < max_if &&
+                   load_counter(control_.recv_head) + fifo_.slot_count >=
+                       next_post_step_ + fifo_.step_increment) {
+                pre_post_recv(next_post_step_ % fifo_.slot_count);
+                next_post_step_ += fifo_.step_increment;
+                ++inflight_;
+                did_work = true;
             }
 
-            const std::uint64_t expected_slot = step % fifo_.slot_count;
-            if (!recv_posted_) {
-                pre_post_recv(expected_slot);
-                recv_posted_ = true;
-            }
-
-            ibv_wc wc{};
-            int n = 0;
-            while ((n = ibv_poll_cq(qp_.cq(), 1, &wc)) == 0) {
-                if (stop_requested_.load(std::memory_order_acquire) ||
-                    errors_->has_error()) {
-                    break;
-                }
-            }
+            const int n = ibv_poll_cq(qp_.cq(), kPollBatch, wcs);
             if (n < 0) {
                 throw std::runtime_error("ibv_poll_cq failed");
             }
-            if (n == 0) {
-                break;
+            for (int i = 0; i < n; ++i) {
+                check_wc(wcs[i], identity_, next_complete_step_, errors_.get());
+                const std::uint64_t slot = RdmaQp::wr_id_to_slot(wcs[i].wr_id);
+                if (slot != next_complete_step_ % fifo_.slot_count) {
+                    throw std::runtime_error(
+                        "rdma recv completion has unexpected FIFO slot");
+                }
+                store_size(fifo_.slot_sizes + slot, wcs[i].byte_len);
+                store_counter(control_.recv_tail,
+                              next_complete_step_ + fifo_.step_increment);
+                next_complete_step_ += fifo_.step_increment;
+                step_.store(next_complete_step_, std::memory_order_release);
+                --inflight_;
+                did_work = true;
             }
-            check_wc(wc, identity_, step, errors_.get());
-            const std::uint64_t slot = RdmaQp::wr_id_to_slot(wc.wr_id);
-            if (slot != expected_slot) {
-                throw std::runtime_error("rdma recv completion has unexpected FIFO slot");
-            }
-            store_size(fifo_.slot_sizes + slot, wc.byte_len);
-            store_counter(control_.recv_tail, step + fifo_.step_increment);
-            const std::uint64_t next_step = step + fifo_.step_increment;
-            step_.store(next_step, std::memory_order_release);
-
-            // Keep the next WQE armed before the sender observes this
-            // completion whenever its target slot is already safe to reuse.
-            // On the slot-wrap boundary recv_head may not have consumed the
-            // old slot yet; the next loop waits for that credit before post.
-            if (load_counter(control_.recv_head) + fifo_.slot_count >=
-                next_step + fifo_.step_increment) {
-                pre_post_recv(next_step % fifo_.slot_count);
-                recv_posted_ = true;
-            } else {
-                recv_posted_ = false;
+            if (!did_work) {
+                std::this_thread::yield();
             }
         }
     } catch (const std::exception& error) {

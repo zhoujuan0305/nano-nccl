@@ -83,6 +83,7 @@ public:
 
 private:
     void run() noexcept;
+    std::size_t max_inflight() const;
 
     RdmaQp qp_;
     ibv_mr* fifo_mr_;
@@ -94,6 +95,10 @@ private:
     std::atomic<bool> stop_requested_{false};
     std::thread thread_;
     std::atomic<std::uint64_t> step_{0};
+    std::uint64_t next_post_step_ = 0;
+    std::uint64_t next_complete_step_ = 0;
+    std::size_t inflight_ = 0;
+    std::size_t max_inflight_ = 0;
 };
 
 class RdmaRecvProxy {
@@ -115,6 +120,7 @@ public:
 private:
     void run() noexcept;
     void pre_post_recv(std::uint64_t slot);
+    std::size_t max_inflight() const;
 
     RdmaQp qp_;
     ibv_mr* fifo_mr_;
@@ -126,7 +132,10 @@ private:
     std::atomic<bool> stop_requested_{false};
     std::thread thread_;
     std::atomic<std::uint64_t> step_{0};
-    bool recv_posted_ = false;
+    std::uint64_t next_post_step_ = 0;
+    std::uint64_t next_complete_step_ = 0;
+    std::size_t inflight_ = 0;
+    std::size_t max_inflight_ = 0;
 };
 
 }  // namespace nano_nccl::transport::rdma
