@@ -112,6 +112,14 @@ RdmaSendProxy::RdmaSendProxy(RdmaQp qp, ibv_mr* fifo_mr, RdmaProxyFifo fifo,
         throw std::runtime_error("rdma send proxy has invalid state");
     }
     max_inflight_ = max_inflight();
+    const std::size_t bounce_bytes = fifo_.slot_count * fifo_.slot_bytes;
+    bounce_ = std::make_unique<std::uint8_t[]>(bounce_bytes);
+    bounce_mr_ = ibv_reg_mr(fifo_mr_->pd, bounce_.get(), bounce_bytes,
+                            IBV_ACCESS_LOCAL_WRITE);
+    if (bounce_mr_ == nullptr) {
+        throw std::runtime_error(std::string("ibv_reg_mr bounce: ") +
+                                 std::strerror(errno));
+    }
     const std::uint64_t head = load_counter(control_.send_head);
     next_post_step_ = head;
     next_complete_step_ = head;
@@ -121,6 +129,10 @@ RdmaSendProxy::RdmaSendProxy(RdmaQp qp, ibv_mr* fifo_mr, RdmaProxyFifo fifo,
 RdmaSendProxy::~RdmaSendProxy() {
     stop();
     join();
+    if (bounce_mr_ != nullptr) {
+        ibv_dereg_mr(bounce_mr_);
+        bounce_mr_ = nullptr;
+    }
 }
 
 void RdmaSendProxy::start() {
@@ -174,11 +186,19 @@ void RdmaSendProxy::run() noexcept {
                         "rdma proxy send payload exceeds FIFO capacity");
                 }
 
+                // CPU-observe mapped FIFO bytes into registered bounce so the
+                // HCA DMA reads host-visible payload rather than stale GPU-mapped
+                // cachelines (multi-flight: one bounce region per FIFO slot).
+                std::uint8_t* bounce_slot =
+                    bounce_.get() + slot * fifo_.slot_bytes;
+                std::memcpy(bounce_slot,
+                            fifo_.data + slot * fifo_.slot_bytes,
+                            payload_bytes);
+
                 ibv_sge sge{};
-                sge.addr = reinterpret_cast<std::uintptr_t>(
-                    fifo_.data + slot * fifo_.slot_bytes);
+                sge.addr = reinterpret_cast<std::uintptr_t>(bounce_slot);
                 sge.length = payload_bytes;
-                sge.lkey = fifo_mr_->lkey;
+                sge.lkey = bounce_mr_->lkey;
 
                 ibv_send_wr wr{};
                 wr.wr_id = RdmaQp::slot_to_wr_id(slot);

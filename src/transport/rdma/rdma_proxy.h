@@ -92,6 +92,8 @@ private:
     RdmaProxyIdentity identity_;
     int fifo_numa_node_;
     std::shared_ptr<RdmaAsyncErrorState> errors_;
+    std::unique_ptr<std::uint8_t[]> bounce_;
+    ibv_mr* bounce_mr_ = nullptr;
     std::atomic<bool> stop_requested_{false};
     std::thread thread_;
     std::atomic<std::uint64_t> step_{0};
