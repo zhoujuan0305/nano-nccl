@@ -67,6 +67,10 @@ private:
 
 class RdmaSendProxy {
 public:
+    // direct (default): post SGE from fifo_.data + fifo_mr_ (registered mapped FIFO).
+    // bounce: memcpy into registered bounce before SEND (visibility fallback).
+    enum class SendMode { Bounce, Direct };
+
     RdmaSendProxy(RdmaQp qp, ibv_mr* fifo_mr, RdmaProxyFifo fifo,
                   RdmaSendControl control, RdmaProxyIdentity identity,
                   int fifo_numa_node,
@@ -81,6 +85,18 @@ public:
     void drain() const;
     void join() noexcept;
 
+    SendMode send_mode() const noexcept { return send_mode_; }
+
+    std::uint64_t posts() const noexcept {
+        return posts_.load(std::memory_order_relaxed);
+    }
+    std::uint64_t zero_payload_posts() const noexcept {
+        return zero_payload_posts_.load(std::memory_order_relaxed);
+    }
+    std::uint64_t bytes_bounced() const noexcept {
+        return bytes_bounced_.load(std::memory_order_relaxed);
+    }
+
 private:
     void run() noexcept;
     std::size_t max_inflight() const;
@@ -92,6 +108,7 @@ private:
     RdmaProxyIdentity identity_;
     int fifo_numa_node_;
     std::shared_ptr<RdmaAsyncErrorState> errors_;
+    SendMode send_mode_ = SendMode::Direct;
     std::unique_ptr<std::uint8_t[]> bounce_;
     ibv_mr* bounce_mr_ = nullptr;
     std::atomic<bool> stop_requested_{false};
@@ -101,14 +118,22 @@ private:
     std::uint64_t next_complete_step_ = 0;
     std::size_t inflight_ = 0;
     std::size_t max_inflight_ = 0;
+    std::atomic<std::uint64_t> posts_{0};
+    std::atomic<std::uint64_t> zero_payload_posts_{0};
+    std::atomic<std::uint64_t> bytes_bounced_{0};
 };
 
 class RdmaRecvProxy {
 public:
+    // elide_zero_payload: when true, slot_sizes[slot]==0 means local step
+    // complete without ibv_post_recv (test harness / known-size schedules).
+    // Production stays false — the kernel elides empty Simple slices so the
+    // proxy never observes 0-byte steps on the live path.
     RdmaRecvProxy(RdmaQp qp, ibv_mr* fifo_mr, RdmaProxyFifo fifo,
                   RdmaRecvControl control, RdmaProxyIdentity identity,
                   int fifo_numa_node,
-                  std::shared_ptr<RdmaAsyncErrorState> errors);
+                  std::shared_ptr<RdmaAsyncErrorState> errors,
+                  bool elide_zero_payload = false);
     ~RdmaRecvProxy();
     RdmaRecvProxy(const RdmaRecvProxy&) = delete;
     RdmaRecvProxy& operator=(const RdmaRecvProxy&) = delete;
@@ -122,6 +147,7 @@ public:
 private:
     void run() noexcept;
     void pre_post_recv(std::uint64_t slot);
+    bool try_elide_zero_payload();
     std::size_t max_inflight() const;
 
     RdmaQp qp_;
@@ -131,6 +157,7 @@ private:
     RdmaProxyIdentity identity_;
     int fifo_numa_node_;
     std::shared_ptr<RdmaAsyncErrorState> errors_;
+    bool elide_zero_payload_ = false;
     std::atomic<bool> stop_requested_{false};
     std::thread thread_;
     std::atomic<std::uint64_t> step_{0};

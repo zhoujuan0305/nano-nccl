@@ -84,7 +84,8 @@ void RdmaQp::destroy() noexcept {
 }
 
 RdmaQp RdmaQp::create_init(RdmaEndpoint& endpoint, int send_wr, int recv_wr) {
-    // CQ 深度取 send/recv 较大者，send + recv 共享一个 CQ（sq_sig_all=1 每发都 poll）。
+    // CQ 深度取 send/recv 较大者；send + recv 共享一个 CQ。
+    // sq_sig_all=0：仅带 IBV_SEND_SIGNALED 的 SEND 进 CQ，减少 multi-flight CQ 税。
     // allocate_cq 返回 unique_ptr，这里 .release() 把 raw 所有权转交给 RdmaQp。
     ibv_cq* cq = endpoint.allocate_cq(std::max(send_wr, recv_wr)).release();
 
@@ -99,7 +100,7 @@ RdmaQp RdmaQp::create_init(RdmaEndpoint& endpoint, int send_wr, int recv_wr) {
     init_attr.cap.max_recv_sge = 1;
     init_attr.cap.max_inline_data = 0;
     init_attr.qp_type = IBV_QPT_RC;
-    init_attr.sq_sig_all = 1;
+    init_attr.sq_sig_all = 0;
 
     ibv_qp* qp = ibv_create_qp(endpoint.pd(), &init_attr);
     if (qp == nullptr) {

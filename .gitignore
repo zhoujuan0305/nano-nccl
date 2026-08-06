@@ -40,3 +40,5 @@ __pycache__/
 
 # Nsight Compute captures
 *.ncu-rep
+# Agent/session scratch
+.superpowers/

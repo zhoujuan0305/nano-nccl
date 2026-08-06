@@ -2,13 +2,21 @@
 
 [中文说明](README.zh.md)
 
-A GPU collective communication library for single-host multi-GPU All Reduce, targeting NCCL `Ring` + `Simple` + 4 channels performance. Optional MPI/socket and MPI/RDMA paths support multi-host correctness runs.
+A GPU collective communication library for single-host multi-GPU All Reduce, targeting NCCL `Ring` + `Simple` + 4 channels performance. Optional MPI/socket and MPI/RDMA paths support multi-host `all_reduce` runs; RDMA is host-pin RC send/receive (no GPUDirect RDMA).
 
 ---
 
 ## Performance
 
-[Detailed single-host and two-host performance results](performance.md) record the tested topology, environment, all dtype/reduction combinations, and point-by-point NCCL comparisons.
+[Detailed single-host and two-host performance results](performance.md) record the tested topology, environment, all dtype/reduction combinations (`float` / FP16 / BF16 × `sum` / `avg` / `max` / `min`), and point-by-point NCCL comparisons.
+
+Highlights from the latest full matrix (`-w 5 -n 20`, out-of-place busbw):
+
+- **Single host (4× A6000, `--transport auto`)**: nano stays at or above NCCL Ring/Simple/4ch on float/sum across 256 KiB–64 MiB (small messages often faster).
+- **Two-host RDMA (8 ranks, nano `--transport rdma`)**: compared under the same host-pin class as NCCL `NCCL_NET_GDR_LEVEL=0`. Medium/large messages are near the link (float/sum ≈ 0.90–0.95× NCCL at 4–64 MiB); small/medium points remain more variable.
+- **Two-host TCP socket**: both stacks stay latency-bound (~0.1 GB/s busbw); no multi-host performance gate is claimed.
+
+Regenerate tables after a code change with `scripts/run_performance_matrix.sh` and `scripts/render_performance_md.py` (hosts and interface names come from the environment only).
 
 ---
 
@@ -79,9 +87,13 @@ cmake --build build-mpi -j$(nproc)
 
 Build the same commit on every host with the global GPU count. RDMA uses RC
 send/receive over registered host-pinned FIFO memory; the host proxy
-multi-flights SEND/RECV up to Simple FIFO slice depth. GPUDirect RDMA is not
-used. The MPI binding uses the MPI C API, so an Open MPI installation need not
-ship the retired C++ binding library.
+multi-flights SEND/RECV up to Simple FIFO slice depth with selective CQ
+signaling. Empty Simple trailing slices do not take a network round-trip.
+By default the send proxy posts from the registered mapped FIFO
+(`NANO_NCCL_RDMA_SEND_MODE` unset or `direct`); set
+`NANO_NCCL_RDMA_SEND_MODE=bounce` to force a host bounce copy before
+`ibv_post_send`. GPUDirect RDMA is not used. The MPI binding uses the MPI C
+API, so an Open MPI installation need not ship the retired C++ binding library.
 
 ```bash
 cmake -S . -B build-rdma -DCMAKE_BUILD_TYPE=Release \
@@ -95,9 +107,12 @@ Set `NANO_NCCL_SOCKET_IFNAME=<interface>` and
 `NANO_NCCL_RDMA_GID_INDEX=<gid-index>` when the default GID entry is not
 routable. Use `--transport rdma`; cross-process ring edges use RDMA and local
 edges retain their local transport, so the reported aggregate transport is
-normally `mixed`.
+normally `mixed`. For fair NCCL comparisons use `NCCL_NET_GDR_LEVEL=0` (same
+host-pin class). Bind Open MPI TCP/OOB to the bootstrap interface
+(`btl_tcp_if_include` / `oob_tcp_if_include`) so MPI does not pick a
+non-routable NIC.
 
-For a two-host, four-GPU-per-host launch, pass the interface export in both MPMD app contexts:
+For a two-host, four-GPU-per-host correctness launch:
 
 ```bash
 mpirun \
@@ -105,6 +120,24 @@ mpirun \
     ./build-mpi/tests/nano_nccl_mpi_correctness --dtype float \
   : -np 1 --host <host-b> -x NANO_NCCL_SOCKET_IFNAME=<interface> \
     ./build-mpi/tests/nano_nccl_mpi_correctness --dtype float
+```
+
+RDMA bench (one 4-GPU process per host; matching trees on every host):
+
+```bash
+mpirun --mca btl_tcp_if_include <interface> --mca oob_tcp_if_include <interface> \
+  --host <host-a>:1 -np 1 \
+  -x CUDA_VISIBLE_DEVICES -x LD_LIBRARY_PATH \
+  -x NANO_NCCL_SOCKET_IFNAME -x NANO_NCCL_RDMA_IFNAME -x NANO_NCCL_RDMA_GID_INDEX \
+  ./build-rdma/benchmarks/nano_nccl_all_reduce_bench \
+    --algo ring_simple --transport rdma --dtype float --redop sum \
+    -b 262144 -e 67108864 -f 4 -w 5 -n 20 : \
+  --host <host-b>:1 -np 1 \
+  -x CUDA_VISIBLE_DEVICES -x LD_LIBRARY_PATH \
+  -x NANO_NCCL_SOCKET_IFNAME -x NANO_NCCL_RDMA_IFNAME -x NANO_NCCL_RDMA_GID_INDEX \
+  ./build-rdma/benchmarks/nano_nccl_all_reduce_bench \
+    --algo ring_simple --transport rdma --dtype float --redop sum \
+    -b 262144 -e 67108864 -f 4 -w 5 -n 20
 ```
 
 ---
@@ -222,8 +255,10 @@ built with MPI/RDMA support.
 - `p2p` requires that every ring edge has the required bidirectional peer
   access and fails during setup on the first unavailable direction.
 - `rdma` requires `NANO_NCCL_ENABLE_MPI=ON` and `NANO_NCCL_ENABLE_RDMA=ON`.
-  It uses multi-flight RC send/receive RDMA (up to Simple FIFO slice depth) for
-  cross-process ring edges and keeps local edges as SHM.
+  It uses multi-flight RC send/receive RDMA (up to Simple FIFO slice depth,
+  selective CQ signal, empty-slice elision) for cross-process ring edges and
+  keeps local edges as SHM/P2P. Default send mode posts from the registered
+  mapped FIFO; `NANO_NCCL_RDMA_SEND_MODE=bounce` is a visibility fallback.
 
 P2P is a single-node transport. It requires CUDA peer access for the complete
 configured ring; it is not a multi-node or network transport. Socket uses a
@@ -235,13 +270,13 @@ trusted, IPv4-only TCP network boundary and has no TLS or auto reconnect.
 
 Currently supports only:
 
-- Single-node multi-GPU performance path (tested with `CUDA_VISIBLE_DEVICES=0,1,2,3`); optional MPI/socket and MPI/RDMA multi-host `all_reduce` correctness paths
+- Single-node multi-GPU performance path (tested with `CUDA_VISIBLE_DEVICES=0,1,2,3`); optional MPI/socket and MPI/RDMA multi-host `all_reduce` paths with published point tables in [performance.md](performance.md)
 - `float`, FP16 (`fp16`), and BF16 (`bf16`) dtypes; BF16 requires SM80+
 - `sum`, `avg`, `max`, and `min` reduce ops; `avg` is `sum / nranks`, and `max`/`min` propagate NaN
 - out-of-place
-- SHM FIFO and device P2P FIFO transports, plus optional MPI/socket or MPI/RDMA for cross-process ring edges; P2P is single-node only
+- SHM FIFO and device P2P FIFO transports, plus optional MPI/socket or MPI/RDMA for cross-process ring edges; P2P is single-node only; RDMA is host-pin RC (no GPUDirect RDMA)
 
-No multi-host performance acceptance gate has been established. This project is not a general NCCL replacement.
+No formal multi-host performance acceptance gate is defined (socket remains latency-bound; RDMA is measured against NCCL `NCCL_NET_GDR_LEVEL=0`). This project is not a general NCCL replacement.
 
 Future expansion plans:
 

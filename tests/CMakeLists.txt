@@ -99,11 +99,17 @@ if(NANO_NCCL_ENABLE_MPI)
         add_test(NAME nano_nccl_rdma_proxy_multi_flight_static
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/rdma_proxy_multi_flight_static.py
-                         ${CMAKE_SOURCE_DIR}/src/transport/rdma/rdma_proxy.cc)
+                         ${CMAKE_SOURCE_DIR}/src/transport/rdma/rdma_proxy.cc
+                         ${CMAKE_SOURCE_DIR}/src/transport/rdma/rdma_qp.cc)
 
         add_test(NAME nano_nccl_rdma_proxy_send_visibility_static
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/rdma_proxy_send_visibility_static.py
+                         ${CMAKE_SOURCE_DIR}/src/transport/rdma/rdma_proxy.cc)
+
+        add_test(NAME nano_nccl_rdma_proxy_zero_byte_static
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/rdma_proxy_zero_byte_static.py
                          ${CMAKE_SOURCE_DIR}/src/transport/rdma/rdma_proxy.cc)
     endif()
 endif()

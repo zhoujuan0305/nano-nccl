@@ -2,13 +2,21 @@
 
 [English](README.md)
 
-面向单机多 GPU 的 All Reduce 通信库，目标是达到 NCCL `Ring` + `Simple` + 4 channels 的性能；可选 MPI/socket 与 MPI/RDMA 路径用于多机正确性运行。
+面向单机多 GPU 的 All Reduce 通信库，目标是达到 NCCL `Ring` + `Simple` + 4 channels 的性能；可选 MPI/socket 与 MPI/RDMA 多机 `all_reduce` 路径。RDMA 为 host-pin 的 RC send/receive，不使用 GPUDirect RDMA。
 
 ---
 
 ## 性能
 
-[详细的单机与双机性能结果](performance.md)记录了测试拓扑、环境、全部 dtype/reduce 操作组合，以及逐点 NCCL 对比。
+[详细的单机与双机性能结果](performance.md)记录了测试拓扑、环境、全部 dtype/reduce 组合（`float` / FP16 / BF16 × `sum` / `avg` / `max` / `min`），以及逐点 NCCL 对比。
+
+最新全量矩阵摘要（`-w 5 -n 20`，out-of-place busbw）：
+
+- **单机（4× A6000，`--transport auto`）**：float/sum 在 256 KiB–64 MiB 上整体不低于 NCCL Ring/Simple/4ch，小消息往往更快。
+- **双机 RDMA（8 ranks，nano `--transport rdma`）**：与 NCCL `NCCL_NET_GDR_LEVEL=0` 的 host-pin 基线同条件对比。中大消息接近链路（float/sum 在 4–64 MiB 约 0.90–0.95× NCCL）；小/中消息仍有波动。
+- **双机 TCP socket**：双方都偏延迟（约 0.1 GB/s busbw）；不设多机性能 gate。
+
+代码变更后可用 `scripts/run_performance_matrix.sh` 与 `scripts/render_performance_md.py` 重测并重写表格（主机名与网卡名仅来自环境变量）。
 
 ---
 
@@ -77,9 +85,12 @@ cmake --build build-mpi -j$(nproc)
 ### 可选 MPI/RDMA 构建
 
 每台机器都要从同一个 commit、以全局 GPU 数构建。RDMA 通过注册的 host-pinned FIFO
-执行 RC send/receive；host proxy 可按 Simple FIFO slice 深度 multi-flight 提交
-SEND/RECV。当前不使用 GPUDirect RDMA。MPI binding 使用 MPI C API，因此
-Open MPI 不需要提供已废弃的 C++ binding library。
+执行 RC send/receive；host proxy 按 Simple FIFO slice 深度 multi-flight 提交
+SEND/RECV，并对 CQ 做 selective signaling。Simple 协议末尾空 slice 不再走网络
+往返。默认 send 路径从已注册的 mapped FIFO 直接 post
+（`NANO_NCCL_RDMA_SEND_MODE` 未设置或 `direct`）；需要时设
+`NANO_NCCL_RDMA_SEND_MODE=bounce` 强制 host bounce。当前不使用 GPUDirect RDMA。
+MPI binding 使用 MPI C API，因此 Open MPI 不需要提供已废弃的 C++ binding library。
 
 ```bash
 cmake -S . -B build-rdma -DCMAKE_BUILD_TYPE=Release \
@@ -92,8 +103,11 @@ cmake --build build-rdma -j$(nproc)
 `NANO_NCCL_RDMA_IFNAME=<rdma-interface>`。默认 GID 不可路由时，设置
 `NANO_NCCL_RDMA_GID_INDEX=<gid-index>`。使用 `--transport rdma`；跨进程 ring edge
 使用 RDMA，本机 edge 保留本地通信路径，因此聚合 transport 通常显示为 `mixed`。
+与 NCCL 公平对比时使用 `NCCL_NET_GDR_LEVEL=0`（同属 host-pin）。请将 Open MPI
+的 TCP/OOB 绑定到 bootstrap 网卡（`btl_tcp_if_include` / `oob_tcp_if_include`），
+避免选到不可路由网卡。
 
-两机、每机四张 GPU 时，MPMD 的两个 app context 都要显式导出接口：
+两机、每机四张 GPU 的正确性启动示例：
 
 ```bash
 mpirun \
@@ -101,6 +115,24 @@ mpirun \
     ./build-mpi/tests/nano_nccl_mpi_correctness --dtype float \
   : -np 1 --host <host-b> -x NANO_NCCL_SOCKET_IFNAME=<interface> \
     ./build-mpi/tests/nano_nccl_mpi_correctness --dtype float
+```
+
+RDMA bench（每机一个 4-GPU 进程；各机目录与 commit 一致）：
+
+```bash
+mpirun --mca btl_tcp_if_include <interface> --mca oob_tcp_if_include <interface> \
+  --host <host-a>:1 -np 1 \
+  -x CUDA_VISIBLE_DEVICES -x LD_LIBRARY_PATH \
+  -x NANO_NCCL_SOCKET_IFNAME -x NANO_NCCL_RDMA_IFNAME -x NANO_NCCL_RDMA_GID_INDEX \
+  ./build-rdma/benchmarks/nano_nccl_all_reduce_bench \
+    --algo ring_simple --transport rdma --dtype float --redop sum \
+    -b 262144 -e 67108864 -f 4 -w 5 -n 20 : \
+  --host <host-b>:1 -np 1 \
+  -x CUDA_VISIBLE_DEVICES -x LD_LIBRARY_PATH \
+  -x NANO_NCCL_SOCKET_IFNAME -x NANO_NCCL_RDMA_IFNAME -x NANO_NCCL_RDMA_GID_INDEX \
+  ./build-rdma/benchmarks/nano_nccl_all_reduce_bench \
+    --algo ring_simple --transport rdma --dtype float --redop sum \
+    -b 262144 -e 67108864 -f 4 -w 5 -n 20
 ```
 
 ---
@@ -213,7 +245,8 @@ unsupported-operation 错误。
 - `p2p` 要求每条 ring edge 都具备所需的双向 peer access。任一方向不可用时，初始化会在第一个不可用方向报错，不会回退。
 - `rdma` 需要 `NANO_NCCL_ENABLE_MPI=ON` 与 `NANO_NCCL_ENABLE_RDMA=ON`。它为跨进程
   ring edge 使用 multi-flight RC send/receive RDMA（深度不超过 Simple FIFO
-  slice），本机 edge 保持 SHM。
+  slice，selective CQ signal，空 slice 跳过网络），本机 edge 保持 SHM/P2P。
+  默认 send 从已注册 mapped FIFO post；`NANO_NCCL_RDMA_SEND_MODE=bounce` 为可见性回退。
 
 P2P 是单机通信路径，需要每对完整配置环邻居之间的双向 CUDA peer access；它不是多机或网络通信路径。socket 使用可信、仅 IPv4 的 TCP 网络边界，不提供 TLS 或自动重连。
 
@@ -223,13 +256,13 @@ P2P 是单机通信路径，需要每对完整配置环邻居之间的双向 CUD
 
 当前仅支持：
 
-- 单机多 GPU 性能路径（已验证 `CUDA_VISIBLE_DEVICES=0,1,2,3`）；可选 MPI/socket 与 MPI/RDMA 多机 `all_reduce` 正确性路径
+- 单机多 GPU 性能路径（已验证 `CUDA_VISIBLE_DEVICES=0,1,2,3`）；可选 MPI/socket 与 MPI/RDMA 多机 `all_reduce`，最新点表见 [performance.md](performance.md)
 - `float`、FP16（`fp16`）和 BF16（`bf16`）类型；BF16 需要 SM80+
 - `sum`、`avg`、`max`、`min` 规约操作；`avg` 为 `sum / nranks`，`max`/`min` 会传播 NaN
 - out-of-place
-- SHM FIFO、device P2P FIFO 通信路径，以及跨进程 ring edge 的可选 MPI/socket 或 MPI/RDMA；P2P 仅支持单机
+- SHM FIFO、device P2P FIFO，以及跨进程 ring edge 的可选 MPI/socket 或 MPI/RDMA；P2P 仅单机；RDMA 为 host-pin RC（无 GPUDirect RDMA）
 
-尚未建立多机性能验收 gate。本项目不是通用 NCCL 替代品。
+未定义正式的多机性能验收 gate（socket 仍偏延迟；RDMA 以 NCCL `NCCL_NET_GDR_LEVEL=0` 为对比基线）。本项目不是通用 NCCL 替代品。
 
 未来计划扩展：
 

@@ -571,17 +571,22 @@ __device__ inline bool direct_send(
             slice_offset < nelem
                 ? transport::shm::nelem(slice_size, nelem, slice_offset)
                 : 0;
+        // Empty Simple trailing slices carry no bytes. Both ring peers compute
+        // the same work, so eliding wait/post/step keeps edge watermarks aligned
+        // and avoids 0-byte host network posts (RDMA/socket).
+        if (work == 0) {
+            slice_offset += slice_size;
+            continue;
+        }
         if (!wait_send_credit<T>(args, *send_step, send_head_cache,
                                          wait_status)) return false;
         worker_barrier(nworkers);
         T* dst = args.send_fifo +
                      ((*send_step % transport::shm::kSimpleFifoSteps) *
                       args.slot_elems);
-        if (work != 0) {
-            copy_worker(src + slice_offset, dst, work, nworkers);
-        }
+        copy_worker(src + slice_offset, dst, work, nworkers);
         __syncthreads();
-        post_send_ready<T>(args, *send_step, work * sizeof(T), work != 0);
+        post_send_ready<T>(args, *send_step, work * sizeof(T), true);
         *send_step += transport::shm::kSimpleFifoSliceSteps;
         slice_offset += slice_size;
     }
@@ -604,6 +609,10 @@ __device__ inline bool recv_reduce_send(
             slice_offset < nelem
                 ? transport::shm::nelem(slice_size, nelem, slice_offset)
                 : 0;
+        if (work == 0) {
+            slice_offset += slice_size;
+            continue;
+        }
         if (!wait_recv_ready<T>(args, *recv_step, recv_tail_cache,
                                         wait_status)) return false;
         if (!wait_send_credit<T>(args, *send_step, send_head_cache,
@@ -615,13 +624,11 @@ __device__ inline bool recv_reduce_send(
         T* dst = args.send_fifo +
                      ((*send_step % transport::shm::kSimpleFifoSteps) *
                       args.slot_elems);
-        if (work != 0) {
-            reduce_volatile_worker<T, kRedOp>(local + slice_offset, recv,
-                                                     dst, work, nworkers);
-        }
+        reduce_volatile_worker<T, kRedOp>(local + slice_offset, recv, dst, work,
+                                          nworkers);
         __syncthreads();
         post_recv_credit<T>(args, *recv_step);
-        post_send_ready<T>(args, *send_step, work * sizeof(T), work != 0);
+        post_send_ready<T>(args, *send_step, work * sizeof(T), true);
         *recv_step += transport::shm::kSimpleFifoSliceSteps;
         *send_step += transport::shm::kSimpleFifoSliceSteps;
         slice_offset += slice_size;
@@ -645,6 +652,10 @@ __device__ inline bool recv_reduce_copy_send(
             slice_offset < nelem
                 ? transport::shm::nelem(slice_size, nelem, slice_offset)
                 : 0;
+        if (work == 0) {
+            slice_offset += slice_size;
+            continue;
+        }
         if (!wait_recv_ready<T>(args, *recv_step, recv_tail_cache,
                                         wait_status)) return false;
         if (!wait_send_credit<T>(args, *send_step, send_head_cache,
@@ -656,14 +667,12 @@ __device__ inline bool recv_reduce_copy_send(
         T* dst = args.send_fifo +
                      ((*send_step % transport::shm::kSimpleFifoSteps) *
                       args.slot_elems);
-        if (work != 0) {
-            reduce_broadcast_volatile_worker<T, kRedOp>(
-                local + slice_offset, recv, out + slice_offset, dst, work,
-                inverse_nranks, nworkers);
-        }
+        reduce_broadcast_volatile_worker<T, kRedOp>(
+            local + slice_offset, recv, out + slice_offset, dst, work,
+            inverse_nranks, nworkers);
         __syncthreads();
         post_recv_credit<T>(args, *recv_step);
-        post_send_ready<T>(args, *send_step, work * sizeof(T), work != 0);
+        post_send_ready<T>(args, *send_step, work * sizeof(T), true);
         *recv_step += transport::shm::kSimpleFifoSliceSteps;
         *send_step += transport::shm::kSimpleFifoSliceSteps;
         slice_offset += slice_size;
@@ -687,6 +696,10 @@ __device__ inline bool recv_copy_send(
             slice_offset < nelem
                 ? transport::shm::nelem(slice_size, nelem, slice_offset)
                 : 0;
+        if (work == 0) {
+            slice_offset += slice_size;
+            continue;
+        }
         if (!wait_recv_ready<T>(args, *recv_step, recv_tail_cache,
                                         wait_status)) return false;
         if (!wait_send_credit<T>(args, *send_step, send_head_cache,
@@ -698,13 +711,11 @@ __device__ inline bool recv_copy_send(
         T* dst = args.send_fifo +
                      ((*send_step % transport::shm::kSimpleFifoSteps) *
                       args.slot_elems);
-        if (work != 0) {
-            copy_broadcast_volatile_worker<T, kRedOp>(
-                recv, out + slice_offset, dst, work, nworkers);
-        }
+        copy_broadcast_volatile_worker<T, kRedOp>(
+            recv, out + slice_offset, dst, work, nworkers);
         __syncthreads();
         post_recv_credit<T>(args, *recv_step);
-        post_send_ready<T>(args, *send_step, work * sizeof(T), work != 0);
+        post_send_ready<T>(args, *send_step, work * sizeof(T), true);
         *recv_step += transport::shm::kSimpleFifoSliceSteps;
         *send_step += transport::shm::kSimpleFifoSliceSteps;
         slice_offset += slice_size;
@@ -727,15 +738,17 @@ __device__ inline bool direct_recv(
             slice_offset < nelem
                 ? transport::shm::nelem(slice_size, nelem, slice_offset)
                 : 0;
+        if (work == 0) {
+            slice_offset += slice_size;
+            continue;
+        }
         if (!wait_recv_ready<T>(args, *recv_step, recv_tail_cache,
                                         wait_status)) return false;
         worker_barrier(nworkers);
         const T* recv = args.recv_fifo +
                             ((*recv_step % transport::shm::kSimpleFifoSteps) *
                              args.slot_elems);
-        if (work != 0) {
-            copy_volatile_worker(recv, out + slice_offset, work, nworkers);
-        }
+        copy_volatile_worker(recv, out + slice_offset, work, nworkers);
         __syncthreads();
         post_recv_credit<T>(args, *recv_step);
         *recv_step += transport::shm::kSimpleFifoSliceSteps;

@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <sstream>
@@ -15,6 +16,23 @@
 namespace nano_nccl::transport::rdma {
 
 namespace {
+
+// NANO_NCCL_RDMA_SEND_MODE=bounce forces host bounce (debug/fallback).
+// Default direct posts from the registered mapped FIFO MR (NCCL host-pin style).
+RdmaSendProxy::SendMode parse_send_mode_env() {
+    const char* env = std::getenv("NANO_NCCL_RDMA_SEND_MODE");
+    if (env == nullptr || env[0] == '\0') {
+        return RdmaSendProxy::SendMode::Direct;
+    }
+    if (std::strcmp(env, "bounce") == 0) {
+        return RdmaSendProxy::SendMode::Bounce;
+    }
+    if (std::strcmp(env, "direct") == 0) {
+        return RdmaSendProxy::SendMode::Direct;
+    }
+    throw std::runtime_error(
+        "NANO_NCCL_RDMA_SEND_MODE must be bounce or direct");
+}
 
 void validate_fifo(const RdmaProxyFifo& fifo) {
     if (fifo.data == nullptr || fifo.slot_sizes == nullptr ||
@@ -104,7 +122,7 @@ RdmaSendProxy::RdmaSendProxy(RdmaQp qp, ibv_mr* fifo_mr, RdmaProxyFifo fifo,
                              std::shared_ptr<RdmaAsyncErrorState> errors)
     : qp_(std::move(qp)), fifo_mr_(fifo_mr), fifo_(fifo), control_(control),
       identity_(identity), fifo_numa_node_(fifo_numa_node),
-      errors_(std::move(errors)) {
+      errors_(std::move(errors)), send_mode_(parse_send_mode_env()) {
     validate_fifo(fifo_);
     if (qp_.qp() == nullptr || fifo_mr_ == nullptr ||
         control_.send_head == nullptr || control_.send_tail == nullptr ||
@@ -112,6 +130,8 @@ RdmaSendProxy::RdmaSendProxy(RdmaQp qp, ibv_mr* fifo_mr, RdmaProxyFifo fifo,
         throw std::runtime_error("rdma send proxy has invalid state");
     }
     max_inflight_ = max_inflight();
+    // Bounce MR always allocated so default path and mode switches stay valid;
+    // direct mode simply skips the memcpy and posts from fifo_mr_.
     const std::size_t bounce_bytes = fifo_.slot_count * fifo_.slot_bytes;
     bounce_ = std::make_unique<std::uint8_t[]>(bounce_bytes);
     bounce_mr_ = ibv_reg_mr(fifo_mr_->pd, bounce_.get(), bounce_bytes,
@@ -171,8 +191,12 @@ void RdmaSendProxy::run() noexcept {
     try {
         core::pin_current_thread_to_numa_node(fifo_numa_node_);
         constexpr int kPollBatch = 16;
+        // Signal every Kth post plus credit-full and burst-tail WRs so unsignaled
+        // WQEs still free send_head in order without a CQ entry per slice.
+        constexpr std::uint64_t kSignalEvery = 4;
         ibv_wc wcs[kPollBatch];
         const std::size_t max_if = max_inflight_;
+        const std::uint64_t step_inc = fifo_.step_increment;
         while (!stop_requested_.load(std::memory_order_acquire) &&
                !errors_->has_error()) {
             bool did_work = false;
@@ -186,26 +210,75 @@ void RdmaSendProxy::run() noexcept {
                         "rdma proxy send payload exceeds FIFO capacity");
                 }
 
-                // CPU-observe mapped FIFO bytes into registered bounce so the
-                // HCA DMA reads host-visible payload rather than stale GPU-mapped
-                // cachelines (multi-flight: one bounce region per FIFO slot).
-                std::uint8_t* bounce_slot =
-                    bounce_.get() + slot * fifo_.slot_bytes;
-                std::memcpy(bounce_slot,
-                            fifo_.data + slot * fifo_.slot_bytes,
-                            payload_bytes);
+                // 0-byte Simple trailing slices: local credit only — no RDMA op.
+                // Kernel elides most empties; this is the host-side guard when a
+                // 0-byte size is still published, and keeps send_head in lockstep.
+                // Only elide at the completion head so send_head stays ordered with
+                // prior in-flight SENDs; otherwise break and drain CQ first.
+                if (payload_bytes == 0) {
+                    if (next_post_step_ != next_complete_step_) {
+                        break;
+                    }
+                    zero_payload_posts_.fetch_add(1, std::memory_order_relaxed);
+                    store_counter(control_.send_head,
+                                  next_post_step_ + step_inc);
+                    next_post_step_ += step_inc;
+                    next_complete_step_ += step_inc;
+                    step_.store(next_complete_step_, std::memory_order_release);
+                    did_work = true;
+                    continue;
+                }
+
+                posts_.fetch_add(1, std::memory_order_relaxed);
 
                 ibv_sge sge{};
-                sge.addr = reinterpret_cast<std::uintptr_t>(bounce_slot);
                 sge.length = payload_bytes;
-                sge.lkey = bounce_mr_->lkey;
+                if (send_mode_ == SendMode::Direct) {
+                    // A/B: zero-copy from registered FIFO MR (no host bounce).
+                    sge.addr = reinterpret_cast<std::uintptr_t>(
+                        fifo_.data + slot * fifo_.slot_bytes);
+                    sge.lkey = fifo_mr_->lkey;
+                } else {
+                    // CPU-observe mapped FIFO bytes into registered bounce so the
+                    // HCA DMA reads host-visible payload rather than stale
+                    // GPU-mapped cachelines (one bounce region per FIFO slot).
+                    bytes_bounced_.fetch_add(payload_bytes,
+                                             std::memory_order_relaxed);
+                    std::uint8_t* bounce_slot =
+                        bounce_.get() + slot * fifo_.slot_bytes;
+                    std::memcpy(bounce_slot,
+                                fifo_.data + slot * fifo_.slot_bytes,
+                                payload_bytes);
+                    sge.addr = reinterpret_cast<std::uintptr_t>(bounce_slot);
+                    sge.lkey = bounce_mr_->lkey;
+                }
+
+                // wr_id = absolute step so one signaled CQE can batch-advance
+                // send_head across prior unsignaled WRs (RC in-order).
+                const std::uint64_t post_step = next_post_step_;
+                const std::uint64_t tail = load_counter(control_.send_tail);
+                const bool more_pending = tail > post_step + step_inc;
+                // 0-byte elide only runs at the completion head. If a later
+                // published step is empty, this WR must be SIGNALED or the
+                // elide path waits forever on an unsignaled CQE.
+                bool next_zero_needs_head = false;
+                if (more_pending) {
+                    const std::size_t next_slot =
+                        (post_step + step_inc) % fifo_.slot_count;
+                    next_zero_needs_head =
+                        load_size(fifo_.slot_sizes + next_slot) == 0;
+                }
+                const bool signal =
+                    (inflight_ + 1 >= max_if) || !more_pending ||
+                    next_zero_needs_head ||
+                    ((post_step / step_inc) % kSignalEvery == 0);
 
                 ibv_send_wr wr{};
-                wr.wr_id = RdmaQp::slot_to_wr_id(slot);
+                wr.wr_id = RdmaQp::slot_to_wr_id(post_step);
                 wr.sg_list = &sge;
                 wr.num_sge = 1;
                 wr.opcode = IBV_WR_SEND;
-                wr.send_flags = 0;
+                wr.send_flags = signal ? IBV_SEND_SIGNALED : 0;
                 wr.next = nullptr;
 
                 ibv_send_wr* bad = nullptr;
@@ -214,7 +287,7 @@ void RdmaSendProxy::run() noexcept {
                     throw std::runtime_error(std::string("ibv_post_send: ") +
                                              std::strerror(post_ret));
                 }
-                next_post_step_ += fifo_.step_increment;
+                next_post_step_ += step_inc;
                 ++inflight_;
                 did_work = true;
             }
@@ -225,16 +298,24 @@ void RdmaSendProxy::run() noexcept {
             }
             for (int i = 0; i < n; ++i) {
                 check_wc(wcs[i], identity_, next_complete_step_, errors_.get());
-                const std::uint64_t slot = RdmaQp::wr_id_to_slot(wcs[i].wr_id);
-                if (slot != next_complete_step_ % fifo_.slot_count) {
+                const std::uint64_t completed_through =
+                    RdmaQp::wr_id_to_slot(wcs[i].wr_id);
+                if (completed_through < next_complete_step_ ||
+                    (completed_through - next_complete_step_) % step_inc != 0) {
                     throw std::runtime_error(
-                        "rdma send completion has unexpected FIFO slot");
+                        "rdma send completion has unexpected step");
                 }
-                store_counter(control_.send_head,
-                              next_complete_step_ + fifo_.step_increment);
-                next_complete_step_ += fifo_.step_increment;
+                const std::uint64_t advanced =
+                    (completed_through - next_complete_step_) / step_inc + 1;
+                if (advanced > inflight_) {
+                    throw std::runtime_error(
+                        "rdma send completion advances past inflight");
+                }
+                // RC in-order: a signaled WR covers all prior unsignaled WRs.
+                next_complete_step_ = completed_through + step_inc;
+                store_counter(control_.send_head, next_complete_step_);
                 step_.store(next_complete_step_, std::memory_order_release);
-                --inflight_;
+                inflight_ -= static_cast<std::size_t>(advanced);
                 did_work = true;
             }
             if (!did_work) {
@@ -260,10 +341,11 @@ std::size_t RdmaRecvProxy::max_inflight() const {
 RdmaRecvProxy::RdmaRecvProxy(RdmaQp qp, ibv_mr* fifo_mr, RdmaProxyFifo fifo,
                              RdmaRecvControl control, RdmaProxyIdentity identity,
                              int fifo_numa_node,
-                             std::shared_ptr<RdmaAsyncErrorState> errors)
+                             std::shared_ptr<RdmaAsyncErrorState> errors,
+                             bool elide_zero_payload)
     : qp_(std::move(qp)), fifo_mr_(fifo_mr), fifo_(fifo), control_(control),
       identity_(identity), fifo_numa_node_(fifo_numa_node),
-      errors_(std::move(errors)) {
+      errors_(std::move(errors)), elide_zero_payload_(elide_zero_payload) {
     validate_fifo(fifo_);
     if (qp_.qp() == nullptr || fifo_mr_ == nullptr ||
         control_.recv_head == nullptr || control_.recv_tail == nullptr ||
@@ -282,6 +364,24 @@ RdmaRecvProxy::~RdmaRecvProxy() {
     join();
 }
 
+bool RdmaRecvProxy::try_elide_zero_payload() {
+    if (!elide_zero_payload_) return false;
+    if (next_post_step_ != next_complete_step_) return false;
+    if (load_counter(control_.recv_head) + fifo_.slot_count <
+        next_post_step_ + fifo_.step_increment) {
+        return false;
+    }
+    const std::size_t slot = next_post_step_ % fifo_.slot_count;
+    if (load_size(fifo_.slot_sizes + slot) != 0) return false;
+    store_size(fifo_.slot_sizes + slot, 0);
+    store_counter(control_.recv_tail,
+                  next_complete_step_ + fifo_.step_increment);
+    next_post_step_ += fifo_.step_increment;
+    next_complete_step_ += fifo_.step_increment;
+    step_.store(next_complete_step_, std::memory_order_release);
+    return true;
+}
+
 void RdmaRecvProxy::start() {
     if (thread_.joinable()) {
         throw std::runtime_error("rdma recv proxy already started");
@@ -291,6 +391,12 @@ void RdmaRecvProxy::start() {
     while (inflight_ < max_inflight_ &&
            load_counter(control_.recv_head) + fifo_.slot_count >=
                next_post_step_ + fifo_.step_increment) {
+        if (try_elide_zero_payload()) continue;
+        if (elide_zero_payload_ &&
+            load_size(fifo_.slot_sizes +
+                      (next_post_step_ % fifo_.slot_count)) == 0) {
+            break;
+        }
         pre_post_recv(next_post_step_ % fifo_.slot_count);
         next_post_step_ += fifo_.step_increment;
         ++inflight_;
@@ -354,6 +460,15 @@ void RdmaRecvProxy::run() noexcept {
             while (inflight_ < max_if &&
                    load_counter(control_.recv_head) + fifo_.slot_count >=
                        next_post_step_ + fifo_.step_increment) {
+                if (try_elide_zero_payload()) {
+                    did_work = true;
+                    continue;
+                }
+                if (elide_zero_payload_ &&
+                    load_size(fifo_.slot_sizes +
+                              (next_post_step_ % fifo_.slot_count)) == 0) {
+                    break;
+                }
                 pre_post_recv(next_post_step_ % fifo_.slot_count);
                 next_post_step_ += fifo_.step_increment;
                 ++inflight_;
