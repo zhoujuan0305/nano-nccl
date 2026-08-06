@@ -2,21 +2,13 @@
 
 [中文说明](README.zh.md)
 
-A GPU collective communication library for single-host multi-GPU All Reduce, targeting NCCL `Ring` + `Simple` + 4 channels performance. Optional MPI/socket and MPI/RDMA paths support multi-host `all_reduce` runs; RDMA is host-pin RC send/receive (no GPUDirect RDMA).
+A GPU collective communication library for single-host multi-GPU All Reduce, targeting NCCL `Ring` + `Simple` + 4 channels performance. Optional MPI/socket and MPI/RDMA paths support multi-host `all_reduce` runs; RDMA is host-pin only (no GPUDirect RDMA); default SEND/RECV, optional WRITE+CTS via `NANO_NCCL_RDMA_USE_WRITE=1`.
 
 ---
 
 ## Performance
 
 [Detailed single-host and two-host performance results](performance.md) record the tested topology, environment, all dtype/reduction combinations (`float` / FP16 / BF16 × `sum` / `avg` / `max` / `min`), and point-by-point NCCL comparisons.
-
-Highlights from the latest full matrix (`-w 5 -n 20`, out-of-place busbw):
-
-- **Single host (4× A6000, `--transport auto`)**: nano stays at or above NCCL Ring/Simple/4ch on float/sum across 256 KiB–64 MiB (small messages often faster).
-- **Two-host RDMA (8 ranks, nano `--transport rdma`)**: compared under the same host-pin class as NCCL `NCCL_NET_GDR_LEVEL=0`. Medium/large messages are near the link (float/sum ≈ 0.90–0.95× NCCL at 4–64 MiB); small/medium points remain more variable.
-- **Two-host TCP socket**: both stacks stay latency-bound (~0.1 GB/s busbw); no multi-host performance gate is claimed.
-
-Regenerate tables after a code change with `scripts/run_performance_matrix.sh` and `scripts/render_performance_md.py` (hosts and interface names come from the environment only).
 
 ---
 

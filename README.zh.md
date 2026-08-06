@@ -2,21 +2,13 @@
 
 [English](README.md)
 
-面向单机多 GPU 的 All Reduce 通信库，目标是达到 NCCL `Ring` + `Simple` + 4 channels 的性能；可选 MPI/socket 与 MPI/RDMA 多机 `all_reduce` 路径。RDMA 为 host-pin 的 RC send/receive，不使用 GPUDirect RDMA。
+面向单机多 GPU 的 All Reduce 通信库，目标是达到 NCCL `Ring` + `Simple` + 4 channels 的性能；可选 MPI/socket 与 MPI/RDMA 多机 `all_reduce` 路径。RDMA 仅 host-pin（无 GPUDirect RDMA）；默认 SEND/RECV，可用 `NANO_NCCL_RDMA_USE_WRITE=1` 启用 WRITE+CTS。
 
 ---
 
 ## 性能
 
 [详细的单机与双机性能结果](performance.md)记录了测试拓扑、环境、全部 dtype/reduce 组合（`float` / FP16 / BF16 × `sum` / `avg` / `max` / `min`），以及逐点 NCCL 对比。
-
-最新全量矩阵摘要（`-w 5 -n 20`，out-of-place busbw）：
-
-- **单机（4× A6000，`--transport auto`）**：float/sum 在 256 KiB–64 MiB 上整体不低于 NCCL Ring/Simple/4ch，小消息往往更快。
-- **双机 RDMA（8 ranks，nano `--transport rdma`）**：与 NCCL `NCCL_NET_GDR_LEVEL=0` 的 host-pin 基线同条件对比。中大消息接近链路（float/sum 在 4–64 MiB 约 0.90–0.95× NCCL）；小/中消息仍有波动。
-- **双机 TCP socket**：双方都偏延迟（约 0.1 GB/s busbw）；不设多机性能 gate。
-
-代码变更后可用 `scripts/run_performance_matrix.sh` 与 `scripts/render_performance_md.py` 重测并重写表格（主机名与网卡名仅来自环境变量）。
 
 ---
 

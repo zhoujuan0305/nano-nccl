@@ -61,7 +61,7 @@ def render_section(name: str, body: dict) -> str:
     if name == "rdma":
         parts.extend(
             [
-                "The nano-nccl runs explicitly request `--transport rdma`. Their aggregate transport output is `mixed` because local ring edges retain their local transport while cross-host edges use RDMA. NCCL uses RDMA with `NCCL_NET_GDR_LEVEL=0` (host-pin / no GPUDirect RDMA), matching nano-nccl's registered host FIFO path. No two-host performance acceptance threshold has been established.",
+                "The nano-nccl runs explicitly request `--transport rdma` with `NANO_NCCL_RDMA_USE_WRITE=1` (WRITE+CTS over registered host-pinned FIFO). Aggregate transport output is `mixed` because local ring edges retain their local transport while cross-host edges use RDMA. NCCL uses RDMA with `NCCL_NET_GDR_LEVEL=0` (host-pin / no GPUDirect RDMA). No two-host performance acceptance threshold has been established.",
                 "",
             ]
         )
@@ -82,8 +82,6 @@ def render_section(name: str, body: dict) -> str:
 
 def render(doc: dict) -> str:
     env = doc.get("env", {})
-    commit = doc.get("commit", "unknown")[:12]
-    generated = doc.get("generated_at", "")
     sections = doc.get("sections", {})
 
     out: list[str] = []
@@ -94,10 +92,6 @@ def render(doc: dict) -> str:
         "Every measured nano-nccl and NCCL result completed validation with zero wrong values. "
         "The `nano/NCCL` column is calculated from the unrounded measured time "
         "(`nccl_time_us / nano_time_us`)."
-    )
-    out.append("")
-    out.append(
-        f"Measurement commit: `{commit}`. Generated at `{generated}` (UTC)."
     )
     out.append("")
     out.append("## Test Topology And Environment")

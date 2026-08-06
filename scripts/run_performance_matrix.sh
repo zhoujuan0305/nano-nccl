@@ -230,6 +230,10 @@ run_mpi_pair() {
             nano_x+=(-x NANO_NCCL_RDMA_GID_INDEX)
             nano_env+=(NANO_NCCL_RDMA_GID_INDEX="${NANO_NCCL_RDMA_GID_INDEX}")
         fi
+        if [[ -n "${NANO_NCCL_RDMA_USE_WRITE:-}" ]]; then
+            nano_x+=(-x NANO_NCCL_RDMA_USE_WRITE)
+            nano_env+=(NANO_NCCL_RDMA_USE_WRITE="${NANO_NCCL_RDMA_USE_WRITE}")
+        fi
     fi
 
     env "${nano_env[@]}" \
