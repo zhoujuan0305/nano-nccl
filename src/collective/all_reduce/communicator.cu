@@ -395,6 +395,10 @@ private:
         MappedU32Array payload_bytes;
         RdmaMrPtr registered;            // dereg's fifo_mr_raw on destruction
         ibv_mr* fifo_mr_raw = nullptr;  // owned by registered; read-only view
+        // WriteCts: sender owns CTS FIFO; receiver owns local CTS shadow.
+        std::unique_ptr<transport::rdma::RdmaCtsSlot[]> cts_slots;
+        RdmaMrPtr cts_registered;
+        ibv_mr* cts_mr_raw = nullptr;
         std::unique_ptr<transport::rdma::RdmaQp> qp;
         transport::rdma::RdmaPeerInfo peer_info{};
     };
@@ -409,6 +413,25 @@ private:
         return resources;
     }
 
+    void register_rdma_cts_buffer(RdmaChannelResources& r, bool remote_write) {
+        constexpr std::size_t kCtsBytes =
+            static_cast<std::size_t>(transport::kSimpleFifoSteps) *
+            sizeof(transport::rdma::RdmaCtsSlot);
+        r.cts_slots.reset(new transport::rdma::RdmaCtsSlot[transport::kSimpleFifoSteps]());
+        int access = IBV_ACCESS_LOCAL_WRITE;
+        if (remote_write) {
+            access |= IBV_ACCESS_REMOTE_WRITE;
+        }
+        ibv_mr* mr = ibv_reg_mr(rdma_endpoint_->pd(), r.cts_slots.get(), kCtsBytes,
+                                access);
+        if (mr == nullptr) {
+            throw std::runtime_error(std::string("ibv_reg_mr rdma cts: ") +
+                                     std::strerror(errno));
+        }
+        r.cts_mr_raw = mr;
+        r.cts_registered = RdmaMrPtr(mr);
+    }
+
     void setup_rdma_transport() {
         if (!topology_.distributed) return;
         bool has_rdma_edge = false;
@@ -419,6 +442,10 @@ private:
             }
         }
         if (!has_rdma_edge) return;
+
+        const transport::rdma::RdmaDataPlane plane =
+            transport::rdma::parse_rdma_data_plane_env();
+        const bool write_cts = plane == transport::rdma::RdmaDataPlane::WriteCts;
 
         rdma_endpoint_ = std::make_shared<transport::rdma::RdmaEndpoint>(
             transport::rdma::RdmaEndpoint::create_from_environment());
@@ -434,6 +461,7 @@ private:
 
         // 1. For each Rdma edge: allocate send/recv FIFO + control, create RC
         //    QP, register the FIFO MR with bidirectional access flags.
+        //    WriteCts also registers sender CTS FIFO and receiver CTS shadow.
         for (int edge = 0; edge < kRanks; ++edge) {
             if (transport_plan_.edge_kind(edge) != TransportKind::Rdma) continue;
             int receiver = (edge + 1) % kRanks;
@@ -458,6 +486,10 @@ private:
                     }
                     r.fifo_mr_raw = mr;
                     r.registered = RdmaMrPtr(mr);
+                    if (write_cts) {
+                        // Sender owns CTS FIFO; peer receiver RDMA_WRITEs into it.
+                        register_rdma_cts_buffer(r, /*remote_write=*/true);
+                    }
                 }
             }
             if (collective::all_reduce::is_local_global_rank(topology_, receiver)) {
@@ -481,12 +513,16 @@ private:
                     }
                     r.fifo_mr_raw = mr;
                     r.registered = RdmaMrPtr(mr);
+                    if (write_cts) {
+                        // Receiver owns CTS shadow SGE source (local write only).
+                        register_rdma_cts_buffer(r, /*remote_write=*/false);
+                    }
                 }
             }
         }
 
         // 2. Iterate the TCP fds left in socket_fds_ by setup_socket_transport.
-        //    Each fd is a ring edge; Rdma edges swap RdmaPeerInfo (28 bytes),
+        //    Each fd is a ring edge; Rdma edges swap RdmaPeerInfo (64 bytes),
         //    then transition RTR/RTS on both sides before the fd closes.
         auto connections = socket_fds_.release_connections();
         std::vector<transport::socket::SocketConnection> rdma_ready_connections;
@@ -518,15 +554,52 @@ private:
                 : *rdma_recv_resources_[hello.channel][edge];
 
             // Build local RdmaPeerInfo: qpn from QP, port LID / gid_index /
-            // gid from the shared endpoint.
+            // gid from the shared endpoint. WriteCts fills owned FIFO/CTS fields.
             transport::rdma::RdmaPeerInfo local_info = r.qp->local_info();
             local_info.port_lid = rdma_endpoint_->port_lid();
             local_info.gid_index = rdma_endpoint_->gid_index();
             std::memcpy(local_info.gid, rdma_endpoint_->gid(), 16);
+            if (write_cts) {
+                if (is_recv) {
+                    local_info.recv_fifo_addr =
+                        reinterpret_cast<std::uint64_t>(r.fifo->host_ptr());
+                    local_info.recv_fifo_rkey = r.fifo_mr_raw->rkey;
+                    local_info.recv_fifo_bytes =
+                        static_cast<std::uint32_t>(transport::kSimpleFifoBuffBytes);
+                }
+                if (is_send) {
+                    local_info.cts_fifo_addr =
+                        reinterpret_cast<std::uint64_t>(r.cts_slots.get());
+                    local_info.cts_fifo_rkey = r.cts_mr_raw->rkey;
+                    local_info.cts_slot_count =
+                        static_cast<std::uint32_t>(transport::kSimpleFifoSteps);
+                }
+            }
 
             transport::rdma::RdmaPeerInfo remote_info{};
             transport::socket::send_all(fd, &local_info, sizeof(local_info));
             transport::socket::recv_all(fd, &remote_info, sizeof(remote_info));
+
+            if (write_cts) {
+                if (is_send &&
+                    (remote_info.recv_fifo_addr == 0 || remote_info.recv_fifo_rkey == 0 ||
+                     remote_info.recv_fifo_bytes == 0)) {
+                    throw std::runtime_error(
+                        "rdma WriteCts peer missing recv FIFO endpoint");
+                }
+                if (is_recv &&
+                    (remote_info.cts_fifo_addr == 0 || remote_info.cts_fifo_rkey == 0 ||
+                     remote_info.cts_slot_count == 0)) {
+                    throw std::runtime_error(
+                        "rdma WriteCts peer missing CTS FIFO endpoint");
+                }
+                if (is_recv &&
+                    remote_info.cts_slot_count !=
+                        static_cast<std::uint32_t>(transport::kSimpleFifoSteps)) {
+                    throw std::runtime_error(
+                        "rdma WriteCts peer CTS slot_count mismatch");
+                }
+            }
 
             // v1 one-shot bootstrap: both PSNs start at 0.
             constexpr std::uint32_t kLocalPsn = 0;
@@ -547,27 +620,65 @@ private:
             transport::rdma::RdmaProxyIdentity identity{
                 edge, receiver, hello.channel};
             if (is_send) {
-                rdma_send_proxies_.push_back(
-                    std::make_unique<transport::rdma::RdmaSendProxy>(
-                        std::move(*qp_taken), r.fifo_mr_raw, fifo,
-                        transport::rdma::RdmaSendControl{
-                            r.control.host_ptr(), r.control.host_ptr() + 1},
-                        identity, fifo_numa_node, rdma_errors_));
+                if (write_cts) {
+                    transport::rdma::RdmaWriteTargets targets{};
+                    targets.remote_fifo_addr = remote_info.recv_fifo_addr;
+                    targets.remote_fifo_rkey = remote_info.recv_fifo_rkey;
+                    targets.remote_fifo_bytes = remote_info.recv_fifo_bytes;
+                    targets.local_cts = r.cts_slots.get();
+                    targets.cts_slot_count =
+                        static_cast<std::size_t>(transport::kSimpleFifoSteps);
+                    targets.local_cts_mr = r.cts_mr_raw;
+                    rdma_send_proxies_.push_back(
+                        std::make_unique<transport::rdma::RdmaSendProxy>(
+                            std::move(*qp_taken), r.fifo_mr_raw, fifo,
+                            transport::rdma::RdmaSendControl{
+                                r.control.host_ptr(), r.control.host_ptr() + 1},
+                            identity, fifo_numa_node, rdma_errors_,
+                            transport::rdma::RdmaDataPlane::WriteCts, targets));
+                } else {
+                    rdma_send_proxies_.push_back(
+                        std::make_unique<transport::rdma::RdmaSendProxy>(
+                            std::move(*qp_taken), r.fifo_mr_raw, fifo,
+                            transport::rdma::RdmaSendControl{
+                                r.control.host_ptr(), r.control.host_ptr() + 1},
+                            identity, fifo_numa_node, rdma_errors_));
+                }
             } else {
-                rdma_recv_proxies_.push_back(
-                    std::make_unique<transport::rdma::RdmaRecvProxy>(
-                        std::move(*qp_taken), r.fifo_mr_raw, fifo,
-                        transport::rdma::RdmaRecvControl{
-                            r.control.host_ptr(), r.control.host_ptr() + 1},
-                        identity, fifo_numa_node, rdma_errors_));
+                if (write_cts) {
+                    transport::rdma::RdmaCtsRemote cts_remote{};
+                    cts_remote.remote_cts_addr = remote_info.cts_fifo_addr;
+                    cts_remote.remote_cts_rkey = remote_info.cts_fifo_rkey;
+                    cts_remote.cts_slot_count = remote_info.cts_slot_count;
+                    cts_remote.local_shadow = r.cts_slots.get();
+                    cts_remote.local_shadow_mr = r.cts_mr_raw;
+                    cts_remote.local_recv_fifo_addr =
+                        reinterpret_cast<std::uint64_t>(r.fifo->host_ptr());
+                    cts_remote.local_recv_fifo_rkey = r.fifo_mr_raw->rkey;
+                    rdma_recv_proxies_.push_back(
+                        std::make_unique<transport::rdma::RdmaRecvProxy>(
+                            std::move(*qp_taken), r.fifo_mr_raw, fifo,
+                            transport::rdma::RdmaRecvControl{
+                                r.control.host_ptr(), r.control.host_ptr() + 1},
+                            identity, fifo_numa_node, rdma_errors_,
+                            transport::rdma::RdmaDataPlane::WriteCts, cts_remote));
+                } else {
+                    rdma_recv_proxies_.push_back(
+                        std::make_unique<transport::rdma::RdmaRecvProxy>(
+                            std::move(*qp_taken), r.fifo_mr_raw, fifo,
+                            transport::rdma::RdmaRecvControl{
+                                r.control.host_ptr(), r.control.host_ptr() + 1},
+                            identity, fifo_numa_node, rdma_errors_));
+                }
             }
             rdma_ready_connections.push_back(std::move(connection));
             // qp_taken (moved-from state) destructs here; r.qp holds nullptr.
         }
 
         // 3. Start receive proxies first. start() posts the next expected
-        //    Simple-protocol slot before launching its worker; a peer-ready
-        //    byte proves the first sender WQE cannot hit an empty RQ.
+        //    Simple-protocol slot (and WriteCts initial CTS) before launching
+        //    its worker; a peer-ready byte proves the first sender WQE cannot
+        //    hit an empty RQ / missing CTS.
         for (const auto& proxy : rdma_recv_proxies_) proxy->start();
         const std::uint8_t ready = 1;
         for (const auto& connection : rdma_ready_connections) {

@@ -37,6 +37,7 @@ Required environment (live run):
 
 Optional environment:
   NANO_NCCL_RDMA_GID_INDEX    forwarded to nano MPI ranks when set
+  NANO_NCCL_RDMA_USE_WRITE    forwarded when set (1=WRITE+CTS, default SEND/RECV)
   NCCL_IB_GID_INDEX           forwarded to NCCL ranks when set
   CUDA_VISIBLE_DEVICES        default 0,1,2,3
   LD_LIBRARY_PATH             extra library path prefix (NCCL lib is prepended)
@@ -162,6 +163,7 @@ print_planned() {
     echo "has_NANO_NCCL_SOCKET_IFNAME=$([[ -n "${NANO_NCCL_SOCKET_IFNAME:-}" ]] && echo 1 || echo 0)"
     echo "has_NANO_NCCL_RDMA_IFNAME=$([[ -n "${NANO_NCCL_RDMA_IFNAME:-}" ]] && echo 1 || echo 0)"
     echo "has_NANO_NCCL_RDMA_GID_INDEX=$([[ -n "${NANO_NCCL_RDMA_GID_INDEX:-}" ]] && echo 1 || echo 0)"
+    echo "has_NANO_NCCL_RDMA_USE_WRITE=$([[ -n "${NANO_NCCL_RDMA_USE_WRITE:-}" ]] && echo 1 || echo 0)"
     echo "has_NCCL_SOCKET_IFNAME=$([[ -n "${NCCL_SOCKET_IFNAME:-}" ]] && echo 1 || echo 0)"
     echo "has_NCCL_IB_HCA=$([[ -n "${NCCL_IB_HCA:-}" ]] && echo 1 || echo 0)"
     echo "has_NCCL_IB_GID_INDEX=$([[ -n "${NCCL_IB_GID_INDEX:-}" ]] && echo 1 || echo 0)"
@@ -174,6 +176,9 @@ run_nano() {
         -x NANO_NCCL_SOCKET_IFNAME -x NANO_NCCL_RDMA_IFNAME)
     if [[ -n "${NANO_NCCL_RDMA_GID_INDEX:-}" ]]; then
         nano_x+=(-x NANO_NCCL_RDMA_GID_INDEX)
+    fi
+    if [[ -n "${NANO_NCCL_RDMA_USE_WRITE:-}" ]]; then
+        nano_x+=(-x NANO_NCCL_RDMA_USE_WRITE)
     fi
     local -a nano_args=(
         --algo ring_simple --transport rdma --dtype float --redop sum

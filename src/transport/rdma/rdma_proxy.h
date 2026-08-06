@@ -1,6 +1,7 @@
 #pragma once
 
 #include "transport/rdma/rdma_endpoint.h"
+#include "transport/rdma/rdma_protocol.h"
 #include "transport/rdma/rdma_qp.h"
 
 #include <atomic>
@@ -14,6 +15,31 @@
 struct ibv_mr;
 
 namespace nano_nccl::transport::rdma {
+
+enum class RdmaDataPlane { SendRecv, WriteCts };
+
+// NANO_NCCL_RDMA_USE_WRITE unset/""/0/false/off → SendRecv;
+// 1/true/on → WriteCts; otherwise throws.
+RdmaDataPlane parse_rdma_data_plane_env();
+
+struct RdmaWriteTargets {
+    std::uint64_t remote_fifo_addr = 0;
+    std::uint32_t remote_fifo_rkey = 0;
+    std::size_t remote_fifo_bytes = 0;
+    RdmaCtsSlot* local_cts = nullptr;
+    std::size_t cts_slot_count = 0;
+    ibv_mr* local_cts_mr = nullptr;
+};
+
+struct RdmaCtsRemote {
+    std::uint64_t remote_cts_addr = 0;
+    std::uint32_t remote_cts_rkey = 0;
+    std::size_t cts_slot_count = 0;
+    RdmaCtsSlot* local_shadow = nullptr;
+    ibv_mr* local_shadow_mr = nullptr;
+    std::uint64_t local_recv_fifo_addr = 0;
+    std::uint32_t local_recv_fifo_rkey = 0;
+};
 
 struct RdmaProxyIdentity {
     int source_rank = -1;
@@ -67,14 +93,18 @@ private:
 
 class RdmaSendProxy {
 public:
-    // direct (default): post SGE from fifo_.data + fifo_mr_ (registered mapped FIFO).
-    // bounce: memcpy into registered bounce before SEND (visibility fallback).
-    enum class SendMode { Bounce, Direct };
-
+    // Always posts SGE from fifo_.data + fifo_mr_ (registered mapped FIFO).
+    // Visibility: all-worker __threadfence_system before send_tail +
+    // system-scope release/acquire step counters (no host bounce).
     RdmaSendProxy(RdmaQp qp, ibv_mr* fifo_mr, RdmaProxyFifo fifo,
                   RdmaSendControl control, RdmaProxyIdentity identity,
                   int fifo_numa_node,
                   std::shared_ptr<RdmaAsyncErrorState> errors);
+    RdmaSendProxy(RdmaQp qp, ibv_mr* fifo_mr, RdmaProxyFifo fifo,
+                  RdmaSendControl control, RdmaProxyIdentity identity,
+                  int fifo_numa_node,
+                  std::shared_ptr<RdmaAsyncErrorState> errors,
+                  RdmaDataPlane plane, RdmaWriteTargets write_targets);
     ~RdmaSendProxy();
     RdmaSendProxy(const RdmaSendProxy&) = delete;
     RdmaSendProxy& operator=(const RdmaSendProxy&) = delete;
@@ -85,7 +115,7 @@ public:
     void drain() const;
     void join() noexcept;
 
-    SendMode send_mode() const noexcept { return send_mode_; }
+    RdmaDataPlane data_plane() const noexcept { return plane_; }
 
     std::uint64_t posts() const noexcept {
         return posts_.load(std::memory_order_relaxed);
@@ -93,12 +123,11 @@ public:
     std::uint64_t zero_payload_posts() const noexcept {
         return zero_payload_posts_.load(std::memory_order_relaxed);
     }
-    std::uint64_t bytes_bounced() const noexcept {
-        return bytes_bounced_.load(std::memory_order_relaxed);
-    }
 
 private:
     void run() noexcept;
+    void run_send_recv() noexcept;
+    void run_write_cts() noexcept;
     std::size_t max_inflight() const;
 
     RdmaQp qp_;
@@ -108,9 +137,8 @@ private:
     RdmaProxyIdentity identity_;
     int fifo_numa_node_;
     std::shared_ptr<RdmaAsyncErrorState> errors_;
-    SendMode send_mode_ = SendMode::Direct;
-    std::unique_ptr<std::uint8_t[]> bounce_;
-    ibv_mr* bounce_mr_ = nullptr;
+    RdmaDataPlane plane_ = RdmaDataPlane::SendRecv;
+    RdmaWriteTargets write_targets_{};
     std::atomic<bool> stop_requested_{false};
     std::thread thread_;
     std::atomic<std::uint64_t> step_{0};
@@ -120,7 +148,6 @@ private:
     std::size_t max_inflight_ = 0;
     std::atomic<std::uint64_t> posts_{0};
     std::atomic<std::uint64_t> zero_payload_posts_{0};
-    std::atomic<std::uint64_t> bytes_bounced_{0};
 };
 
 class RdmaRecvProxy {
@@ -134,6 +161,12 @@ public:
                   int fifo_numa_node,
                   std::shared_ptr<RdmaAsyncErrorState> errors,
                   bool elide_zero_payload = false);
+    RdmaRecvProxy(RdmaQp qp, ibv_mr* fifo_mr, RdmaProxyFifo fifo,
+                  RdmaRecvControl control, RdmaProxyIdentity identity,
+                  int fifo_numa_node,
+                  std::shared_ptr<RdmaAsyncErrorState> errors,
+                  RdmaDataPlane plane, RdmaCtsRemote cts_remote,
+                  bool elide_zero_payload = false);
     ~RdmaRecvProxy();
     RdmaRecvProxy(const RdmaRecvProxy&) = delete;
     RdmaRecvProxy& operator=(const RdmaRecvProxy&) = delete;
@@ -144,9 +177,15 @@ public:
     void drain() const;
     void join() noexcept;
 
+    RdmaDataPlane data_plane() const noexcept { return plane_; }
+
 private:
     void run() noexcept;
+    void run_send_recv() noexcept;
+    void run_write_cts() noexcept;
     void pre_post_recv(std::uint64_t slot);
+    void pre_post_imm_recv(std::uint64_t step);
+    void post_cts(std::uint64_t step);
     bool try_elide_zero_payload();
     std::size_t max_inflight() const;
 
@@ -157,13 +196,20 @@ private:
     RdmaProxyIdentity identity_;
     int fifo_numa_node_;
     std::shared_ptr<RdmaAsyncErrorState> errors_;
+    RdmaDataPlane plane_ = RdmaDataPlane::SendRecv;
+    RdmaCtsRemote cts_remote_{};
     bool elide_zero_payload_ = false;
+    std::unique_ptr<std::uint8_t[]> imm_scratch_;
+    ibv_mr* imm_scratch_mr_ = nullptr;
     std::atomic<bool> stop_requested_{false};
     std::thread thread_;
     std::atomic<std::uint64_t> step_{0};
     std::uint64_t next_post_step_ = 0;
     std::uint64_t next_complete_step_ = 0;
+    std::uint64_t next_cts_step_ = 0;
+    std::uint64_t next_cts_complete_step_ = 0;
     std::size_t inflight_ = 0;
+    std::size_t inflight_cts_ = 0;
     std::size_t max_inflight_ = 0;
 };
 

@@ -29,6 +29,13 @@ if(BUILD_TESTING)
                 ${CMAKE_SOURCE_DIR}/src/kernels/ring_simple_kernel.cuh
     )
     add_test(
+        NAME nano_nccl_rdma_direct_publish_static
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/rdma_direct_publish_static.py
+                ${CMAKE_SOURCE_DIR}/src/kernels/ring_simple_kernel.cuh
+                ${CMAKE_SOURCE_DIR}/src/transport/shm/shm_step.h
+    )
+    add_test(
         NAME nano_nccl_bench_profiling_static
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/bench_profiling_static.py
@@ -49,6 +56,7 @@ if(BUILD_TESTING)
                 ${CMAKE_SOURCE_DIR}/src/CMakeLists.txt
                 ${CMAKE_SOURCE_DIR}/benchmarks/CMakeLists.txt
                 ${CMAKE_SOURCE_DIR}/src/transport/rdma/rdma_protocol.h
+                ${CMAKE_SOURCE_DIR}/src/collective/all_reduce/communicator.cu
     )
     add_test(
         NAME nano_nccl_mpi_c_api_link_static
@@ -110,6 +118,12 @@ if(NANO_NCCL_ENABLE_MPI)
         add_test(NAME nano_nccl_rdma_proxy_zero_byte_static
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/rdma_proxy_zero_byte_static.py
+                         ${CMAKE_SOURCE_DIR}/src/transport/rdma/rdma_proxy.cc)
+
+        add_test(NAME nano_nccl_rdma_proxy_write_cts_static
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/rdma_proxy_write_cts_static.py
+                         ${CMAKE_SOURCE_DIR}/src/transport/rdma/rdma_proxy.h
                          ${CMAKE_SOURCE_DIR}/src/transport/rdma/rdma_proxy.cc)
     endif()
 endif()

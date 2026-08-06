@@ -15,7 +15,7 @@ Both hosts use two-socket Intel Xeon Platinum 8462Y+ CPUs (32 cores per socket, 
 
 On each host GPU0-GPU1 and GPU2-GPU3 are connected by four NVLinks. The two pairs are separated by `SYS` paths across NUMA nodes. The nano-nccl `auto` plan resolves each ring edge independently (P2P when bidirectional NVLink peer access is available, otherwise SHM). Two-host socket runs use TCP; NCCL socket runs set `NCCL_IB_DISABLE=1`. Two-host RDMA runs use nano `--transport rdma` and NCCL IB/RoCE with `NCCL_NET_GDR_LEVEL=0`.
 
-All measurements use a Release build with `NANO_NCCL_ENABLE_BENCH_PROFILING=OFF`, message sizes 256 KiB through 64 MiB, `-w 5`, and `-n 20`. NCCL uses `Ring`, `Simple`, four channels, and a 32 MiB buffer. RDMA send defaults to posting from the registered mapped FIFO (`NANO_NCCL_RDMA_SEND_MODE` unset / `direct`).
+All measurements use a Release build with `NANO_NCCL_ENABLE_BENCH_PROFILING=OFF`, message sizes 256 KiB through 64 MiB, `-w 5`, and `-n 20`. NCCL uses `Ring`, `Simple`, four channels, and a 32 MiB buffer. RDMA SEND/WriteCts always post from the registered mapped FIFO (no host bounce; visibility via `__threadfence_system` + release/acquire steps).
 
 ## Single Host: 4 Ranks
 

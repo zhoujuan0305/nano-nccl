@@ -535,14 +535,22 @@ __device__ inline void worker_barrier(int nworkers) {
 template <typename T>
 __device__ inline void post_send_ready(
     transport::SimpleChannelArgs<T> args, std::uint64_t step,
-    std::size_t payload_bytes, bool data_stored) {
+    std::size_t payload_bytes, bool data_stored, int nworkers) {
     std::uint64_t* tail = args.send_tail;
+    // All FIFO writers must make stores system-visible before the publisher
+    // advances send_tail; host RDMA/socket proxies sample that counter.
+    if (data_stored && threadIdx.x < nworkers) {
+        __threadfence_system();
+    }
+    __syncthreads();
     if (threadIdx.x == blockDim.x - 1) {
         if (args.send_payload_bytes != nullptr) {
             args.send_payload_bytes[step % transport::shm::kSimpleFifoSteps] =
                 static_cast<std::uint32_t>(payload_bytes);
         }
-        if (data_stored || args.send_payload_bytes != nullptr) __threadfence_system();
+        if (data_stored || args.send_payload_bytes != nullptr) {
+            __threadfence_system();
+        }
         transport::shm::store_step(tail, step + transport::shm::kSimpleFifoSliceSteps);
     }
 }
@@ -586,7 +594,7 @@ __device__ inline bool direct_send(
                       args.slot_elems);
         copy_worker(src + slice_offset, dst, work, nworkers);
         __syncthreads();
-        post_send_ready<T>(args, *send_step, work * sizeof(T), true);
+        post_send_ready<T>(args, *send_step, work * sizeof(T), true, nworkers);
         *send_step += transport::shm::kSimpleFifoSliceSteps;
         slice_offset += slice_size;
     }
@@ -628,7 +636,7 @@ __device__ inline bool recv_reduce_send(
                                           nworkers);
         __syncthreads();
         post_recv_credit<T>(args, *recv_step);
-        post_send_ready<T>(args, *send_step, work * sizeof(T), true);
+        post_send_ready<T>(args, *send_step, work * sizeof(T), true, nworkers);
         *recv_step += transport::shm::kSimpleFifoSliceSteps;
         *send_step += transport::shm::kSimpleFifoSliceSteps;
         slice_offset += slice_size;
@@ -672,7 +680,7 @@ __device__ inline bool recv_reduce_copy_send(
             inverse_nranks, nworkers);
         __syncthreads();
         post_recv_credit<T>(args, *recv_step);
-        post_send_ready<T>(args, *send_step, work * sizeof(T), true);
+        post_send_ready<T>(args, *send_step, work * sizeof(T), true, nworkers);
         *recv_step += transport::shm::kSimpleFifoSliceSteps;
         *send_step += transport::shm::kSimpleFifoSliceSteps;
         slice_offset += slice_size;
@@ -715,7 +723,7 @@ __device__ inline bool recv_copy_send(
             recv, out + slice_offset, dst, work, nworkers);
         __syncthreads();
         post_recv_credit<T>(args, *recv_step);
-        post_send_ready<T>(args, *send_step, work * sizeof(T), true);
+        post_send_ready<T>(args, *send_step, work * sizeof(T), true, nworkers);
         *recv_step += transport::shm::kSimpleFifoSliceSteps;
         *send_step += transport::shm::kSimpleFifoSliceSteps;
         slice_offset += slice_size;

@@ -1,7 +1,6 @@
 #include "transport/rdma/rdma_qp.h"
 #include "transport/rdma/rdma_endpoint.h"
 
-#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <stdexcept>
@@ -48,10 +47,14 @@ void modify_qp_to_init(ibv_qp* qp) {
 RdmaQp::~RdmaQp() { destroy(); }
 
 RdmaQp::RdmaQp(RdmaQp&& other) noexcept
-    : qp_(other.qp_), cq_(other.cq_), qpn_(other.qpn_) {
+    : qp_(other.qp_),
+      cq_(other.cq_),
+      qpn_(other.qpn_),
+      max_inline_data_(other.max_inline_data_) {
     other.qp_ = nullptr;
     other.cq_ = nullptr;
     other.qpn_ = 0;
+    other.max_inline_data_ = 0;
 }
 
 RdmaQp& RdmaQp::operator=(RdmaQp&& other) noexcept {
@@ -60,15 +63,18 @@ RdmaQp& RdmaQp::operator=(RdmaQp&& other) noexcept {
         qp_ = other.qp_;
         cq_ = other.cq_;
         qpn_ = other.qpn_;
+        max_inline_data_ = other.max_inline_data_;
         other.qp_ = nullptr;
         other.cq_ = nullptr;
         other.qpn_ = 0;
+        other.max_inline_data_ = 0;
     }
     return *this;
 }
 
-RdmaQp::RdmaQp(ibv_qp* qp, ibv_cq* cq, std::uint32_t qpn) noexcept
-    : qp_(qp), cq_(cq), qpn_(qpn) {}
+RdmaQp::RdmaQp(ibv_qp* qp, ibv_cq* cq, std::uint32_t qpn,
+               std::uint32_t max_inline_data) noexcept
+    : qp_(qp), cq_(cq), qpn_(qpn), max_inline_data_(max_inline_data) {}
 
 void RdmaQp::destroy() noexcept {
     // 销毁顺序与创建相反：先 qp 再 cq——qp 必须先于其关联的 CQ 释放。
@@ -81,13 +87,16 @@ void RdmaQp::destroy() noexcept {
     qp_ = nullptr;
     cq_ = nullptr;
     qpn_ = 0;
+    max_inline_data_ = 0;
 }
 
 RdmaQp RdmaQp::create_init(RdmaEndpoint& endpoint, int send_wr, int recv_wr) {
-    // CQ 深度取 send/recv 较大者；send + recv 共享一个 CQ。
+    // Shared CQ must hold both SQ and RQ completions (WriteCts posts CTS SENDs
+    // and IMM RECVs on the same CQ). Depth is send_wr + recv_wr.
     // sq_sig_all=0：仅带 IBV_SEND_SIGNALED 的 SEND 进 CQ，减少 multi-flight CQ 税。
     // allocate_cq 返回 unique_ptr，这里 .release() 把 raw 所有权转交给 RdmaQp。
-    ibv_cq* cq = endpoint.allocate_cq(std::max(send_wr, recv_wr)).release();
+    const int cq_depth = send_wr + recv_wr;
+    ibv_cq* cq = endpoint.allocate_cq(cq_depth).release();
 
     ibv_qp_init_attr init_attr{};
     init_attr.qp_context = nullptr;
@@ -98,7 +107,8 @@ RdmaQp RdmaQp::create_init(RdmaEndpoint& endpoint, int send_wr, int recv_wr) {
     init_attr.cap.max_recv_wr = static_cast<std::uint32_t>(recv_wr);
     init_attr.cap.max_send_sge = 1;
     init_attr.cap.max_recv_sge = 1;
-    init_attr.cap.max_inline_data = 0;
+    // Request enough inline room for a 32B RdmaCtsSlot (and a small margin).
+    init_attr.cap.max_inline_data = 64;
     init_attr.qp_type = IBV_QPT_RC;
     init_attr.sq_sig_all = 0;
 
@@ -108,6 +118,8 @@ RdmaQp RdmaQp::create_init(RdmaEndpoint& endpoint, int send_wr, int recv_wr) {
         ibv_destroy_cq(cq);
         throw qp_error("ibv_create_qp");
     }
+    // Driver overwrites cap with the actual granted values.
+    const std::uint32_t max_inline = init_attr.cap.max_inline_data;
 
     try {
         modify_qp_to_init(qp);
@@ -118,7 +130,7 @@ RdmaQp RdmaQp::create_init(RdmaEndpoint& endpoint, int send_wr, int recv_wr) {
         throw;
     }
 
-    return RdmaQp(qp, cq, qp->qp_num);
+    return RdmaQp(qp, cq, qp->qp_num, max_inline);
 }
 
 void RdmaQp::transition_to_rtr(const RdmaPeerInfo& remote,

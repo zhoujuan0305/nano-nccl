@@ -11,27 +11,45 @@
 #include <string>
 #include <utility>
 
+#include <endian.h>
+#include <immintrin.h>
 #include <infiniband/verbs.h>
 
 namespace nano_nccl::transport::rdma {
 
 namespace {
 
-// NANO_NCCL_RDMA_SEND_MODE=bounce forces host bounce (debug/fallback).
-// Default direct posts from the registered mapped FIFO MR (NCCL host-pin style).
-RdmaSendProxy::SendMode parse_send_mode_env() {
-    const char* env = std::getenv("NANO_NCCL_RDMA_SEND_MODE");
-    if (env == nullptr || env[0] == '\0') {
-        return RdmaSendProxy::SendMode::Direct;
+void validate_write_targets(const RdmaWriteTargets& targets) {
+    if (targets.remote_fifo_addr == 0 || targets.remote_fifo_bytes == 0 ||
+        targets.local_cts == nullptr || targets.cts_slot_count == 0) {
+        throw std::runtime_error(
+            "rdma send proxy WriteCts targets are incomplete");
     }
-    if (std::strcmp(env, "bounce") == 0) {
-        return RdmaSendProxy::SendMode::Bounce;
+}
+
+void validate_cts_remote(const RdmaCtsRemote& remote) {
+    if (remote.remote_cts_addr == 0 || remote.cts_slot_count == 0 ||
+        remote.local_recv_fifo_addr == 0 || remote.local_shadow == nullptr ||
+        remote.local_shadow_mr == nullptr) {
+        throw std::runtime_error(
+            "rdma recv proxy WriteCts CTS remote is incomplete");
     }
-    if (std::strcmp(env, "direct") == 0) {
-        return RdmaSendProxy::SendMode::Direct;
-    }
-    throw std::runtime_error(
-        "NANO_NCCL_RDMA_SEND_MODE must be bounce or direct");
+}
+
+// High bit tags CTS send CQEs so the shared CQ can distinguish them from
+// data WRITE_WITH_IMM receive completions (wr_id = absolute step).
+constexpr std::uint64_t kCtsWrIdBit = 1ull << 63;
+
+constexpr bool is_cts_wr_id(std::uint64_t wr_id) noexcept {
+    return (wr_id & kCtsWrIdBit) != 0;
+}
+
+constexpr std::uint64_t make_cts_wr_id(std::uint64_t step) noexcept {
+    return kCtsWrIdBit | step;
+}
+
+constexpr std::uint64_t cts_wr_id_to_step(std::uint64_t wr_id) noexcept {
+    return wr_id & ~kCtsWrIdBit;
 }
 
 void validate_fifo(const RdmaProxyFifo& fifo) {
@@ -86,6 +104,19 @@ void check_wc(const ibv_wc& wc, RdmaProxyIdentity identity, std::uint64_t step,
 
 }  // namespace
 
+RdmaDataPlane parse_rdma_data_plane_env() {
+    const char* env = std::getenv("NANO_NCCL_RDMA_USE_WRITE");
+    if (env == nullptr || env[0] == '\0' || std::strcmp(env, "0") == 0 ||
+        std::strcmp(env, "false") == 0 || std::strcmp(env, "off") == 0) {
+        return RdmaDataPlane::SendRecv;
+    }
+    if (std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0 ||
+        std::strcmp(env, "on") == 0) {
+        return RdmaDataPlane::WriteCts;
+    }
+    throw std::runtime_error("NANO_NCCL_RDMA_USE_WRITE must be 0 or 1");
+}
+
 void RdmaAsyncErrorState::record_failure(RdmaProxyIdentity identity,
                                          std::uint64_t step,
                                          const std::string& reason) noexcept {
@@ -120,26 +151,29 @@ RdmaSendProxy::RdmaSendProxy(RdmaQp qp, ibv_mr* fifo_mr, RdmaProxyFifo fifo,
                              RdmaSendControl control, RdmaProxyIdentity identity,
                              int fifo_numa_node,
                              std::shared_ptr<RdmaAsyncErrorState> errors)
+    : RdmaSendProxy(std::move(qp), fifo_mr, fifo, control, identity,
+                    fifo_numa_node, std::move(errors), RdmaDataPlane::SendRecv,
+                    RdmaWriteTargets{}) {}
+
+RdmaSendProxy::RdmaSendProxy(RdmaQp qp, ibv_mr* fifo_mr, RdmaProxyFifo fifo,
+                             RdmaSendControl control, RdmaProxyIdentity identity,
+                             int fifo_numa_node,
+                             std::shared_ptr<RdmaAsyncErrorState> errors,
+                             RdmaDataPlane plane, RdmaWriteTargets write_targets)
     : qp_(std::move(qp)), fifo_mr_(fifo_mr), fifo_(fifo), control_(control),
       identity_(identity), fifo_numa_node_(fifo_numa_node),
-      errors_(std::move(errors)), send_mode_(parse_send_mode_env()) {
+      errors_(std::move(errors)), plane_(plane),
+      write_targets_(write_targets) {
     validate_fifo(fifo_);
     if (qp_.qp() == nullptr || fifo_mr_ == nullptr ||
         control_.send_head == nullptr || control_.send_tail == nullptr ||
         errors_ == nullptr) {
         throw std::runtime_error("rdma send proxy has invalid state");
     }
-    max_inflight_ = max_inflight();
-    // Bounce MR always allocated so default path and mode switches stay valid;
-    // direct mode simply skips the memcpy and posts from fifo_mr_.
-    const std::size_t bounce_bytes = fifo_.slot_count * fifo_.slot_bytes;
-    bounce_ = std::make_unique<std::uint8_t[]>(bounce_bytes);
-    bounce_mr_ = ibv_reg_mr(fifo_mr_->pd, bounce_.get(), bounce_bytes,
-                            IBV_ACCESS_LOCAL_WRITE);
-    if (bounce_mr_ == nullptr) {
-        throw std::runtime_error(std::string("ibv_reg_mr bounce: ") +
-                                 std::strerror(errno));
+    if (plane_ == RdmaDataPlane::WriteCts) {
+        validate_write_targets(write_targets_);
     }
+    max_inflight_ = max_inflight();
     const std::uint64_t head = load_counter(control_.send_head);
     next_post_step_ = head;
     next_complete_step_ = head;
@@ -149,10 +183,6 @@ RdmaSendProxy::RdmaSendProxy(RdmaQp qp, ibv_mr* fifo_mr, RdmaProxyFifo fifo,
 RdmaSendProxy::~RdmaSendProxy() {
     stop();
     join();
-    if (bounce_mr_ != nullptr) {
-        ibv_dereg_mr(bounce_mr_);
-        bounce_mr_ = nullptr;
-    }
 }
 
 void RdmaSendProxy::start() {
@@ -188,6 +218,14 @@ void RdmaSendProxy::join() noexcept {
 }
 
 void RdmaSendProxy::run() noexcept {
+    if (plane_ == RdmaDataPlane::WriteCts) {
+        run_write_cts();
+    } else {
+        run_send_recv();
+    }
+}
+
+void RdmaSendProxy::run_send_recv() noexcept {
     try {
         core::pin_current_thread_to_numa_node(fifo_numa_node_);
         constexpr int kPollBatch = 16;
@@ -233,25 +271,9 @@ void RdmaSendProxy::run() noexcept {
 
                 ibv_sge sge{};
                 sge.length = payload_bytes;
-                if (send_mode_ == SendMode::Direct) {
-                    // A/B: zero-copy from registered FIFO MR (no host bounce).
-                    sge.addr = reinterpret_cast<std::uintptr_t>(
-                        fifo_.data + slot * fifo_.slot_bytes);
-                    sge.lkey = fifo_mr_->lkey;
-                } else {
-                    // CPU-observe mapped FIFO bytes into registered bounce so the
-                    // HCA DMA reads host-visible payload rather than stale
-                    // GPU-mapped cachelines (one bounce region per FIFO slot).
-                    bytes_bounced_.fetch_add(payload_bytes,
-                                             std::memory_order_relaxed);
-                    std::uint8_t* bounce_slot =
-                        bounce_.get() + slot * fifo_.slot_bytes;
-                    std::memcpy(bounce_slot,
-                                fifo_.data + slot * fifo_.slot_bytes,
-                                payload_bytes);
-                    sge.addr = reinterpret_cast<std::uintptr_t>(bounce_slot);
-                    sge.lkey = bounce_mr_->lkey;
-                }
+                sge.addr = reinterpret_cast<std::uintptr_t>(
+                    fifo_.data + slot * fifo_.slot_bytes);
+                sge.lkey = fifo_mr_->lkey;
 
                 // wr_id = absolute step so one signaled CQE can batch-advance
                 // send_head across prior unsignaled WRs (RC in-order).
@@ -330,6 +352,159 @@ void RdmaSendProxy::run() noexcept {
     }
 }
 
+void RdmaSendProxy::run_write_cts() noexcept {
+    try {
+        core::pin_current_thread_to_numa_node(fifo_numa_node_);
+        constexpr int kPollBatch = 16;
+        constexpr std::uint64_t kSignalEvery = 4;
+        ibv_wc wcs[kPollBatch];
+        const std::size_t max_if = max_inflight_;
+        const std::uint64_t step_inc = fifo_.step_increment;
+        while (!stop_requested_.load(std::memory_order_acquire) &&
+               !errors_->has_error()) {
+            bool did_work = false;
+            while (inflight_ < max_if &&
+                   load_counter(control_.send_tail) > next_post_step_) {
+                const std::size_t slot = next_post_step_ % fifo_.slot_count;
+                const std::uint32_t payload_bytes =
+                    load_size(fifo_.slot_sizes + slot);
+                if (payload_bytes > fifo_.slot_bytes) {
+                    throw std::runtime_error(
+                        "rdma proxy send payload exceeds FIFO capacity");
+                }
+
+                // 0-byte Simple trailing slices: local credit only — no RDMA.
+                // Elide only at the completion head so ordering with in-flight
+                // WRITEs is preserved.
+                if (payload_bytes == 0) {
+                    if (next_post_step_ != next_complete_step_) {
+                        break;
+                    }
+                    zero_payload_posts_.fetch_add(1, std::memory_order_relaxed);
+                    store_counter(control_.send_head,
+                                  next_post_step_ + step_inc);
+                    next_post_step_ += step_inc;
+                    next_complete_step_ += step_inc;
+                    step_.store(next_complete_step_, std::memory_order_release);
+                    did_work = true;
+                    continue;
+                }
+
+                if (slot >= write_targets_.cts_slot_count) {
+                    throw std::runtime_error(
+                        "rdma WriteCts slot exceeds CTS FIFO");
+                }
+                RdmaCtsSlot* cts = write_targets_.local_cts + slot;
+                const std::uint32_t ready =
+                    __atomic_load_n(&cts->ready, __ATOMIC_ACQUIRE);
+                if (ready != 1) {
+                    break;
+                }
+                const std::uint64_t step_tag =
+                    __atomic_load_n(&cts->step_tag, __ATOMIC_RELAXED);
+                if (step_tag != next_post_step_) {
+                    throw std::runtime_error(
+                        "rdma WriteCts CTS step_tag mismatch");
+                }
+                const std::uint64_t remote_addr =
+                    __atomic_load_n(&cts->raddr, __ATOMIC_RELAXED);
+                const std::uint32_t rkey =
+                    __atomic_load_n(&cts->rkey, __ATOMIC_RELAXED);
+                const std::uint32_t nbytes_cap =
+                    __atomic_load_n(&cts->nbytes, __ATOMIC_RELAXED);
+                if (remote_addr == 0 || payload_bytes > nbytes_cap) {
+                    throw std::runtime_error(
+                        "rdma WriteCts CTS target invalid for payload");
+                }
+
+                posts_.fetch_add(1, std::memory_order_relaxed);
+
+                ibv_sge sge{};
+                sge.length = payload_bytes;
+                sge.addr = reinterpret_cast<std::uintptr_t>(
+                    fifo_.data + slot * fifo_.slot_bytes);
+                sge.lkey = fifo_mr_->lkey;
+
+                const std::uint64_t post_step = next_post_step_;
+                const std::uint64_t tail = load_counter(control_.send_tail);
+                const bool more_pending = tail > post_step + step_inc;
+                bool next_zero_needs_head = false;
+                if (more_pending) {
+                    const std::size_t next_slot =
+                        (post_step + step_inc) % fifo_.slot_count;
+                    next_zero_needs_head =
+                        load_size(fifo_.slot_sizes + next_slot) == 0;
+                }
+                const bool signal =
+                    (inflight_ + 1 >= max_if) || !more_pending ||
+                    next_zero_needs_head ||
+                    ((post_step / step_inc) % kSignalEvery == 0);
+
+                ibv_send_wr wr{};
+                wr.wr_id = RdmaQp::slot_to_wr_id(post_step);
+                wr.sg_list = &sge;
+                wr.num_sge = 1;
+                wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+                wr.send_flags = signal ? IBV_SEND_SIGNALED : 0;
+                wr.imm_data = htobe32(payload_bytes);
+                wr.wr.rdma.remote_addr = remote_addr;
+                wr.wr.rdma.rkey = rkey;
+                wr.next = nullptr;
+
+                ibv_send_wr* bad = nullptr;
+                const int post_ret = ibv_post_send(qp_.qp(), &wr, &bad);
+                if (post_ret != 0) {
+                    throw std::runtime_error(std::string("ibv_post_send WRITE: ") +
+                                             std::strerror(post_ret));
+                }
+                // Clear ready immediately after a successful post. raddr/rkey
+                // were already snapshotted into the WR; waiting until CQE would
+                // race a next-round CTS that reuses the same slot index.
+                __atomic_store_n(&cts->ready, 0U, __ATOMIC_RELEASE);
+                next_post_step_ += step_inc;
+                ++inflight_;
+                did_work = true;
+            }
+
+            const int n = ibv_poll_cq(qp_.cq(), kPollBatch, wcs);
+            if (n < 0) {
+                throw std::runtime_error("ibv_poll_cq failed");
+            }
+            for (int i = 0; i < n; ++i) {
+                check_wc(wcs[i], identity_, next_complete_step_, errors_.get());
+                const std::uint64_t completed_through =
+                    RdmaQp::wr_id_to_slot(wcs[i].wr_id);
+                if (completed_through < next_complete_step_ ||
+                    (completed_through - next_complete_step_) % step_inc != 0) {
+                    throw std::runtime_error(
+                        "rdma WriteCts send completion has unexpected step");
+                }
+                const std::uint64_t advanced =
+                    (completed_through - next_complete_step_) / step_inc + 1;
+                if (advanced > inflight_) {
+                    throw std::runtime_error(
+                        "rdma WriteCts send completion advances past inflight");
+                }
+                // ready already cleared at post; CQE only advances credit.
+                next_complete_step_ = completed_through + step_inc;
+                store_counter(control_.send_head, next_complete_step_);
+                step_.store(next_complete_step_, std::memory_order_release);
+                inflight_ -= static_cast<std::size_t>(advanced);
+                did_work = true;
+            }
+            if (!did_work) {
+                _mm_pause();
+            }
+        }
+    } catch (const std::exception& error) {
+        if (!stop_requested_.load(std::memory_order_acquire)) {
+            errors_->record_failure(identity_,
+                                    step_.load(std::memory_order_acquire),
+                                    error.what());
+        }
+    }
+}
+
 std::size_t RdmaRecvProxy::max_inflight() const {
     if (fifo_.step_increment == 0 ||
         fifo_.slot_count % fifo_.step_increment != 0) {
@@ -343,25 +518,60 @@ RdmaRecvProxy::RdmaRecvProxy(RdmaQp qp, ibv_mr* fifo_mr, RdmaProxyFifo fifo,
                              int fifo_numa_node,
                              std::shared_ptr<RdmaAsyncErrorState> errors,
                              bool elide_zero_payload)
+    : RdmaRecvProxy(std::move(qp), fifo_mr, fifo, control, identity,
+                    fifo_numa_node, std::move(errors), RdmaDataPlane::SendRecv,
+                    RdmaCtsRemote{}, elide_zero_payload) {}
+
+RdmaRecvProxy::RdmaRecvProxy(RdmaQp qp, ibv_mr* fifo_mr, RdmaProxyFifo fifo,
+                             RdmaRecvControl control, RdmaProxyIdentity identity,
+                             int fifo_numa_node,
+                             std::shared_ptr<RdmaAsyncErrorState> errors,
+                             RdmaDataPlane plane, RdmaCtsRemote cts_remote,
+                             bool elide_zero_payload)
     : qp_(std::move(qp)), fifo_mr_(fifo_mr), fifo_(fifo), control_(control),
       identity_(identity), fifo_numa_node_(fifo_numa_node),
-      errors_(std::move(errors)), elide_zero_payload_(elide_zero_payload) {
+      errors_(std::move(errors)), plane_(plane), cts_remote_(cts_remote),
+      elide_zero_payload_(elide_zero_payload) {
     validate_fifo(fifo_);
     if (qp_.qp() == nullptr || fifo_mr_ == nullptr ||
         control_.recv_head == nullptr || control_.recv_tail == nullptr ||
         errors_ == nullptr) {
         throw std::runtime_error("rdma recv proxy has invalid state");
     }
+    if (plane_ == RdmaDataPlane::WriteCts) {
+        validate_cts_remote(cts_remote_);
+        if (cts_remote_.cts_slot_count != fifo_.slot_count) {
+            throw std::runtime_error(
+                "rdma WriteCts CTS slot_count must match FIFO slot_count");
+        }
+    }
     max_inflight_ = max_inflight();
+    if (plane_ == RdmaDataPlane::WriteCts) {
+        // One scratch byte per concurrent IMM RECV WQE (HCA may reject 0-len).
+        imm_scratch_ = std::make_unique<std::uint8_t[]>(max_inflight_);
+        imm_scratch_mr_ =
+            ibv_reg_mr(fifo_mr_->pd, imm_scratch_.get(), max_inflight_,
+                       IBV_ACCESS_LOCAL_WRITE);
+        if (imm_scratch_mr_ == nullptr) {
+            throw std::runtime_error(std::string("ibv_reg_mr imm scratch: ") +
+                                     std::strerror(errno));
+        }
+    }
     const std::uint64_t tail = load_counter(control_.recv_tail);
     next_post_step_ = tail;
     next_complete_step_ = tail;
+    next_cts_step_ = tail;
+    next_cts_complete_step_ = tail;
     step_.store(tail, std::memory_order_relaxed);
 }
 
 RdmaRecvProxy::~RdmaRecvProxy() {
     stop();
     join();
+    if (imm_scratch_mr_ != nullptr) {
+        ibv_dereg_mr(imm_scratch_mr_);
+        imm_scratch_mr_ = nullptr;
+    }
 }
 
 bool RdmaRecvProxy::try_elide_zero_payload() {
@@ -385,6 +595,28 @@ bool RdmaRecvProxy::try_elide_zero_payload() {
 void RdmaRecvProxy::start() {
     if (thread_.joinable()) {
         throw std::runtime_error("rdma recv proxy already started");
+    }
+    if (plane_ == RdmaDataPlane::WriteCts) {
+        // Pre-post IMM RQ WQEs and initial CTS. Credit matches SEND/socket:
+        // free while recv_head + slot_count covers the next step (head starts
+        // at 0; GPU advances head as it consumes).
+        const std::uint64_t step_inc = fifo_.step_increment;
+        while (inflight_ < max_inflight_ &&
+               load_counter(control_.recv_head) + fifo_.slot_count >=
+                   next_post_step_ + step_inc) {
+            pre_post_imm_recv(next_post_step_);
+            next_post_step_ += step_inc;
+            ++inflight_;
+        }
+        while (inflight_cts_ < max_inflight_ &&
+               load_counter(control_.recv_head) + fifo_.slot_count >=
+                   next_cts_step_ + step_inc) {
+            post_cts(next_cts_step_);
+            next_cts_step_ += step_inc;
+            ++inflight_cts_;
+        }
+        thread_ = std::thread(&RdmaRecvProxy::run, this);
+        return;
     }
     // Simple 每个 slice 以 step_increment 前进；预投递必须与 kernel 的
     // slot 序列一致，并在 credit 与 max_inflight 约束下尽可能填满 RQ。
@@ -448,7 +680,98 @@ void RdmaRecvProxy::pre_post_recv(std::uint64_t slot) {
     }
 }
 
+void RdmaRecvProxy::pre_post_imm_recv(std::uint64_t step) {
+    // WRITE_WITH_IMM payload lands in the remote FIFO via RDMA; the RQ WQE
+    // only harvests the IMM CQE. Scratch SGE satisfies HCAs that reject 0-len.
+    const std::size_t scratch_idx = step % max_inflight_;
+    ibv_sge sge{};
+    sge.addr = reinterpret_cast<std::uintptr_t>(imm_scratch_.get() + scratch_idx);
+    sge.length = 1;
+    sge.lkey = imm_scratch_mr_->lkey;
+
+    ibv_recv_wr wr{};
+    wr.wr_id = RdmaQp::slot_to_wr_id(step);
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.next = nullptr;
+
+    ibv_recv_wr* bad = nullptr;
+    const int post_ret = ibv_post_recv(qp_.qp(), &wr, &bad);
+    if (post_ret != 0) {
+        throw std::runtime_error(std::string("ibv_post_recv IMM: ") +
+                                 std::strerror(post_ret));
+    }
+}
+
+void RdmaRecvProxy::post_cts(std::uint64_t step) {
+    const std::size_t slot = step % cts_remote_.cts_slot_count;
+    RdmaCtsSlot* shadow = cts_remote_.local_shadow + slot;
+    shadow->raddr =
+        cts_remote_.local_recv_fifo_addr +
+        static_cast<std::uint64_t>(slot) * fifo_.slot_bytes;
+    shadow->rkey = cts_remote_.local_recv_fifo_rkey;
+    shadow->nbytes = static_cast<std::uint32_t>(fifo_.slot_bytes);
+    shadow->step_tag = step;
+    shadow->reserved = 0;
+    // ready last so a remote observer that sees ready==1 also sees fields.
+    __atomic_store_n(&shadow->ready, 1U, __ATOMIC_RELEASE);
+
+    // Selective SIGNAL mirrors the data path: reclaim SQ via RC in-order
+    // batch on a subset of CQEs (credit-full, every N, or burst tail).
+    constexpr std::uint64_t kSignalEvery = 4;
+    const std::uint64_t step_inc = fifo_.step_increment;
+    const bool more_credit =
+        (inflight_cts_ + 1 < max_inflight_) &&
+        (load_counter(control_.recv_head) + fifo_.slot_count >=
+         step + 2 * step_inc);
+    const bool signal = (inflight_cts_ + 1 >= max_inflight_) || !more_credit ||
+                        ((step / step_inc) % kSignalEvery == 0);
+
+    ibv_sge sge{};
+    sge.addr = reinterpret_cast<std::uintptr_t>(shadow);
+    sge.length = static_cast<std::uint32_t>(sizeof(RdmaCtsSlot));
+
+    ibv_send_wr wr{};
+    wr.wr_id = make_cts_wr_id(step);
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_WRITE;
+    // Prefer INLINE when the QP grants enough room so the HCA copies from
+    // the WR and skips MR fetch. Combine with optional SIGNALED.
+    int send_flags = 0;
+    if (sizeof(RdmaCtsSlot) <= qp_.max_inline_data()) {
+        send_flags = IBV_SEND_INLINE;
+        // lkey ignored for inline; addr/length identify the host buffer.
+    } else {
+        sge.lkey = cts_remote_.local_shadow_mr->lkey;
+    }
+    if (signal) {
+        send_flags |= IBV_SEND_SIGNALED;
+    }
+    wr.send_flags = send_flags;
+    wr.wr.rdma.remote_addr =
+        cts_remote_.remote_cts_addr +
+        static_cast<std::uint64_t>(slot) * sizeof(RdmaCtsSlot);
+    wr.wr.rdma.rkey = cts_remote_.remote_cts_rkey;
+    wr.next = nullptr;
+
+    ibv_send_wr* bad = nullptr;
+    const int post_ret = ibv_post_send(qp_.qp(), &wr, &bad);
+    if (post_ret != 0) {
+        throw std::runtime_error(std::string("ibv_post_send CTS: ") +
+                                 std::strerror(post_ret));
+    }
+}
+
 void RdmaRecvProxy::run() noexcept {
+    if (plane_ == RdmaDataPlane::WriteCts) {
+        run_write_cts();
+    } else {
+        run_send_recv();
+    }
+}
+
+void RdmaRecvProxy::run_send_recv() noexcept {
     try {
         core::pin_current_thread_to_numa_node(fifo_numa_node_);
         constexpr int kPollBatch = 16;
@@ -501,6 +824,108 @@ void RdmaRecvProxy::run() noexcept {
     } catch (const std::exception& error) {
         if (!stop_requested_.load(std::memory_order_acquire)) {
             errors_->record_failure(identity_, step_.load(std::memory_order_acquire),
+                                    error.what());
+        }
+    }
+}
+
+void RdmaRecvProxy::run_write_cts() noexcept {
+    try {
+        core::pin_current_thread_to_numa_node(fifo_numa_node_);
+        constexpr int kPollBatch = 16;
+        ibv_wc wcs[kPollBatch];
+        const std::size_t max_if = max_inflight_;
+        const std::uint64_t step_inc = fifo_.step_increment;
+        while (!stop_requested_.load(std::memory_order_acquire) &&
+               !errors_->has_error()) {
+            bool did_work = false;
+
+            // Refresh CTS for free slots (recv_head + slot_count credit).
+            while (inflight_cts_ < max_if &&
+                   load_counter(control_.recv_head) + fifo_.slot_count >=
+                       next_cts_step_ + step_inc) {
+                post_cts(next_cts_step_);
+                next_cts_step_ += step_inc;
+                ++inflight_cts_;
+                did_work = true;
+            }
+
+            // Keep IMM RQ depth matched to available credit.
+            while (inflight_ < max_if &&
+                   load_counter(control_.recv_head) + fifo_.slot_count >=
+                       next_post_step_ + step_inc) {
+                pre_post_imm_recv(next_post_step_);
+                next_post_step_ += step_inc;
+                ++inflight_;
+                did_work = true;
+            }
+
+            const int n = ibv_poll_cq(qp_.cq(), kPollBatch, wcs);
+            if (n < 0) {
+                throw std::runtime_error("ibv_poll_cq failed");
+            }
+            for (int i = 0; i < n; ++i) {
+                check_wc(wcs[i], identity_, next_complete_step_, errors_.get());
+                if (is_cts_wr_id(wcs[i].wr_id)) {
+                    const std::uint64_t completed_through =
+                        cts_wr_id_to_step(wcs[i].wr_id);
+                    if (completed_through < next_cts_complete_step_ ||
+                        (completed_through - next_cts_complete_step_) %
+                                step_inc !=
+                            0) {
+                        throw std::runtime_error(
+                            "rdma WriteCts CTS completion has unexpected step");
+                    }
+                    const std::uint64_t advanced =
+                        (completed_through - next_cts_complete_step_) /
+                            step_inc +
+                        1;
+                    if (advanced > inflight_cts_) {
+                        throw std::runtime_error(
+                            "rdma WriteCts CTS completion advances past "
+                            "inflight");
+                    }
+                    // RC in-order: signaled CTS covers prior unsignaled CTS.
+                    next_cts_complete_step_ = completed_through + step_inc;
+                    inflight_cts_ -= static_cast<std::size_t>(advanced);
+                    did_work = true;
+                    continue;
+                }
+
+                // Data path only accepts WRITE_WITH_IMM; plain RECV has no imm.
+                if (wcs[i].opcode != IBV_WC_RECV_RDMA_WITH_IMM) {
+                    throw std::runtime_error(
+                        "rdma WriteCts unexpected recv WC opcode");
+                }
+                const std::uint64_t completed_step =
+                    RdmaQp::wr_id_to_slot(wcs[i].wr_id);
+                if (completed_step != next_complete_step_) {
+                    throw std::runtime_error(
+                        "rdma WriteCts IMM completion has unexpected step");
+                }
+                const std::size_t slot = completed_step % fifo_.slot_count;
+                const std::uint32_t payload =
+                    be32toh(static_cast<std::uint32_t>(wcs[i].imm_data));
+                if (payload > fifo_.slot_bytes) {
+                    throw std::runtime_error(
+                        "rdma WriteCts IMM payload exceeds FIFO capacity");
+                }
+                store_size(fifo_.slot_sizes + slot, payload);
+                store_counter(control_.recv_tail,
+                              next_complete_step_ + step_inc);
+                next_complete_step_ += step_inc;
+                step_.store(next_complete_step_, std::memory_order_release);
+                --inflight_;
+                did_work = true;
+            }
+            if (!did_work) {
+                _mm_pause();
+            }
+        }
+    } catch (const std::exception& error) {
+        if (!stop_requested_.load(std::memory_order_acquire)) {
+            errors_->record_failure(identity_,
+                                    step_.load(std::memory_order_acquire),
                                     error.what());
         }
     }

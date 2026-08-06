@@ -20,7 +20,7 @@ Future expansion axes:
 - **collective**: `all_reduce` → `all_gather`/`reduce_scatter`/`broadcast`
 - **transport**: SHM FIFO/P2P FIFO → network
 
-`all_gather` and `reduce_scatter` are unsupported. There is no multi-host performance gate. Socket has no TLS or automatic reconnect; use it only on a trusted network. RDMA v1 uses RC send/receive over registered host-pinned FIFO memory and does not use GPUDirect RDMA; the host proxy posts multiple RC SEND/RECV WQEs up to Simple FIFO slice depth. Do not claim general NCCL replacement capability until expansion is complete.
+`all_gather` and `reduce_scatter` are unsupported. There is no multi-host performance gate. Socket has no TLS or automatic reconnect; use it only on a trusted network. RDMA defaults to RC send/receive over registered host-pinned FIFO memory; `NANO_NCCL_RDMA_USE_WRITE=1` enables WRITE+CTS. Neither path uses GPUDirect RDMA (compare with `NCCL_NET_GDR_LEVEL=0`); the host proxy multi-flights WQEs up to Simple FIFO slice depth. Both hosts must use the same commit (`RdmaPeerInfo` is 64 bytes). Do not claim general NCCL replacement capability until expansion is complete.
 
 ## Sensitive Information
 
@@ -144,7 +144,7 @@ Namespace layering maps 1:1 to directory structure:
 
 - **Device kernel** is templated: `template<typename T, typename RedOp> __global__ void ring_simple_kernel(...)` with `int nranks` as a runtime argument. dtype and reduce op are compile-time parameters; rank count is runtime (benchmarked lossless vs. template specialization on 4× A6000: geomean busbw ratio 1.003/0.997/0.998 for float/fp16/bf16 across 256 KiB – 64 MiB).
 - **Host side** uses runtime parameters to select algo/transport/collective, does not require compiling all combinations.
-- **Transport**: SHM FIFO, device P2P FIFO, MPI/socket, or optional MPI/RDMA for cross-process ring edges. SHM GPUs read/write mapped host memory directly over PCIe (`cudaHostAllocMapped`), with no proxy thread or `cudaMemcpy`; FIFO buffers are allocated on the receiver NUMA node to avoid cross-NUMA bandwidth loss. P2P FIFO buffers are allocated on the receiver GPU and require bidirectional CUDA peer access between every ring-neighbor pair. Socket uses an IPv4 listener chosen by `NANO_NCCL_SOCKET_IFNAME`; it is a trusted-network transport without TLS or auto reconnect. RDMA uses RC send/recv over a host-pinned, registered FIFO; the proxy multi-flights SEND/RECV WQEs up to Simple FIFO slice depth and does not use GPUDirect RDMA; it is selected only by explicit `--transport rdma` and requires the MPI/RDMA build plus `NANO_NCCL_RDMA_IFNAME`.
+- **Transport**: SHM FIFO, device P2P FIFO, MPI/socket, or optional MPI/RDMA for cross-process ring edges. SHM GPUs read/write mapped host memory directly over PCIe (`cudaHostAllocMapped`), with no proxy thread or `cudaMemcpy`; FIFO buffers are allocated on the receiver NUMA node to avoid cross-NUMA bandwidth loss. P2P FIFO buffers are allocated on the receiver GPU and require bidirectional CUDA peer access between every ring-neighbor pair. Socket uses an IPv4 listener chosen by `NANO_NCCL_SOCKET_IFNAME`; it is a trusted-network transport without TLS or auto reconnect. RDMA defaults to RC send/recv over a host-pinned, registered FIFO; set `NANO_NCCL_RDMA_USE_WRITE=1` for the WRITE+CTS host-pin data plane. The proxy multi-flights WQEs up to Simple FIFO slice depth and does not use GPUDirect RDMA (compare with `NCCL_NET_GDR_LEVEL=0`); it is selected only by explicit `--transport rdma` and requires the MPI/RDMA build plus `NANO_NCCL_RDMA_IFNAME`. Both hosts must build the same commit (`RdmaPeerInfo` is 64 bytes).
 
 ### Transport selection
 
@@ -158,14 +158,22 @@ directions and fails on the first unavailable direction; it does not fall back.
 P2P is single-node only and is not a network transport.
 
 `rdma` requires `NANO_NCCL_ENABLE_MPI=ON` and `NANO_NCCL_ENABLE_RDMA=ON` at
-build time. It resolves cross-process ring edges to RC send/recv RDMA and
-keeps local edges as SHM. The host proxy posts multiple RC SEND/RECV WQEs up to
-Simple FIFO slice depth over registered host-pinned FIFO memory; GPUDirect RDMA
-is not used. Set `NANO_NCCL_RDMA_IFNAME=<rdma-interface>` in every MPI process;
-set `NANO_NCCL_RDMA_GID_INDEX` when the default GID table entry is not routable
-for the target RoCE deployment. QP information and receive-ready coordination
-reuse the trusted TCP bootstrap connection. There is no multi-host performance
-gate for this path.
+build time. It resolves cross-process ring edges to RDMA and keeps local edges
+as SHM. The default data plane is RC SEND/RECV; `NANO_NCCL_RDMA_USE_WRITE=1`
+enables WRITE+CTS (RC `WRITE_WITH_IMM` plus a host-pinned CTS slot ring). Both
+planes use registered host-pinned FIFO memory only — no GPUDirect RDMA; fair
+NCCL comparisons use `NCCL_NET_GDR_LEVEL=0`. The host proxy multi-flights WQEs
+up to Simple FIFO slice depth. SEND and WriteCts always post SGE from the
+registered mapped FIFO; correctness relies on all-worker
+`__threadfence_system` before `send_tail` publish plus system-scope
+release/acquire step counters (no host bounce path). Dual-host WRITE matrix
+(float/fp16/bf16 × sum/avg/max/min, 256 KiB–64 MiB) validated `#wrong=0`.
+Both hosts must build the same commit (`RdmaPeerInfo` is 64 bytes). Set
+`NANO_NCCL_RDMA_IFNAME=<rdma-interface>` in every MPI process; set
+`NANO_NCCL_RDMA_GID_INDEX` when the default GID table entry is not routable for
+the target RoCE deployment. QP information and receive-ready coordination reuse
+the trusted TCP bootstrap connection. There is no multi-host performance gate
+for this path.
 
 For MPI/socket launches, set `NANO_NCCL_SOCKET_IFNAME` to an interface with exactly one usable IPv4 address in every MPMD app context. `NANO_NCCL_SOCKET_TEST_FAULT_INJECTION=ON` builds a separate test-only library for `nano_nccl_mpi_correctness`; ordinary MPI benchmarks always link the library without the `NANO_NCCL_SOCKET_FAIL_AFTER_SLICES` hook.
 
@@ -271,4 +279,4 @@ This is a single-host acceptance criterion only; no multi-host socket performanc
 - **New rank count**: pass the new rank count to `ring_simple_kernel` as runtime `nranks` argument; `kRanks` (from `NANO_NCCL_NRANKS`) still controls host-side buffer sizing and array dimensions
 - **New collective**: create subdirectory under `src/collective/`, implement collective interface
 - **New transport**: create a subdirectory under `src/transport/` and implement the transport interface (for example, RoCE RC send/recv); RDMA v1 uses registered host FIFO memory, while RDMA write and GPUDirect RDMA remain future work
-- **RDMA build**: `cmake -S . -B build-rdma -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_ENABLE_MPI=ON -DNANO_NCCL_ENABLE_RDMA=ON -DNANO_NCCL_NRANKS=<ranks> -DNANO_NCCL_CUDA_ARCH=<arch>`; requires `libibverbs-dev` and reuses the TCP bootstrap connection for `RdmaPeerInfo` exchange and receive-ready coordination
+- **RDMA build**: `cmake -S . -B build-rdma -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_ENABLE_MPI=ON -DNANO_NCCL_ENABLE_RDMA=ON -DNANO_NCCL_NRANKS=<ranks> -DNANO_NCCL_CUDA_ARCH=<arch>`; requires `libibverbs-dev` and reuses the TCP bootstrap connection for `RdmaPeerInfo` exchange and receive-ready coordination. Default data plane is SEND/RECV; `NANO_NCCL_RDMA_USE_WRITE=1` enables WRITE+CTS (host-pin only; no GDR)

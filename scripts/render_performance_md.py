@@ -133,7 +133,7 @@ def render(doc: dict) -> str:
         "All measurements use a Release build with `NANO_NCCL_ENABLE_BENCH_PROFILING=OFF`, "
         "message sizes 256 KiB through 64 MiB, `-w 5`, and `-n 20`. "
         "NCCL uses `Ring`, `Simple`, four channels, and a 32 MiB buffer. "
-        "RDMA send defaults to posting from the registered mapped FIFO (`NANO_NCCL_RDMA_SEND_MODE` unset / `direct`)."
+        "RDMA SEND/WriteCts always post from the registered mapped FIFO (no host bounce; visibility via `__threadfence_system` + release/acquire steps)."
     )
     out.append("")
 

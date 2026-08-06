@@ -110,6 +110,11 @@ int main() {
         constexpr int kRecvWr = 8;
         RdmaQp qp_a = RdmaQp::create_init(endpoint, kSendWr, kRecvWr);
         RdmaQp qp_b = RdmaQp::create_init(endpoint, kSendWr, kRecvWr);
+        if (qp_a.max_inline_data() < sizeof(nano_nccl::transport::rdma::RdmaCtsSlot) ||
+            qp_b.max_inline_data() < sizeof(nano_nccl::transport::rdma::RdmaCtsSlot)) {
+            throw std::runtime_error(
+                "rdma_bootstrap: max_inline_data too small for RdmaCtsSlot");
+        }
 
         // 16-byte payload (16 is mmap/max_inline friendly, comfortably holds
         // the 13-byte terminated C string "RDMA_BOOT_OK" + null).
@@ -145,7 +150,7 @@ int main() {
         const int fd_a = conn_a.fd();
         const int fd_b = conn_b.fd();
 
-        // Swap RdmaPeerInfo each direction (28-byte fixed-layout POD).
+        // Swap RdmaPeerInfo each direction (64-byte fixed-layout POD).
         RdmaPeerInfo local_a{}, local_b{}, remote_a{}, remote_b{};
         build_local_info(endpoint, qp_a, &local_a);
         build_local_info(endpoint, qp_b, &local_b);

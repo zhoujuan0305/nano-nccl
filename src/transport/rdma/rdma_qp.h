@@ -45,17 +45,21 @@ public:
 
     ibv_qp* qp() const noexcept { return qp_; }
     ibv_cq* cq() const noexcept { return cq_; }
+    // Actual max_inline_data granted by the HCA after create (may be 0).
+    std::uint32_t max_inline_data() const noexcept { return max_inline_data_; }
     // 仅填 qpn；port_lid/gid_index/gid 由调用方从 RdmaEndpoint 抄入。
     RdmaPeerInfo local_info() const noexcept;
 
 private:
-    RdmaQp(ibv_qp* qp, ibv_cq* cq, std::uint32_t qpn) noexcept;
+    RdmaQp(ibv_qp* qp, ibv_cq* cq, std::uint32_t qpn,
+           std::uint32_t max_inline_data) noexcept;
 
     void destroy() noexcept;
 
     ibv_qp* qp_ = nullptr;
     ibv_cq* cq_ = nullptr;
     std::uint32_t qpn_ = 0;
+    std::uint32_t max_inline_data_ = 0;
 };
 
 }  // namespace nano_nccl::transport::rdma

@@ -36,13 +36,33 @@ def main() -> int:
     rdma_header = Path(sys.argv[1]).parent.parent.parent / "src/transport/rdma/rdma_protocol.h"
     if rdma_header.exists():
         text = rdma_header.read_text()
+        require(text, "struct RdmaCtsSlot", "rdma_protocol.h RdmaCtsSlot")
         require(text, "struct RdmaPeerInfo", "rdma_protocol.h RdmaPeerInfo")
         require(text, "std::uint32_t qpn", "rdma_protocol.h qpn field")
         require(text, "std::uint32_t psn", "rdma_protocol.h psn field")
         require(text, "std::uint16_t port_lid", "rdma_protocol.h port_lid field")
         require(text, "std::uint16_t gid_index", "rdma_protocol.h gid_index field")
         require(text, "std::uint8_t  gid[16]", "rdma_protocol.h gid field")
-        require(text, "static_assert(sizeof(RdmaPeerInfo) == 28)", "rdma_protocol.h size assert")
+        require(text, "recv_fifo_addr", "rdma_protocol.h recv_fifo_addr field")
+        require(text, "cts_fifo_addr", "rdma_protocol.h cts_fifo_addr field")
+        require(text, "static_assert(sizeof(RdmaCtsSlot) == 32)",
+                "rdma_protocol.h RdmaCtsSlot size assert")
+        require(text, "static_assert(sizeof(RdmaPeerInfo) == 64)",
+                "rdma_protocol.h RdmaPeerInfo size assert")
+
+    # Communicator must wire WRITE+CTS bootstrap when the env plane is selected.
+    for path in sys.argv[2:]:
+        if Path(path).name != "communicator.cu":
+            continue
+        text = Path(path).read_text()
+        where = "communicator.cu"
+        if "parse_rdma_data_plane_env" not in text and "NANO_NCCL_RDMA_USE_WRITE" not in text:
+            raise AssertionError(
+                f"{where}: missing parse_rdma_data_plane_env or NANO_NCCL_RDMA_USE_WRITE")
+        require(text, "cts_fifo_addr", f"{where} cts_fifo_addr assignment")
+        require(text, "RdmaDataPlane::WriteCts", f"{where} WriteCts construction branch")
+        require(text, "RdmaWriteTargets", f"{where} RdmaWriteTargets for send proxy")
+        require(text, "RdmaCtsRemote", f"{where} RdmaCtsRemote for recv proxy")
     return 0
 
 

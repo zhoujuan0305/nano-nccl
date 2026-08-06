@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Static regression: RDMA send keeps bounce fallback; default is direct.
+"""Static regression: RDMA send has no host bounce path.
 
-Default posts IBV_WR_SEND from the registered mapped FIFO (fifo_mr_), matching
-NCCL host-pin style after multi-host stress. Bounce mode remains available via
-NANO_NCCL_RDMA_SEND_MODE=bounce for visibility debugging.
+SEND and WriteCts always post SGE from the registered mapped FIFO
+(fifo_.data + fifo_mr_->lkey). Visibility is the all-worker
+__threadfence_system + release/acquire step contract — not a bounce copy.
 """
 
 from pathlib import Path
@@ -19,55 +19,52 @@ def main() -> int:
         )
         return 2
     text = Path(sys.argv[1]).read_text()
-    send_run = re.search(
-        r"void RdmaSendProxy::run\(\)[^{]*\{(?P<body>.*)\n\}\n\n"
+
+    for needle, msg in (
+        ("NANO_NCCL_RDMA_SEND_MODE", "bounce env NANO_NCCL_RDMA_SEND_MODE must be gone"),
+        ("parse_send_mode_env", "parse_send_mode_env must be gone"),
+        ("SendMode", "SendMode enum must be gone"),
+        ("bounce_mr_", "bounce_mr_ must be gone"),
+        ("bytes_bounced_", "bytes_bounced_ must be gone"),
+        ("bounce_", "bounce_ buffer must be gone"),
+    ):
+        if needle in text:
+            raise AssertionError(msg)
+
+    send_recv = re.search(
+        r"void RdmaSendProxy::run_send_recv\(\)[^{]*\{(?P<body>.*)\n\}\n\n"
+        r"void RdmaSendProxy::run_write_cts",
+        text,
+        re.S,
+    )
+    if send_recv is None:
+        raise AssertionError("could not locate RdmaSendProxy::run_send_recv")
+    write_cts = re.search(
+        r"void RdmaSendProxy::run_write_cts\(\)[^{]*\{(?P<body>.*)\n\}\n\n"
         r"std::size_t RdmaRecvProxy::max_inflight",
         text,
         re.S,
     )
-    if send_run is None:
-        raise AssertionError("could not locate RdmaSendProxy::run")
-    body = send_run.group("body")
-    if "ibv_post_send" not in body:
-        raise AssertionError("send run missing ibv_post_send")
+    if write_cts is None:
+        raise AssertionError("could not locate RdmaSendProxy::run_write_cts")
 
-    if "NANO_NCCL_RDMA_SEND_MODE" not in text:
-        raise AssertionError(
-            "expected NANO_NCCL_RDMA_SEND_MODE env for bounce|direct"
-        )
-    if not re.search(
-        r"return\s+RdmaSendProxy::SendMode::Direct|"
-        r"SendMode\s*::\s*Direct",
-        text,
+    for name, body in (
+        ("run_send_recv", send_recv.group("body")),
+        ("run_write_cts", write_cts.group("body")),
     ):
-        raise AssertionError("expected Direct send mode in proxy source")
-    # Default when env unset must be Direct.
-    parse = re.search(
-        r"parse_send_mode_env\(\)\s*\{(?P<body>.*?)\n\}",
-        text,
-        re.S,
-    )
-    if parse is None:
-        raise AssertionError("could not locate parse_send_mode_env")
-    parse_body = parse.group("body")
-    if not re.search(
-        r"env\s*==\s*nullptr.*?return\s+RdmaSendProxy::SendMode::Direct",
-        parse_body,
-        re.S,
-    ):
-        raise AssertionError("default send mode (env unset) must be Direct")
-
-    if not re.search(r"\b(?:std::)?(?:memcpy|copy_n|copy)\s*\(", body):
-        raise AssertionError("bounce path must retain host payload copy")
-    if not re.search(r"sge\.lkey\s*=\s*bounce_mr_->lkey", body):
-        raise AssertionError("bounce path must assign sge.lkey = bounce_mr_->lkey")
-    if not re.search(r"sge\.lkey\s*=\s*fifo_mr_->lkey", body):
-        raise AssertionError("direct path must assign sge.lkey = fifo_mr_->lkey")
-    if not re.search(
-        r"sge\.addr\s*=\s*reinterpret_cast<[^>]+>\(\s*fifo_\.data\s*\+",
-        body,
-    ):
-        raise AssertionError("direct path must post SGE from fifo_.data")
+        if "ibv_post_send" not in body:
+            raise AssertionError(f"{name} missing ibv_post_send")
+        if re.search(r"\b(?:std::)?(?:memcpy|copy_n|copy)\s*\(", body):
+            raise AssertionError(f"{name} must not host-copy payload (bounce gone)")
+        if not re.search(r"sge\.lkey\s*=\s*fifo_mr_->lkey", body):
+            raise AssertionError(f"{name} must assign sge.lkey = fifo_mr_->lkey")
+        if not re.search(
+            r"sge\.addr\s*=\s*reinterpret_cast<[^>]+>\(\s*fifo_\.data\s*\+",
+            body,
+        ):
+            raise AssertionError(f"{name} must post SGE from fifo_.data")
+        if re.search(r"sge\.lkey\s*=\s*bounce", body):
+            raise AssertionError(f"{name} must not use bounce lkey")
 
     print("rdma_proxy_send_visibility_static=PASS")
     return 0

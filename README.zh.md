@@ -84,13 +84,18 @@ cmake --build build-mpi -j$(nproc)
 
 ### 可选 MPI/RDMA 构建
 
-每台机器都要从同一个 commit、以全局 GPU 数构建。RDMA 通过注册的 host-pinned FIFO
-执行 RC send/receive；host proxy 按 Simple FIFO slice 深度 multi-flight 提交
-SEND/RECV，并对 CQ 做 selective signaling。Simple 协议末尾空 slice 不再走网络
-往返。默认 send 路径从已注册的 mapped FIFO 直接 post
-（`NANO_NCCL_RDMA_SEND_MODE` 未设置或 `direct`）；需要时设
-`NANO_NCCL_RDMA_SEND_MODE=bounce` 强制 host bounce。当前不使用 GPUDirect RDMA。
-MPI binding 使用 MPI C API，因此 Open MPI 不需要提供已废弃的 C++ binding library。
+每台机器都要从同一个 commit、以全局 GPU 数构建（`RdmaPeerInfo` 为 64 字节；commit
+不一致会导致 bootstrap 失败）。RDMA 默认通过注册的 host-pinned FIFO 执行 RC
+send/receive；host proxy 按 Simple FIFO slice 深度 multi-flight 提交 SEND/RECV，
+并对 CQ 做 selective signaling。Simple 协议末尾空 slice 不再走网络往返。设置
+`NANO_NCCL_RDMA_USE_WRITE=1` 可选用 WRITE+CTS 数据面（RC `WRITE_WITH_IMM` +
+host-pinned CTS slot ring）；未设置/`0` 保持 SEND/RECV。两种数据面均为 host-pin，
+  不使用 GPUDirect RDMA；与 NCCL 对比时请设 `NCCL_NET_GDR_LEVEL=0`。SEND 与
+  WriteCts 始终从已注册的 mapped FIFO（`fifo_mr_`）直接 post SGE。正确性依赖：
+  所有 FIFO writer 在发布 `send_tail` 前执行 `__threadfence_system`，以及
+  system-scope release/acquire step counter（无 host bounce 路径）。双机 WRITE
+  矩阵（float/fp16/bf16 × sum/avg/max/min，256 KiB–64 MiB）已验证 `#wrong=0`。
+  MPI binding 使用 MPI C API，因此 Open MPI 不需要提供已废弃的 C++ binding library。
 
 ```bash
 cmake -S . -B build-rdma -DCMAKE_BUILD_TYPE=Release \
@@ -244,9 +249,13 @@ unsupported-operation 错误。
 - `shm` 强制使用 mapped host memory 的 SHM FIFO 路径。
 - `p2p` 要求每条 ring edge 都具备所需的双向 peer access。任一方向不可用时，初始化会在第一个不可用方向报错，不会回退。
 - `rdma` 需要 `NANO_NCCL_ENABLE_MPI=ON` 与 `NANO_NCCL_ENABLE_RDMA=ON`。它为跨进程
-  ring edge 使用 multi-flight RC send/receive RDMA（深度不超过 Simple FIFO
-  slice，selective CQ signal，空 slice 跳过网络），本机 edge 保持 SHM/P2P。
-  默认 send 从已注册 mapped FIFO post；`NANO_NCCL_RDMA_SEND_MODE=bounce` 为可见性回退。
+  ring edge 使用 multi-flight RC RDMA（深度不超过 Simple FIFO slice，selective CQ
+  signal，空 slice 跳过网络），本机 edge 保持 SHM/P2P。默认数据面为 SEND/RECV；
+  `NANO_NCCL_RDMA_USE_WRITE=1` 选用 WRITE+CTS（仍为 host-pin；与 NCCL 公平对比请用
+  `NCCL_NET_GDR_LEVEL=0`）。双机须同一 commit（64 字节 `RdmaPeerInfo`）。
+  SEND/WriteCts 始终从已注册 mapped FIFO 直接 post；正确性依赖 all-worker
+  `__threadfence_system`（在 `send_tail` 前）与 system release/acquire step
+  （无 host bounce）。双机 WRITE 矩阵 `#wrong=0`。
 
 P2P 是单机通信路径，需要每对完整配置环邻居之间的双向 CUDA peer access；它不是多机或网络通信路径。socket 使用可信、仅 IPv4 的 TCP 网络边界，不提供 TLS 或自动重连。
 
