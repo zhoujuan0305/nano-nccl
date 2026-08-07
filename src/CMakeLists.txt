@@ -41,6 +41,12 @@ if(NANO_NCCL_ENABLE_BENCH_PROFILING)
     target_link_libraries(nano_nccl PRIVATE CUDA::nvToolsExt)
 endif()
 
+if(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+    target_sources(nano_nccl PRIVATE transport/rdma/rdma_proxy_timeline.cc)
+    target_compile_definitions(nano_nccl PUBLIC
+        NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE=1)
+endif()
+
 if(NANO_NCCL_SOCKET_TEST_FAULT_INJECTION)
     add_nano_nccl_library(nano_nccl_test_fault)
     target_compile_definitions(nano_nccl_test_fault PRIVATE

@@ -4,6 +4,11 @@
 #include "transport/rdma/rdma_protocol.h"
 #include "transport/rdma/rdma_qp.h"
 
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+#include "transport/rdma/rdma_proxy_timeline.h"
+#include <chrono>
+#endif
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -124,11 +129,20 @@ public:
         return zero_payload_posts_.load(std::memory_order_relaxed);
     }
 
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+    void dump_timeline_if_enabled() const;
+#else
+    void dump_timeline_if_enabled() const {}
+#endif
+
 private:
     void run() noexcept;
     void run_send_recv() noexcept;
     void run_write_cts() noexcept;
     std::size_t max_inflight() const;
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+    const char* timeline_plane_label() const noexcept;
+#endif
 
     RdmaQp qp_;
     ibv_mr* fifo_mr_;
@@ -148,6 +162,20 @@ private:
     std::size_t max_inflight_ = 0;
     std::atomic<std::uint64_t> posts_{0};
     std::atomic<std::uint64_t> zero_payload_posts_{0};
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+    RdmaProxyTimelineCounters timeline_{};
+    bool timeline_enabled_ = false;
+    mutable bool timeline_dumped_ = false;
+    // Signaled-only post→CQ: one slot per in-flight index (step/step_inc)%max.
+    std::unique_ptr<std::chrono::steady_clock::time_point[]> signaled_post_tp_;
+    std::unique_ptr<bool[]> signaled_post_valid_;
+    std::chrono::steady_clock::time_point last_data_post_tp_{};
+    bool last_data_post_valid_ = false;
+    bool send_tail_armed_ = false;
+    std::chrono::steady_clock::time_point send_tail_tp_{};
+    bool send_cts_armed_ = false;
+    std::chrono::steady_clock::time_point send_cts_tp_{};
+#endif
 };
 
 class RdmaRecvProxy {
@@ -179,6 +207,12 @@ public:
 
     RdmaDataPlane data_plane() const noexcept { return plane_; }
 
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+    void dump_timeline_if_enabled() const;
+#else
+    void dump_timeline_if_enabled() const {}
+#endif
+
 private:
     void run() noexcept;
     void run_send_recv() noexcept;
@@ -188,6 +222,9 @@ private:
     void post_cts(std::uint64_t step);
     bool try_elide_zero_payload();
     std::size_t max_inflight() const;
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+    const char* timeline_plane_label() const noexcept;
+#endif
 
     RdmaQp qp_;
     ibv_mr* fifo_mr_;
@@ -211,6 +248,15 @@ private:
     std::size_t inflight_ = 0;
     std::size_t inflight_cts_ = 0;
     std::size_t max_inflight_ = 0;
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+    RdmaProxyTimelineCounters timeline_{};
+    bool timeline_enabled_ = false;
+    mutable bool timeline_dumped_ = false;
+    std::chrono::steady_clock::time_point last_publish_tp_{};
+    bool last_publish_valid_ = false;
+    std::chrono::steady_clock::time_point last_cts_post_tp_{};
+    bool last_cts_post_valid_ = false;
+#endif
 };
 
 }  // namespace nano_nccl::transport::rdma

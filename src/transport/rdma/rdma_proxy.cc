@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -10,6 +11,10 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+#include <chrono>
+#endif
 
 #include <endian.h>
 #include <immintrin.h>
@@ -102,6 +107,25 @@ void check_wc(const ibv_wc& wc, RdmaProxyIdentity identity, std::uint64_t step,
     throw std::runtime_error(reason);
 }
 
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+using SteadyClock = std::chrono::steady_clock;
+using SteadyTp = SteadyClock::time_point;
+
+std::uint64_t timeline_ns_delta(SteadyTp start, SteadyTp end) noexcept {
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+    return elapsed > 0 ? static_cast<std::uint64_t>(elapsed) : 0;
+}
+
+std::size_t timeline_flight_index(std::uint64_t step, std::uint64_t step_inc,
+                                  std::size_t max_if) noexcept {
+    if (max_if == 0 || step_inc == 0) {
+        return 0;
+    }
+    return static_cast<std::size_t>((step / step_inc) % max_if);
+}
+#endif
+
 }  // namespace
 
 RdmaDataPlane parse_rdma_data_plane_env() {
@@ -178,12 +202,44 @@ RdmaSendProxy::RdmaSendProxy(RdmaQp qp, ibv_mr* fifo_mr, RdmaProxyFifo fifo,
     next_post_step_ = head;
     next_complete_step_ = head;
     step_.store(head, std::memory_order_relaxed);
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+    timeline_enabled_ = rdma_proxy_timeline_env_enabled();
+    if (timeline_enabled_ && max_inflight_ > 0) {
+        signaled_post_tp_ =
+            std::make_unique<SteadyTp[]>(max_inflight_);
+        signaled_post_valid_ = std::make_unique<bool[]>(max_inflight_);
+        for (std::size_t i = 0; i < max_inflight_; ++i) {
+            signaled_post_valid_[i] = false;
+        }
+    }
+#endif
 }
 
 RdmaSendProxy::~RdmaSendProxy() {
     stop();
     join();
+    dump_timeline_if_enabled();
 }
+
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+const char* RdmaSendProxy::timeline_plane_label() const noexcept {
+    return plane_ == RdmaDataPlane::WriteCts ? "WriteCts" : "SendRecv";
+}
+
+void RdmaSendProxy::dump_timeline_if_enabled() const {
+    if (!timeline_enabled_ || timeline_dumped_) {
+        return;
+    }
+    timeline_dumped_ = true;
+    // v2 per-event metrics only — lifetime stage spins poison interpretation.
+    const std::string text = timeline_.format_v2(
+        "send", identity_.source_rank, identity_.destination_rank,
+        identity_.channel, timeline_plane_label());
+    if (!text.empty()) {
+        std::fprintf(stderr, "%s", text.c_str());
+    }
+}
+#endif
 
 void RdmaSendProxy::start() {
     if (thread_.joinable()) {
@@ -238,8 +294,25 @@ void RdmaSendProxy::run_send_recv() noexcept {
         while (!stop_requested_.load(std::memory_order_acquire) &&
                !errors_->has_error()) {
             bool did_work = false;
-            while (inflight_ < max_if &&
-                   load_counter(control_.send_tail) > next_post_step_) {
+            while (inflight_ < max_if) {
+                const std::uint64_t tail = load_counter(control_.send_tail);
+                const bool tail_ready = tail > next_post_step_;
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+                if (timeline_enabled_ && tail_ready && !send_tail_armed_) {
+                    send_tail_tp_ = SteadyClock::now();
+                    send_tail_armed_ = true;
+                    // Gap after prior data post until this step's tail arms
+                    // (dominates send_inter_post under PIVOT=TAIL).
+                    if (last_data_post_valid_) {
+                        timeline_.record_event(
+                            RdmaProxyTimelineEvent::SendPostToNextTail,
+                            timeline_ns_delta(last_data_post_tp_, send_tail_tp_));
+                    }
+                }
+#endif
+                if (!tail_ready) {
+                    break;
+                }
                 const std::size_t slot = next_post_step_ % fifo_.slot_count;
                 const std::uint32_t payload_bytes =
                     load_size(fifo_.slot_sizes + slot);
@@ -263,12 +336,22 @@ void RdmaSendProxy::run_send_recv() noexcept {
                     next_post_step_ += step_inc;
                     next_complete_step_ += step_inc;
                     step_.store(next_complete_step_, std::memory_order_release);
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+                    send_tail_armed_ = false;
+                    send_cts_armed_ = false;
+#endif
                     did_work = true;
                     continue;
                 }
 
                 posts_.fetch_add(1, std::memory_order_relaxed);
 
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+                // Q1: local handle after can_post (same iteration; no spin).
+                const SteadyTp t_ready =
+                    timeline_enabled_ ? SteadyClock::now() : SteadyTp{};
+#endif
+                bool signal = false;
                 ibv_sge sge{};
                 sge.length = payload_bytes;
                 sge.addr = reinterpret_cast<std::uintptr_t>(
@@ -278,7 +361,6 @@ void RdmaSendProxy::run_send_recv() noexcept {
                 // wr_id = absolute step so one signaled CQE can batch-advance
                 // send_head across prior unsignaled WRs (RC in-order).
                 const std::uint64_t post_step = next_post_step_;
-                const std::uint64_t tail = load_counter(control_.send_tail);
                 const bool more_pending = tail > post_step + step_inc;
                 // 0-byte elide only runs at the completion head. If a later
                 // published step is empty, this WR must be SIGNALED or the
@@ -290,10 +372,9 @@ void RdmaSendProxy::run_send_recv() noexcept {
                     next_zero_needs_head =
                         load_size(fifo_.slot_sizes + next_slot) == 0;
                 }
-                const bool signal =
-                    (inflight_ + 1 >= max_if) || !more_pending ||
-                    next_zero_needs_head ||
-                    ((post_step / step_inc) % kSignalEvery == 0);
+                signal = (inflight_ + 1 >= max_if) || !more_pending ||
+                         next_zero_needs_head ||
+                         ((post_step / step_inc) % kSignalEvery == 0);
 
                 ibv_send_wr wr{};
                 wr.wr_id = RdmaQp::slot_to_wr_id(post_step);
@@ -309,6 +390,43 @@ void RdmaSendProxy::run_send_recv() noexcept {
                     throw std::runtime_error(std::string("ibv_post_send: ") +
                                              std::strerror(post_ret));
                 }
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+                if (timeline_enabled_) {
+                    const SteadyTp post_done = SteadyClock::now();
+                    timeline_.record_event(
+                        RdmaProxyTimelineEvent::SendReadyToPost,
+                        timeline_ns_delta(t_ready, post_done));
+                    if (send_tail_armed_) {
+                        timeline_.record_event(
+                            RdmaProxyTimelineEvent::SendTailArmToPost,
+                            timeline_ns_delta(send_tail_tp_, post_done));
+                        send_tail_armed_ = false;
+                    }
+                    // Q2: previous successful data post → this post.
+                    if (last_data_post_valid_) {
+                        timeline_.record_event(
+                            RdmaProxyTimelineEvent::SendInterPost,
+                            timeline_ns_delta(last_data_post_tp_, post_done));
+                    }
+                    last_data_post_tp_ = post_done;
+                    last_data_post_valid_ = true;
+                    // Depth: inflight before ++ ; free slots from host credit view.
+                    timeline_.inflight_at_post.record(
+                        static_cast<std::uint64_t>(inflight_));
+                    const std::uint64_t free_slots =
+                        (next_complete_step_ +
+                         static_cast<std::uint64_t>(fifo_.slot_count) - tail) /
+                        step_inc;
+                    timeline_.free_slots_at_post.record(free_slots);
+                    // Q3 signaled-only: unsignaled WRs attribute to next CQE.
+                    if (signal && signaled_post_tp_ && signaled_post_valid_) {
+                        const std::size_t idx =
+                            timeline_flight_index(post_step, step_inc, max_if);
+                        signaled_post_tp_[idx] = post_done;
+                        signaled_post_valid_[idx] = true;
+                    }
+                }
+#endif
                 next_post_step_ += step_inc;
                 ++inflight_;
                 did_work = true;
@@ -333,6 +451,25 @@ void RdmaSendProxy::run_send_recv() noexcept {
                     throw std::runtime_error(
                         "rdma send completion advances past inflight");
                 }
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+                // Q3 signaled-only: full interval attributed to the signaled WR.
+                if (timeline_enabled_ && signaled_post_tp_ &&
+                    signaled_post_valid_) {
+                    const std::size_t idx = timeline_flight_index(
+                        completed_through, step_inc, max_if);
+                    if (signaled_post_valid_[idx]) {
+                        const SteadyTp now = SteadyClock::now();
+                        timeline_.record_event(
+                            RdmaProxyTimelineEvent::SendPostToCq,
+                            timeline_ns_delta(signaled_post_tp_[idx], now));
+                        signaled_post_valid_[idx] = false;
+                    }
+                }
+                if (timeline_enabled_) {
+                    timeline_.inflight_at_cqe.record(
+                        static_cast<std::uint64_t>(inflight_));
+                }
+#endif
                 // RC in-order: a signaled WR covers all prior unsignaled WRs.
                 next_complete_step_ = completed_through + step_inc;
                 store_counter(control_.send_head, next_complete_step_);
@@ -341,7 +478,7 @@ void RdmaSendProxy::run_send_recv() noexcept {
                 did_work = true;
             }
             if (!did_work) {
-                std::this_thread::yield();
+                _mm_pause();
             }
         }
     } catch (const std::exception& error) {
@@ -363,9 +500,26 @@ void RdmaSendProxy::run_write_cts() noexcept {
         while (!stop_requested_.load(std::memory_order_acquire) &&
                !errors_->has_error()) {
             bool did_work = false;
-            while (inflight_ < max_if &&
-                   load_counter(control_.send_tail) > next_post_step_) {
+            while (inflight_ < max_if) {
                 const std::size_t slot = next_post_step_ % fifo_.slot_count;
+                const std::uint64_t tail = load_counter(control_.send_tail);
+                const bool tail_ready = tail > next_post_step_;
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+                if (timeline_enabled_ && tail_ready && !send_tail_armed_) {
+                    send_tail_tp_ = SteadyClock::now();
+                    send_tail_armed_ = true;
+                    // Gap after prior data post until this step's tail arms
+                    // (dominates send_inter_post under PIVOT=TAIL).
+                    if (last_data_post_valid_) {
+                        timeline_.record_event(
+                            RdmaProxyTimelineEvent::SendPostToNextTail,
+                            timeline_ns_delta(last_data_post_tp_, send_tail_tp_));
+                    }
+                }
+#endif
+                if (!tail_ready) {
+                    break;
+                }
                 const std::uint32_t payload_bytes =
                     load_size(fifo_.slot_sizes + slot);
                 if (payload_bytes > fifo_.slot_bytes) {
@@ -386,6 +540,10 @@ void RdmaSendProxy::run_write_cts() noexcept {
                     next_post_step_ += step_inc;
                     next_complete_step_ += step_inc;
                     step_.store(next_complete_step_, std::memory_order_release);
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+                    send_tail_armed_ = false;
+                    send_cts_armed_ = false;
+#endif
                     did_work = true;
                     continue;
                 }
@@ -397,14 +555,29 @@ void RdmaSendProxy::run_write_cts() noexcept {
                 RdmaCtsSlot* cts = write_targets_.local_cts + slot;
                 const std::uint32_t ready =
                     __atomic_load_n(&cts->ready, __ATOMIC_ACQUIRE);
-                if (ready != 1) {
-                    break;
-                }
                 const std::uint64_t step_tag =
-                    __atomic_load_n(&cts->step_tag, __ATOMIC_RELAXED);
-                if (step_tag != next_post_step_) {
-                    throw std::runtime_error(
-                        "rdma WriteCts CTS step_tag mismatch");
+                    ready == 1 ? __atomic_load_n(&cts->step_tag, __ATOMIC_RELAXED)
+                               : 0;
+                const bool cts_ready =
+                    ready == 1 && step_tag == next_post_step_;
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+                if (timeline_enabled_ && cts_ready && !send_cts_armed_) {
+                    send_cts_tp_ = SteadyClock::now();
+                    send_cts_armed_ = true;
+                    if (send_tail_armed_) {
+                        timeline_.record_event(
+                            RdmaProxyTimelineEvent::SendTailToCtsReady,
+                            timeline_ns_delta(send_tail_tp_, send_cts_tp_));
+                    }
+                }
+#endif
+                if (!cts_ready) {
+                    if (ready == 1 && step_tag != next_post_step_) {
+                        throw std::runtime_error(
+                            "rdma WriteCts CTS step_tag mismatch");
+                    }
+                    // Tail ready but CTS not yet — keep arm clocks across waits.
+                    break;
                 }
                 const std::uint64_t remote_addr =
                     __atomic_load_n(&cts->raddr, __ATOMIC_RELAXED);
@@ -419,6 +592,12 @@ void RdmaSendProxy::run_write_cts() noexcept {
 
                 posts_.fetch_add(1, std::memory_order_relaxed);
 
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+                // Q1: can_post (tail+CTS) true → post return, same iteration.
+                const SteadyTp t_ready =
+                    timeline_enabled_ ? SteadyClock::now() : SteadyTp{};
+#endif
+                bool signal = false;
                 ibv_sge sge{};
                 sge.length = payload_bytes;
                 sge.addr = reinterpret_cast<std::uintptr_t>(
@@ -426,7 +605,6 @@ void RdmaSendProxy::run_write_cts() noexcept {
                 sge.lkey = fifo_mr_->lkey;
 
                 const std::uint64_t post_step = next_post_step_;
-                const std::uint64_t tail = load_counter(control_.send_tail);
                 const bool more_pending = tail > post_step + step_inc;
                 bool next_zero_needs_head = false;
                 if (more_pending) {
@@ -435,10 +613,9 @@ void RdmaSendProxy::run_write_cts() noexcept {
                     next_zero_needs_head =
                         load_size(fifo_.slot_sizes + next_slot) == 0;
                 }
-                const bool signal =
-                    (inflight_ + 1 >= max_if) || !more_pending ||
-                    next_zero_needs_head ||
-                    ((post_step / step_inc) % kSignalEvery == 0);
+                signal = (inflight_ + 1 >= max_if) || !more_pending ||
+                         next_zero_needs_head ||
+                         ((post_step / step_inc) % kSignalEvery == 0);
 
                 ibv_send_wr wr{};
                 wr.wr_id = RdmaQp::slot_to_wr_id(post_step);
@@ -454,13 +631,55 @@ void RdmaSendProxy::run_write_cts() noexcept {
                 ibv_send_wr* bad = nullptr;
                 const int post_ret = ibv_post_send(qp_.qp(), &wr, &bad);
                 if (post_ret != 0) {
-                    throw std::runtime_error(std::string("ibv_post_send WRITE: ") +
-                                             std::strerror(post_ret));
+                    throw std::runtime_error(
+                        std::string("ibv_post_send WRITE: ") +
+                        std::strerror(post_ret));
                 }
                 // Clear ready immediately after a successful post. raddr/rkey
                 // were already snapshotted into the WR; waiting until CQE would
                 // race a next-round CTS that reuses the same slot index.
                 __atomic_store_n(&cts->ready, 0U, __ATOMIC_RELEASE);
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+                if (timeline_enabled_) {
+                    const SteadyTp post_done = SteadyClock::now();
+                    timeline_.record_event(
+                        RdmaProxyTimelineEvent::SendReadyToPost,
+                        timeline_ns_delta(t_ready, post_done));
+                    if (send_tail_armed_) {
+                        timeline_.record_event(
+                            RdmaProxyTimelineEvent::SendTailArmToPost,
+                            timeline_ns_delta(send_tail_tp_, post_done));
+                    }
+                    if (send_cts_armed_) {
+                        timeline_.record_event(
+                            RdmaProxyTimelineEvent::SendCtsArmToPost,
+                            timeline_ns_delta(send_cts_tp_, post_done));
+                    }
+                    send_tail_armed_ = false;
+                    send_cts_armed_ = false;
+                    if (last_data_post_valid_) {
+                        timeline_.record_event(
+                            RdmaProxyTimelineEvent::SendInterPost,
+                            timeline_ns_delta(last_data_post_tp_, post_done));
+                    }
+                    last_data_post_tp_ = post_done;
+                    last_data_post_valid_ = true;
+                    timeline_.inflight_at_post.record(
+                        static_cast<std::uint64_t>(inflight_));
+                    const std::uint64_t free_slots =
+                        (next_complete_step_ +
+                         static_cast<std::uint64_t>(fifo_.slot_count) - tail) /
+                        step_inc;
+                    timeline_.free_slots_at_post.record(free_slots);
+                    // Q3 signaled-only post→CQ attribution.
+                    if (signal && signaled_post_tp_ && signaled_post_valid_) {
+                        const std::size_t idx =
+                            timeline_flight_index(post_step, step_inc, max_if);
+                        signaled_post_tp_[idx] = post_done;
+                        signaled_post_valid_[idx] = true;
+                    }
+                }
+#endif
                 next_post_step_ += step_inc;
                 ++inflight_;
                 did_work = true;
@@ -485,6 +704,25 @@ void RdmaSendProxy::run_write_cts() noexcept {
                     throw std::runtime_error(
                         "rdma WriteCts send completion advances past inflight");
                 }
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+                // Q3 signaled-only: full interval attributed to the signaled WR.
+                if (timeline_enabled_ && signaled_post_tp_ &&
+                    signaled_post_valid_) {
+                    const std::size_t idx = timeline_flight_index(
+                        completed_through, step_inc, max_if);
+                    if (signaled_post_valid_[idx]) {
+                        const SteadyTp now = SteadyClock::now();
+                        timeline_.record_event(
+                            RdmaProxyTimelineEvent::SendPostToCq,
+                            timeline_ns_delta(signaled_post_tp_[idx], now));
+                        signaled_post_valid_[idx] = false;
+                    }
+                }
+                if (timeline_enabled_) {
+                    timeline_.inflight_at_cqe.record(
+                        static_cast<std::uint64_t>(inflight_));
+                }
+#endif
                 // ready already cleared at post; CQE only advances credit.
                 next_complete_step_ = completed_through + step_inc;
                 store_counter(control_.send_head, next_complete_step_);
@@ -563,16 +801,40 @@ RdmaRecvProxy::RdmaRecvProxy(RdmaQp qp, ibv_mr* fifo_mr, RdmaProxyFifo fifo,
     next_cts_step_ = tail;
     next_cts_complete_step_ = tail;
     step_.store(tail, std::memory_order_relaxed);
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+    timeline_enabled_ = rdma_proxy_timeline_env_enabled();
+#endif
 }
 
 RdmaRecvProxy::~RdmaRecvProxy() {
     stop();
     join();
+    dump_timeline_if_enabled();
     if (imm_scratch_mr_ != nullptr) {
         ibv_dereg_mr(imm_scratch_mr_);
         imm_scratch_mr_ = nullptr;
     }
 }
+
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+const char* RdmaRecvProxy::timeline_plane_label() const noexcept {
+    return plane_ == RdmaDataPlane::WriteCts ? "WriteCts" : "SendRecv";
+}
+
+void RdmaRecvProxy::dump_timeline_if_enabled() const {
+    if (!timeline_enabled_ || timeline_dumped_) {
+        return;
+    }
+    timeline_dumped_ = true;
+    // v2 per-event metrics only — lifetime stage spins poison interpretation.
+    const std::string text = timeline_.format_v2(
+        "recv", identity_.source_rank, identity_.destination_rank,
+        identity_.channel, timeline_plane_label());
+    if (!text.empty()) {
+        std::fprintf(stderr, "%s", text.c_str());
+    }
+}
+#endif
 
 bool RdmaRecvProxy::try_elide_zero_payload() {
     if (!elide_zero_payload_) return false;
@@ -704,6 +966,11 @@ void RdmaRecvProxy::pre_post_imm_recv(std::uint64_t step) {
 }
 
 void RdmaRecvProxy::post_cts(std::uint64_t step) {
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+    // Caller already verified credit; measure local CTS handle only.
+    const SteadyTp t_ready =
+        timeline_enabled_ ? SteadyClock::now() : SteadyTp{};
+#endif
     const std::size_t slot = step % cts_remote_.cts_slot_count;
     RdmaCtsSlot* shadow = cts_remote_.local_shadow + slot;
     shadow->raddr =
@@ -761,6 +1028,20 @@ void RdmaRecvProxy::post_cts(std::uint64_t step) {
         throw std::runtime_error(std::string("ibv_post_send CTS: ") +
                                  std::strerror(post_ret));
     }
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+    if (timeline_enabled_) {
+        const SteadyTp post_done = SteadyClock::now();
+        timeline_.record_event(RdmaProxyTimelineEvent::CtsReadyToPost,
+                               timeline_ns_delta(t_ready, post_done));
+        if (last_cts_post_valid_) {
+            timeline_.record_event(
+                RdmaProxyTimelineEvent::CtsInterPost,
+                timeline_ns_delta(last_cts_post_tp_, post_done));
+        }
+        last_cts_post_tp_ = post_done;
+        last_cts_post_valid_ = true;
+    }
+#endif
 }
 
 void RdmaRecvProxy::run() noexcept {
@@ -809,16 +1090,37 @@ void RdmaRecvProxy::run_send_recv() noexcept {
                     throw std::runtime_error(
                         "rdma recv completion has unexpected FIFO slot");
                 }
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+                // Q4: CQE seen → after recv_tail store (local publish handle).
+                const SteadyTp t_cq =
+                    timeline_enabled_ ? SteadyClock::now() : SteadyTp{};
+#endif
                 store_size(fifo_.slot_sizes + slot, wcs[i].byte_len);
                 store_counter(control_.recv_tail,
                               next_complete_step_ + fifo_.step_increment);
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+                if (timeline_enabled_) {
+                    const SteadyTp t_pub = SteadyClock::now();
+                    timeline_.record_event(
+                        RdmaProxyTimelineEvent::RecvCqToPublish,
+                        timeline_ns_delta(t_cq, t_pub));
+                    // Q5: previous publish → this publish.
+                    if (last_publish_valid_) {
+                        timeline_.record_event(
+                            RdmaProxyTimelineEvent::RecvInterPublish,
+                            timeline_ns_delta(last_publish_tp_, t_pub));
+                    }
+                    last_publish_tp_ = t_pub;
+                    last_publish_valid_ = true;
+                }
+#endif
                 next_complete_step_ += fifo_.step_increment;
                 step_.store(next_complete_step_, std::memory_order_release);
                 --inflight_;
                 did_work = true;
             }
             if (!did_work) {
-                std::this_thread::yield();
+                _mm_pause();
             }
         }
     } catch (const std::exception& error) {
@@ -910,9 +1212,29 @@ void RdmaRecvProxy::run_write_cts() noexcept {
                     throw std::runtime_error(
                         "rdma WriteCts IMM payload exceeds FIFO capacity");
                 }
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+                // Q4: CQE seen → after recv_tail store.
+                const SteadyTp t_cq =
+                    timeline_enabled_ ? SteadyClock::now() : SteadyTp{};
+#endif
                 store_size(fifo_.slot_sizes + slot, payload);
                 store_counter(control_.recv_tail,
                               next_complete_step_ + step_inc);
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+                if (timeline_enabled_) {
+                    const SteadyTp t_pub = SteadyClock::now();
+                    timeline_.record_event(
+                        RdmaProxyTimelineEvent::RecvCqToPublish,
+                        timeline_ns_delta(t_cq, t_pub));
+                    if (last_publish_valid_) {
+                        timeline_.record_event(
+                            RdmaProxyTimelineEvent::RecvInterPublish,
+                            timeline_ns_delta(last_publish_tp_, t_pub));
+                    }
+                    last_publish_tp_ = t_pub;
+                    last_publish_valid_ = true;
+                }
+#endif
                 next_complete_step_ += step_inc;
                 step_.store(next_complete_step_, std::memory_order_release);
                 --inflight_;

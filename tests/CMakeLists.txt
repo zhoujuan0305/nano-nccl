@@ -14,6 +14,21 @@ target_link_libraries(nano_nccl_p2p_topology PRIVATE nano_nccl)
 add_executable(nano_nccl_simple_protocol simple_protocol.cu)
 target_link_libraries(nano_nccl_simple_protocol PRIVATE nano_nccl)
 
+if(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+    add_executable(nano_nccl_rdma_proxy_timeline rdma_proxy_timeline_test.cc)
+    target_link_libraries(nano_nccl_rdma_proxy_timeline PRIVATE nano_nccl)
+    target_compile_definitions(nano_nccl_rdma_proxy_timeline PRIVATE
+        NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE=1)
+    add_executable(nano_nccl_ring_turnaround ring_turnaround_test.cc)
+    target_link_libraries(nano_nccl_ring_turnaround PRIVATE nano_nccl)
+    target_compile_definitions(nano_nccl_ring_turnaround PRIVATE
+        NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE=1)
+    if(BUILD_TESTING)
+        add_test(NAME nano_nccl_rdma_proxy_timeline COMMAND nano_nccl_rdma_proxy_timeline)
+        add_test(NAME nano_nccl_ring_turnaround COMMAND nano_nccl_ring_turnaround)
+    endif()
+endif()
+
 if(BUILD_TESTING)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     add_test(

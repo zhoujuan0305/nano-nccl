@@ -24,6 +24,8 @@ option(NANO_NCCL_ENABLE_MPI "Build the optional MPI communicator bootstrap adapt
 option(NANO_NCCL_SOCKET_TEST_FAULT_INJECTION
        "Build a test-only MPI socket fault-injection library" OFF)
 option(NANO_NCCL_ENABLE_BENCH_PROFILING "Enable NVTX and CUDA profiler instrumentation in the all-reduce benchmark" OFF)
+option(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE
+       "Enable host RDMA proxy hot-path stage timeline counters" OFF)
 option(NANO_NCCL_ENABLE_RDMA "Build the optional RDMA (RC send/recv) transport" OFF)
 
 if(NANO_NCCL_SOCKET_TEST_FAULT_INJECTION AND NOT NANO_NCCL_ENABLE_MPI)

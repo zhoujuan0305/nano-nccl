@@ -185,6 +185,7 @@ For MPI/socket launches, set `NANO_NCCL_SOCKET_IFNAME` to an interface with exac
 - `kSimpleFifoSliceSteps = 2` (two slices per chunk), matching the active Simple protocol constants.
 - Wait cache (`send_head_cache`/`recv_tail_cache`) matches NCCL `connStepCache`, avoiding reloading step counter from host memory on every wait.
 - Optional benchmark profiling is guarded by `NANO_NCCL_ENABLE_BENCH_PROFILING`; when `OFF`, the default performance path compiles no NVTX or CUDA profiler calls and has no iteration-time profiling condition. When `ON`, every size starts capture after warmup, creates an outer `all_reduce size=<bytes>B` range plus `all_reduce size=<bytes>B iteration=<iteration>` per-iteration ranges, synchronizes, stops capture, then validates. CUDA 12.8 warns that NVTX 2 `<nvToolsExt.h>` is deprecated; the supported range API remains in use.
+- Optional `NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE` (default `OFF`) can record per-event RDMA host-proxy metrics including tail-vs-CTS arm times and inter-post spacing; investigation-only, not for production perf claims.
 
 ## Build
 

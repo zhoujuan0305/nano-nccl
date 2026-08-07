@@ -11,6 +11,10 @@
 #include "transport/p2p/p2p_step_counters.h"
 #include "transport/p2p/p2p_topology.h"
 #include "transport/shm/shm_fifo.h"
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+#include "collective/all_reduce/ring_turnaround.h"
+#include "transport/rdma/rdma_proxy_timeline.h"
+#endif
 #if defined(NANO_NCCL_ENABLE_RDMA)
 #include "transport/rdma/rdma_endpoint.h"
 #include "transport/rdma/rdma_proxy.h"
@@ -160,6 +164,7 @@ public:
         fallback_streams_.resize(devices_.size());
         completion_recorded_.resize(devices_.size());
         fallback_in_flight_.resize(devices_.size());
+        maybe_enable_ring_turnaround();
     }
 
     Impl(const CommunicatorConfig& config,
@@ -183,6 +188,7 @@ public:
         fallback_streams_.resize(devices_.size());
         completion_recorded_.resize(devices_.size());
         fallback_in_flight_.resize(devices_.size());
+        maybe_enable_ring_turnaround();
         setup_socket_transport();
 #if defined(NANO_NCCL_ENABLE_RDMA)
         setup_rdma_transport();
@@ -212,7 +218,10 @@ public:
         for (const auto& proxy : rdma_recv_proxies_) proxy->shutdown();
         for (const auto& proxy : rdma_send_proxies_) proxy->join();
         for (const auto& proxy : rdma_recv_proxies_) proxy->join();
+        for (const auto& proxy : rdma_send_proxies_) proxy->dump_timeline_if_enabled();
+        for (const auto& proxy : rdma_recv_proxies_) proxy->dump_timeline_if_enabled();
 #endif
+        dump_ring_turnaround_if_enabled();
     }
 
     void all_reduce(const CollectiveArgs& args) {
@@ -976,6 +985,20 @@ private:
 #endif
             kernel_args.control.base_steps = p2p_control.base_steps != nullptr
                 ? p2p_control.base_steps : shm_control.base_steps;
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+            if (turnaround_enabled_ && turnaround_stats_ != nullptr) {
+                auto* base = reinterpret_cast<collective::all_reduce::RingTurnaroundStats*>(
+                    turnaround_stats_->device_ptr(devices_[rank]));
+                for (int channel = 0; channel < kChannels; ++channel) {
+                    kernel_args.turnaround[channel] =
+                        base + static_cast<std::size_t>(rank) * kChannels + channel;
+                }
+            } else {
+                for (int channel = 0; channel < kChannels; ++channel) {
+                    kernel_args.turnaround[channel] = nullptr;
+                }
+            }
+#endif
 
             CUDA_CHECK_THROW(cudaSetDevice(devices_[rank]));
             ring_simple_kernel<T, kRedOp>
@@ -1031,6 +1054,40 @@ private:
                 completion_events_[rank] = nullptr;
             }
         }
+    }
+
+    void maybe_enable_ring_turnaround() {
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+        if (!transport::rdma::rdma_proxy_timeline_env_enabled()) {
+            return;
+        }
+        const std::size_t n =
+            static_cast<std::size_t>(local_rank_count()) * kChannels *
+            sizeof(collective::all_reduce::RingTurnaroundStats);
+        turnaround_stats_ =
+            std::make_unique<MappedBuffer<std::uint8_t>>(n, -1, devices_);
+        std::memset(turnaround_stats_->host_ptr(), 0, n);
+        turnaround_enabled_ = true;
+#endif
+    }
+
+    void dump_ring_turnaround_if_enabled() const {
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+        if (!turnaround_enabled_ || turnaround_stats_ == nullptr) {
+            return;
+        }
+        auto* host = reinterpret_cast<const collective::all_reduce::RingTurnaroundStats*>(
+            turnaround_stats_->host_ptr());
+        for (int rank = 0; rank < local_rank_count(); ++rank) {
+            for (int channel = 0; channel < kChannels; ++channel) {
+                const auto& stats =
+                    host[static_cast<std::size_t>(rank) * kChannels + channel];
+                const std::string text =
+                    collective::all_reduce::format_ring_turnaround(stats, rank, channel);
+                std::fputs(text.c_str(), stderr);
+            }
+        }
+#endif
     }
 
     void ensure_bf16_devices_validated() {
@@ -1126,6 +1183,10 @@ private:
     std::vector<cudaStream_t> fallback_streams_;
     std::vector<bool> completion_recorded_;
     std::vector<bool> fallback_in_flight_;
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+    std::unique_ptr<MappedBuffer<std::uint8_t>> turnaround_stats_;
+    bool turnaround_enabled_ = false;
+#endif
     bool bf16_devices_validated_ = false;
     bool control_initialized_ = false;
     bool has_launch_ = false;
