@@ -158,8 +158,10 @@ directions and fails on the first unavailable direction; it does not fall back.
 P2P is single-node only and is not a network transport.
 
 `rdma` requires `NANO_NCCL_ENABLE_MPI=ON` and `NANO_NCCL_ENABLE_RDMA=ON` at
-build time. It resolves cross-process ring edges to RDMA and keeps local edges
-as SHM. The default data plane is RC SEND/RECV; `NANO_NCCL_RDMA_USE_WRITE=1`
+build time. It resolves cross-process ring edges to RDMA and resolves local
+edges like `auto` (P2P when bidirectional NVLink peer access is available,
+otherwise SHM). Aggregate transport is still `mixed` when local and RDMA edges
+coexist. The default data plane is RC SEND/RECV; `NANO_NCCL_RDMA_USE_WRITE=1`
 enables WRITE+CTS (RC `WRITE_WITH_IMM` plus a host-pinned CTS slot ring). Both
 planes use registered host-pinned FIFO memory only — no GPUDirect RDMA; fair
 NCCL comparisons use `NCCL_NET_GDR_LEVEL=0`. The host proxy multi-flights WQEs

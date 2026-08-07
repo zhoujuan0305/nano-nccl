@@ -181,6 +181,10 @@ std::unique_ptr<Communicator> create_communicator_from_mpi(
         }
     } else if (config.transport == TransportKind::Rdma) {
 #if defined(NANO_NCCL_ENABLE_RDMA)
+        // Match NCCL local edge selection: upgrade NVLink pairs to P2P, keep
+        // SYS-local edges on SHM, then promote only cross-process edges to RDMA.
+        topology.edge_kinds = transport::p2p::resolve_ring_transport(
+            TransportKind::Auto, topology).edge_kinds();
         for (int edge = 0; edge < global_count; ++edge) {
             if (topology.edge_kinds[edge] == TransportKind::Socket) {
                 topology.edge_kinds[edge] = TransportKind::Rdma;

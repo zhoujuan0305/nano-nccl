@@ -104,11 +104,11 @@ Set `NANO_NCCL_SOCKET_IFNAME=<interface>` and
 `NANO_NCCL_RDMA_IFNAME=<rdma-interface>` in every MPI process. Set
 `NANO_NCCL_RDMA_GID_INDEX=<gid-index>` when the default GID entry is not
 routable. Use `--transport rdma`; cross-process ring edges use RDMA and local
-edges retain their local transport, so the reported aggregate transport is
-normally `mixed`. For fair NCCL comparisons use `NCCL_NET_GDR_LEVEL=0` (same
-host-pin class). Bind Open MPI TCP/OOB to the bootstrap interface
-(`btl_tcp_if_include` / `oob_tcp_if_include`) so MPI does not pick a
-non-routable NIC.
+edges resolve like `auto` (P2P when bidirectional NVLink peer access is
+available, otherwise SHM), so the reported aggregate transport is normally
+`mixed`. For fair NCCL comparisons use `NCCL_NET_GDR_LEVEL=0` (same host-pin
+class). Bind Open MPI TCP/OOB to the bootstrap interface (`btl_tcp_if_include` /
+`oob_tcp_if_include`) so MPI does not pick a non-routable NIC.
 
 For a two-host, four-GPU-per-host correctness launch:
 

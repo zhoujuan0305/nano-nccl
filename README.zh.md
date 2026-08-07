@@ -99,10 +99,11 @@ cmake --build build-rdma -j$(nproc)
 每个 MPI process 都要设置 `NANO_NCCL_SOCKET_IFNAME=<interface>` 与
 `NANO_NCCL_RDMA_IFNAME=<rdma-interface>`。默认 GID 不可路由时，设置
 `NANO_NCCL_RDMA_GID_INDEX=<gid-index>`。使用 `--transport rdma`；跨进程 ring edge
-使用 RDMA，本机 edge 保留本地通信路径，因此聚合 transport 通常显示为 `mixed`。
-与 NCCL 公平对比时使用 `NCCL_NET_GDR_LEVEL=0`（同属 host-pin）。请将 Open MPI
-的 TCP/OOB 绑定到 bootstrap 网卡（`btl_tcp_if_include` / `oob_tcp_if_include`），
-避免选到不可路由网卡。
+使用 RDMA，本机 edge 按 `auto` 解析（双向 NVLink peer access 时用 P2P，否则
+SHM），因此聚合 transport 通常显示为 `mixed`。与 NCCL 公平对比时使用
+`NCCL_NET_GDR_LEVEL=0`（同属 host-pin）。请将 Open MPI 的 TCP/OOB 绑定到
+bootstrap 网卡（`btl_tcp_if_include` / `oob_tcp_if_include`），避免选到不可路由
+网卡。
 
 两机、每机四张 GPU 的正确性启动示例：
 
