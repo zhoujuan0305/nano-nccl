@@ -3,6 +3,9 @@
 #include "nano_nccl/traits.h"
 #include "transport/shm/shm_fifo.h"
 #include "transport/shm/shm_step.h"
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+#include "collective/all_reduce/ring_turnaround.h"
+#endif
 
 #include <cstddef>
 #include <cstdint>
@@ -526,6 +529,108 @@ __device__ inline bool wait_recv_ready(
     return *wait_status != 0;
 }
 
+// Overlap recv-ready and send-credit spins: sequential wait_* each barrier the
+// whole block twice, serializing the two independent polls on RECV_BOUND paths.
+template <typename T>
+__device__ inline bool wait_recv_ready_and_send_credit(
+    transport::SimpleChannelArgs<T> args, std::uint64_t recv_step,
+    std::uint64_t send_step, std::uint64_t* recv_tail_cache,
+    std::uint64_t* send_head_cache, int* wait_status) {
+    std::uint64_t* tail = args.recv_tail;
+    std::uint64_t* head = args.send_head;
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+    __shared__ unsigned long long s_t_enter;
+#endif
+    if (threadIdx.x == 0) {
+        *wait_status = 1;
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+        if (args.turnaround != nullptr) {
+            unsigned long long t_enter;
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_enter));
+            s_t_enter = t_enter;
+        }
+#endif
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+        unsigned long long t_recv0 = 0;
+        if (args.turnaround != nullptr) {
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_recv0));
+        }
+#endif
+        if (args.abort != nullptr && transport::shm::load_abort(args.abort) != 0) {
+            *wait_status = 0;
+        }
+        if (*recv_tail_cache < recv_step + transport::shm::kSimpleFifoSliceSteps &&
+            *wait_status != 0 && args.wait_observer != nullptr) {
+            *args.wait_observer = 1;
+            __threadfence_system();
+        }
+        while (*recv_tail_cache <
+                   recv_step + transport::shm::kSimpleFifoSliceSteps &&
+               *wait_status != 0) {
+            if (args.abort != nullptr &&
+                transport::shm::load_abort(args.abort) != 0) {
+                *wait_status = 0;
+                break;
+            }
+            *recv_tail_cache = transport::shm::load_step(tail);
+        }
+        if (*wait_status != 0) *wait_status = 1;
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+        if (args.turnaround != nullptr) {
+            unsigned long long t_recv1;
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_recv1));
+            atomicAdd(&args.turnaround->wait_recv_ns, t_recv1 - t_recv0);
+        }
+#endif
+    } else if (threadIdx.x == 1) {
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+        unsigned long long t_send0 = 0;
+        if (args.turnaround != nullptr) {
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_send0));
+        }
+#endif
+        if (args.abort != nullptr && transport::shm::load_abort(args.abort) != 0) {
+            *wait_status = 0;
+        }
+        if (*send_head_cache + transport::shm::kSimpleFifoSteps <
+                send_step + transport::shm::kSimpleFifoSliceSteps &&
+            *wait_status != 0 && args.wait_observer != nullptr) {
+            *args.wait_observer = 1;
+            __threadfence_system();
+        }
+        while (*send_head_cache + transport::shm::kSimpleFifoSteps <
+                   send_step + transport::shm::kSimpleFifoSliceSteps &&
+               *wait_status != 0) {
+            if (args.abort != nullptr &&
+                transport::shm::load_abort(args.abort) != 0) {
+                *wait_status = 0;
+                break;
+            }
+            *send_head_cache = transport::shm::load_step(head);
+        }
+        if (*wait_status != 0) *wait_status = 1;
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+        if (args.turnaround != nullptr) {
+            unsigned long long t_send1;
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_send1));
+            atomicAdd(&args.turnaround->wait_send_ns, t_send1 - t_send0);
+        }
+#endif
+    }
+    __syncthreads();
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+    if (args.turnaround != nullptr && threadIdx.x == 0) {
+        unsigned long long t_end;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_end));
+        atomicAdd(&args.turnaround->wait_wall_ns, t_end - s_t_enter);
+    }
+#endif
+    return *wait_status != 0;
+}
+
 __device__ inline void worker_barrier(int nworkers) {
     if (threadIdx.x < nworkers) {
         asm volatile("bar.sync 1, %0;" : : "r"(nworkers));
@@ -537,13 +642,19 @@ __device__ inline void post_send_ready(
     transport::SimpleChannelArgs<T> args, std::uint64_t step,
     std::size_t payload_bytes, bool data_stored, int nworkers) {
     std::uint64_t* tail = args.send_tail;
-    // All FIFO writers must make stores system-visible before the publisher
-    // advances send_tail; host RDMA/socket proxies sample that counter.
-    if (data_stored && threadIdx.x < nworkers) {
-        __threadfence_system();
-    }
+    // Workers wrote FIFO before entry. Full-block sync (publisher is
+    // blockDim-1, outside nworkers) then a single publisher system fence
+    // orders FIFO + payload_bytes before send_tail for host RDMA/socket
+    // proxies — no per-worker __threadfence_system.
+    (void)nworkers;
     __syncthreads();
     if (threadIdx.x == blockDim.x - 1) {
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+        unsigned long long t_post0 = 0;
+        if (args.turnaround != nullptr) {
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_post0));
+        }
+#endif
         if (args.send_payload_bytes != nullptr) {
             args.send_payload_bytes[step % transport::shm::kSimpleFifoSteps] =
                 static_cast<std::uint32_t>(payload_bytes);
@@ -552,6 +663,13 @@ __device__ inline void post_send_ready(
             __threadfence_system();
         }
         transport::shm::store_step(tail, step + transport::shm::kSimpleFifoSliceSteps);
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+        if (args.turnaround != nullptr) {
+            unsigned long long t_post1;
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_post1));
+            atomicAdd(&args.turnaround->post_ns, t_post1 - t_post0);
+        }
+#endif
     }
 }
 
@@ -621,10 +739,16 @@ __device__ inline bool recv_reduce_send(
             slice_offset += slice_size;
             continue;
         }
-        if (!wait_recv_ready<T>(args, *recv_step, recv_tail_cache,
-                                        wait_status)) return false;
-        if (!wait_send_credit<T>(args, *send_step, send_head_cache,
-                                         wait_status)) return false;
+        if (!wait_recv_ready_and_send_credit<T>(
+                args, *recv_step, *send_step, recv_tail_cache, send_head_cache,
+                wait_status))
+            return false;
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+        unsigned long long t_comp0 = 0;
+        if (args.turnaround != nullptr && threadIdx.x == 0) {
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_comp0));
+        }
+#endif
         worker_barrier(nworkers);
         const T* recv = args.recv_fifo +
                             ((*recv_step % transport::shm::kSimpleFifoSteps) *
@@ -635,6 +759,14 @@ __device__ inline bool recv_reduce_send(
         reduce_volatile_worker<T, kRedOp>(local + slice_offset, recv, dst, work,
                                           nworkers);
         __syncthreads();
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+        if (args.turnaround != nullptr && threadIdx.x == 0) {
+            unsigned long long t_comp1;
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_comp1));
+            atomicAdd(&args.turnaround->compute_ns, t_comp1 - t_comp0);
+            atomicAdd(&args.turnaround->count, 1ULL);
+        }
+#endif
         post_recv_credit<T>(args, *recv_step);
         post_send_ready<T>(args, *send_step, work * sizeof(T), true, nworkers);
         *recv_step += transport::shm::kSimpleFifoSliceSteps;
@@ -664,10 +796,16 @@ __device__ inline bool recv_reduce_copy_send(
             slice_offset += slice_size;
             continue;
         }
-        if (!wait_recv_ready<T>(args, *recv_step, recv_tail_cache,
-                                        wait_status)) return false;
-        if (!wait_send_credit<T>(args, *send_step, send_head_cache,
-                                         wait_status)) return false;
+        if (!wait_recv_ready_and_send_credit<T>(
+                args, *recv_step, *send_step, recv_tail_cache, send_head_cache,
+                wait_status))
+            return false;
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+        unsigned long long t_comp0 = 0;
+        if (args.turnaround != nullptr && threadIdx.x == 0) {
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_comp0));
+        }
+#endif
         worker_barrier(nworkers);
         const T* recv = args.recv_fifo +
                             ((*recv_step % transport::shm::kSimpleFifoSteps) *
@@ -679,6 +817,14 @@ __device__ inline bool recv_reduce_copy_send(
             local + slice_offset, recv, out + slice_offset, dst, work,
             inverse_nranks, nworkers);
         __syncthreads();
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+        if (args.turnaround != nullptr && threadIdx.x == 0) {
+            unsigned long long t_comp1;
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_comp1));
+            atomicAdd(&args.turnaround->compute_ns, t_comp1 - t_comp0);
+            atomicAdd(&args.turnaround->count, 1ULL);
+        }
+#endif
         post_recv_credit<T>(args, *recv_step);
         post_send_ready<T>(args, *send_step, work * sizeof(T), true, nworkers);
         *recv_step += transport::shm::kSimpleFifoSliceSteps;
@@ -708,10 +854,16 @@ __device__ inline bool recv_copy_send(
             slice_offset += slice_size;
             continue;
         }
-        if (!wait_recv_ready<T>(args, *recv_step, recv_tail_cache,
-                                        wait_status)) return false;
-        if (!wait_send_credit<T>(args, *send_step, send_head_cache,
-                                         wait_status)) return false;
+        if (!wait_recv_ready_and_send_credit<T>(
+                args, *recv_step, *send_step, recv_tail_cache, send_head_cache,
+                wait_status))
+            return false;
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+        unsigned long long t_comp0 = 0;
+        if (args.turnaround != nullptr && threadIdx.x == 0) {
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_comp0));
+        }
+#endif
         worker_barrier(nworkers);
         const T* recv = args.recv_fifo +
                             ((*recv_step % transport::shm::kSimpleFifoSteps) *
@@ -722,6 +874,14 @@ __device__ inline bool recv_copy_send(
         copy_broadcast_volatile_worker<T, kRedOp>(
             recv, out + slice_offset, dst, work, nworkers);
         __syncthreads();
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+        if (args.turnaround != nullptr && threadIdx.x == 0) {
+            unsigned long long t_comp1;
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_comp1));
+            atomicAdd(&args.turnaround->compute_ns, t_comp1 - t_comp0);
+            atomicAdd(&args.turnaround->count, 1ULL);
+        }
+#endif
         post_recv_credit<T>(args, *recv_step);
         post_send_ready<T>(args, *send_step, work * sizeof(T), true, nworkers);
         *recv_step += transport::shm::kSimpleFifoSliceSteps;
@@ -789,6 +949,9 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
         args.recv_payload_bytes[channel],
         args.abort,
         nullptr,
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+        args.turnaround[channel],
+#endif
     };
     int nworkers = blockDim.x >= 3 * 32 ? blockDim.x - 32 : blockDim.x;
     std::size_t part_offset = 0;

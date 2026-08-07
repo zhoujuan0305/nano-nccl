@@ -5,6 +5,12 @@
 #include <cstddef>
 #include <cstdint>
 
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+namespace nano_nccl::collective::all_reduce {
+struct RingTurnaroundStats;
+}
+#endif
+
 namespace nano_nccl::transport {
 
 // FIFO 布局常量，对齐 NCCL Simple 协议：
@@ -44,6 +50,9 @@ struct SimpleFifoArgs {
     const std::uint32_t* recv_payload_bytes[kChannels];
     const std::uint32_t* abort;
     SimpleControlArgs control;
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+    collective::all_reduce::RingTurnaroundStats* turnaround[kChannels];
+#endif
 };
 
 template <typename T>
@@ -60,6 +69,9 @@ struct SimpleChannelArgs {
     const std::uint32_t* recv_payload_bytes;
     const std::uint32_t* abort;
     std::uint32_t* wait_observer;
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+    collective::all_reduce::RingTurnaroundStats* turnaround;
+#endif
 };
 
 }  // namespace nano_nccl::transport

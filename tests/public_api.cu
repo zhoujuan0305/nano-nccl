@@ -387,6 +387,31 @@ __global__ void abort_after_recv_wait_starts(
     if (threadIdx.x == 0) result[0] = ready ? 0 : 1;
 }
 
+__global__ void abort_after_dual_wait_starts(
+    nano_nccl::transport::SimpleChannelArgs<float> args, int* result) {
+    std::uint64_t recv_cache = 0;
+    std::uint64_t send_cache = 0;
+    __shared__ int wait_status;
+    // recv_step=0 needs tail advance; send_step=8 needs head credit.
+    bool ready = nano_nccl::kernels::wait_recv_ready_and_send_credit<float>(
+        args, 0, 8, &recv_cache, &send_cache, &wait_status);
+    if (threadIdx.x == 0) result[0] = ready ? 0 : 1;
+}
+
+__global__ void dual_wait_both_ready(
+    nano_nccl::transport::SimpleChannelArgs<float> args, int* result) {
+    std::uint64_t recv_cache = 0;
+    std::uint64_t send_cache = 0;
+    __shared__ int wait_status;
+    bool ready = nano_nccl::kernels::wait_recv_ready_and_send_credit<float>(
+        args, 0, 0, &recv_cache, &send_cache, &wait_status);
+    if (threadIdx.x == 0) {
+        result[0] = ready ? 1 : 0;
+        result[1] = static_cast<int>(recv_cache);
+        result[2] = static_cast<int>(send_cache);
+    }
+}
+
 __global__ void publish_socket_slice(
     nano_nccl::transport::SimpleChannelArgs<float> args, const float* input) {
     std::uint64_t step = 0;
@@ -411,7 +436,7 @@ bool run_socket_abort_test() {
     started.reset(1, -1, {kDevice});
     int* result = nullptr;
     if (cudaSetDevice(kDevice) != cudaSuccess ||
-        cudaMalloc(&result, sizeof(int)) != cudaSuccess) {
+        cudaMalloc(&result, 3 * sizeof(int)) != cudaSuccess) {
         return false;
     }
     SimpleChannelArgs<float> args{
@@ -445,6 +470,34 @@ bool run_socket_abort_test() {
              cudaMemcpy(&aborted, result, sizeof(aborted), cudaMemcpyDeviceToHost) ==
                  cudaSuccess &&
              aborted == 1 && recv_observed;
+    }
+    if (ok) {
+        __atomic_store_n(abort.host_ptr(), 0U, __ATOMIC_RELEASE);
+        __atomic_store_n(started.host_ptr(), 0U, __ATOMIC_RELEASE);
+        abort_after_dual_wait_starts<<<1, 32>>>(args, result);
+        for (int spin = 0; spin < 1000000 &&
+             __atomic_load_n(started.host_ptr(), __ATOMIC_ACQUIRE) == 0; ++spin) {}
+        const bool dual_observed =
+            __atomic_load_n(started.host_ptr(), __ATOMIC_ACQUIRE) != 0;
+        __atomic_store_n(abort.host_ptr(), 1U, __ATOMIC_RELEASE);
+        aborted = 0;
+        ok = cudaGetLastError() == cudaSuccess &&
+             cudaMemcpy(&aborted, result, sizeof(aborted), cudaMemcpyDeviceToHost) ==
+                 cudaSuccess &&
+             aborted == 1 && dual_observed;
+    }
+    if (ok) {
+        // recv_tail must cover slice steps; send step 0 already has credit at head=0.
+        counters.host_ptr()[1] = nano_nccl::transport::kSimpleFifoSliceSteps;
+        __atomic_store_n(abort.host_ptr(), 0U, __ATOMIC_RELEASE);
+        int dual_ready[3] = {};
+        dual_wait_both_ready<<<1, 32>>>(args, result);
+        ok = cudaGetLastError() == cudaSuccess &&
+             cudaMemcpy(dual_ready, result, sizeof(dual_ready),
+                        cudaMemcpyDeviceToHost) == cudaSuccess &&
+             dual_ready[0] == 1 &&
+             dual_ready[1] >=
+                 static_cast<int>(nano_nccl::transport::kSimpleFifoSliceSteps);
     }
     cudaFree(result);
     std::puts(ok ? "socket_abort=PASS" : "socket_abort=FAIL");
