@@ -83,11 +83,12 @@ send/receive；host proxy 按 Simple FIFO slice 深度 multi-flight 提交 SEND/
 `NANO_NCCL_RDMA_USE_WRITE=1` 可选用 WRITE+CTS 数据面（RC `WRITE_WITH_IMM` +
 host-pinned CTS slot ring）；未设置/`0` 保持 SEND/RECV。两种数据面均为 host-pin，
   不使用 GPUDirect RDMA；与 NCCL 对比时请设 `NCCL_NET_GDR_LEVEL=0`。SEND 与
-  WriteCts 始终从已注册的 mapped FIFO（`fifo_mr_`）直接 post SGE。正确性依赖：
-  所有 FIFO writer 在发布 `send_tail` 前执行 `__threadfence_system`，以及
+  WriteCts 始终从已注册的 mapped FIFO（`fifo_mr_`）直接 post SGE。worker 写完后
+  由 publisher 单次 `__threadfence_system` 再发布 `send_tail`，并配合
   system-scope release/acquire step counter（无 host bounce 路径）。双机 WRITE
-  矩阵（float/fp16/bf16 × sum/avg/max/min，256 KiB–64 MiB）已验证 `#wrong=0`。
-  MPI binding 使用 MPI C API，因此 Open MPI 不需要提供已废弃的 C++ binding library。
+  矩阵（float/fp16/bf16 × sum/avg/max/min，256 KiB–64 MiB）已刷新于
+  [performance.md](performance.md)，`#wrong=0`。MPI binding 使用 MPI C API，
+  因此 Open MPI 不需要提供已废弃的 C++ binding library。
 
 ```bash
 cmake -S . -B build-rdma -DCMAKE_BUILD_TYPE=Release \
@@ -243,12 +244,15 @@ unsupported-operation 错误。
 - `p2p` 要求每条 ring edge 都具备所需的双向 peer access。任一方向不可用时，初始化会在第一个不可用方向报错，不会回退。
 - `rdma` 需要 `NANO_NCCL_ENABLE_MPI=ON` 与 `NANO_NCCL_ENABLE_RDMA=ON`。它为跨进程
   ring edge 使用 multi-flight RC RDMA（深度不超过 Simple FIFO slice，selective CQ
-  signal，空 slice 跳过网络），本机 edge 保持 SHM/P2P。默认数据面为 SEND/RECV；
-  `NANO_NCCL_RDMA_USE_WRITE=1` 选用 WRITE+CTS（仍为 host-pin；与 NCCL 公平对比请用
-  `NCCL_NET_GDR_LEVEL=0`）。双机须同一 commit（64 字节 `RdmaPeerInfo`）。
-  SEND/WriteCts 始终从已注册 mapped FIFO 直接 post；正确性依赖 all-worker
-  `__threadfence_system`（在 `send_tail` 前）与 system release/acquire step
-  （无 host bounce）。双机 WRITE 矩阵 `#wrong=0`。
+  signal，空 slice 跳过网络），本机 edge 按 `auto` 解析（双向 NVLink peer access
+  时用 P2P，否则 SHM）。默认数据面为 SEND/RECV；`NANO_NCCL_RDMA_USE_WRITE=1`
+  选用 WRITE+CTS（仍为 host-pin；与 NCCL 公平对比请用 `NCCL_NET_GDR_LEVEL=0`）。
+  双机须同一 commit（64 字节 `RdmaPeerInfo`）。SEND/WriteCts 从已注册 mapped
+  FIFO 直接 post；worker 写完后由 publisher 单次 `__threadfence_system` 再推进
+  `send_tail`（配合 system release/acquire step，无 host bounce）。小 Simple
+  slice 可在消费完 recv FIFO 后立刻 `post_recv_credit`。双机 WRITE 矩阵
+  （float/fp16/bf16 × sum/avg/max/min，256 KiB–64 MiB）已刷新于
+  [performance.md](performance.md)，`#wrong=0`。
 
 P2P 是单机通信路径，需要每对完整配置环邻居之间的双向 CUDA peer access；它不是多机或网络通信路径。socket 使用可信、仅 IPv4 的 TCP 网络边界，不提供 TLS 或自动重连。
 

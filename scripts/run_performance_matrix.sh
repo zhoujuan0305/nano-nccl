@@ -58,13 +58,16 @@ command -v python3 >/dev/null || die "python3 required"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export PATH="${PATH}"
+# Prefer the Open MPI 4.1.2 prefix used for dual-host builds. ~/.local/openmpi can
+# shadow it with an incompatible libevent and break mpirun symbol lookup.
 MPI_LIB_HINT=""
-if [[ -d "${HOME}/.local/openmpi/lib" ]]; then
-    MPI_LIB_HINT="${HOME}/.local/openmpi/lib"
-elif [[ -d "${HOME}/opt/openmpi-4.1.2/lib" ]]; then
+if [[ -d "${HOME}/opt/openmpi-4.1.2/lib" ]]; then
     MPI_LIB_HINT="${HOME}/opt/openmpi-4.1.2/lib"
+elif [[ -d "${HOME}/.local/openmpi/lib" ]]; then
+    MPI_LIB_HINT="${HOME}/.local/openmpi/lib"
 fi
-export LD_LIBRARY_PATH="${NCCL_LIB}:${MPI_LIB_HINT:+$MPI_LIB_HINT:}/usr/local/cuda-12.8/lib64:${LD_LIBRARY_PATH:-}"
+# MPI libs before NCCL so mpirun resolves against the intended Open MPI build.
+export LD_LIBRARY_PATH="${MPI_LIB_HINT:+$MPI_LIB_HINT:}${NCCL_LIB}:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 mkdir -p "${OUT_DIR}/logs"
 RAW_JSONL="${OUT_DIR}/cells.jsonl"
