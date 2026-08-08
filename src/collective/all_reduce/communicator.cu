@@ -213,12 +213,19 @@ public:
         for (const auto& proxy : socket_send_proxies_) proxy->join();
         for (const auto& proxy : socket_recv_proxies_) proxy->join();
 #if defined(NANO_NCCL_ENABLE_RDMA)
-        // Drain while the shared progress thread is still running.
+        // Drain while progress (shared engine or dedicated proxy threads) still runs.
         for (const auto& proxy : rdma_send_proxies_) proxy->drain();
-        for (const auto& proxy : rdma_send_proxies_) proxy->shutdown();
-        for (const auto& proxy : rdma_recv_proxies_) proxy->shutdown();
-        rdma_progress_.shutdown();
-        rdma_progress_.join();
+        if (rdma_shared_progress_) {
+            for (const auto& proxy : rdma_send_proxies_) proxy->shutdown();
+            for (const auto& proxy : rdma_recv_proxies_) proxy->shutdown();
+            rdma_progress_.shutdown();
+            rdma_progress_.join();
+        } else {
+            for (const auto& proxy : rdma_send_proxies_) proxy->shutdown();
+            for (const auto& proxy : rdma_recv_proxies_) proxy->shutdown();
+            for (const auto& proxy : rdma_send_proxies_) proxy->join();
+            for (const auto& proxy : rdma_recv_proxies_) proxy->join();
+        }
         for (const auto& proxy : rdma_send_proxies_) proxy->dump_timeline_if_enabled();
         for (const auto& proxy : rdma_recv_proxies_) proxy->dump_timeline_if_enabled();
 #endif
@@ -456,6 +463,7 @@ private:
         const transport::rdma::RdmaDataPlane plane =
             transport::rdma::parse_rdma_data_plane_env();
         const bool write_cts = plane == transport::rdma::RdmaDataPlane::WriteCts;
+        rdma_shared_progress_ = transport::rdma::parse_rdma_shared_progress_env();
 
         rdma_endpoint_ = std::make_shared<transport::rdma::RdmaEndpoint>(
             transport::rdma::RdmaEndpoint::create_from_environment());
@@ -685,31 +693,49 @@ private:
             // qp_taken (moved-from state) destructs here; r.qp holds nullptr.
         }
 
-        // 3. prepare() posts the next expected Simple-protocol slot (and
-        //    WriteCts initial CTS) without spawning per-proxy threads. A
-        //    peer-ready byte proves the first sender WQE cannot hit an empty
-        //    RQ / missing CTS. One shared progress thread then multiplexes all
-        //    local proxies (recv-first).
-        for (const auto& proxy : rdma_recv_proxies_) proxy->prepare();
+        // 3. Recv-side prepare/start first, then a peer-ready byte so the first
+        //    sender WQE cannot hit an empty RQ / missing CTS. Shared mode then
+        //    multiplexes all local proxies on one progress thread (recv-first);
+        //    dedicated mode keeps per-proxy threads (NANO_NCCL_RDMA_SHARED_PROGRESS=0).
         const std::uint8_t ready = 1;
-        for (const auto& connection : rdma_ready_connections) {
-            std::uint8_t peer_ready = 0;
-            transport::socket::send_all(connection.fd(), &ready, sizeof(ready));
-            transport::socket::recv_all(connection.fd(), &peer_ready, sizeof(peer_ready));
-            if (peer_ready != ready) {
-                throw std::runtime_error("rdma peer did not confirm recv readiness");
+        if (rdma_shared_progress_) {
+            for (const auto& proxy : rdma_recv_proxies_) proxy->prepare();
+            for (const auto& connection : rdma_ready_connections) {
+                std::uint8_t peer_ready = 0;
+                transport::socket::send_all(connection.fd(), &ready, sizeof(ready));
+                transport::socket::recv_all(connection.fd(), &peer_ready,
+                                            sizeof(peer_ready));
+                if (peer_ready != ready) {
+                    throw std::runtime_error(
+                        "rdma peer did not confirm recv readiness");
+                }
             }
-        }
-        rdma_ready_connections.clear();
+            rdma_ready_connections.clear();
 
-        for (const auto& proxy : rdma_send_proxies_) proxy->prepare();
-        for (const auto& proxy : rdma_recv_proxies_) {
-            rdma_progress_.add_recv(proxy.get());
+            for (const auto& proxy : rdma_send_proxies_) proxy->prepare();
+            for (const auto& proxy : rdma_recv_proxies_) {
+                rdma_progress_.add_recv(proxy.get());
+            }
+            for (const auto& proxy : rdma_send_proxies_) {
+                rdma_progress_.add_send(proxy.get());
+            }
+            rdma_progress_.start();
+        } else {
+            for (const auto& proxy : rdma_recv_proxies_) proxy->start();
+            for (const auto& connection : rdma_ready_connections) {
+                std::uint8_t peer_ready = 0;
+                transport::socket::send_all(connection.fd(), &ready, sizeof(ready));
+                transport::socket::recv_all(connection.fd(), &peer_ready,
+                                            sizeof(peer_ready));
+                if (peer_ready != ready) {
+                    throw std::runtime_error(
+                        "rdma peer did not confirm recv readiness");
+                }
+            }
+            rdma_ready_connections.clear();
+
+            for (const auto& proxy : rdma_send_proxies_) proxy->start();
         }
-        for (const auto& proxy : rdma_send_proxies_) {
-            rdma_progress_.add_send(proxy.get());
-        }
-        rdma_progress_.start();
     }
 #endif
 
@@ -1179,6 +1205,7 @@ private:
     std::vector<std::unique_ptr<transport::rdma::RdmaSendProxy>> rdma_send_proxies_;
     std::vector<std::unique_ptr<transport::rdma::RdmaRecvProxy>> rdma_recv_proxies_;
     transport::rdma::RdmaProgressEngine rdma_progress_;
+    bool rdma_shared_progress_ = true;
 #endif
     MappedU64Array simple_fifo_steps_;
     MappedU64Array simple_fifo_base_step_;
