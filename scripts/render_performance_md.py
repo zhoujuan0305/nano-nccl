@@ -61,7 +61,7 @@ def render_section(name: str, body: dict) -> str:
     if name == "rdma":
         parts.extend(
             [
-                "The nano-nccl runs explicitly request `--transport rdma` with `NANO_NCCL_RDMA_USE_WRITE=1` (WRITE+CTS over registered host-pinned FIFO). Aggregate transport is `mixed`: local ring edges resolve like `auto` (P2P when bidirectional NVLink peer access is available, otherwise SHM) while cross-host edges use RDMA. NCCL uses RDMA with `NCCL_NET_GDR_LEVEL=0` (host-pin / no GPUDirect RDMA). No two-host performance acceptance threshold has been established. Small-message NCCL points can show cold-start spikes.",
+                "The nano-nccl runs explicitly request `--transport rdma` with `NANO_NCCL_RDMA_USE_WRITE=1` (WRITE+CTS over registered host-pinned FIFO). Aggregate transport is `mixed`: local ring edges resolve like `auto` (P2P when bidirectional NVLink peer access is available, otherwise SHM) while cross-host edges use RDMA. NCCL uses RDMA with `NCCL_NET_GDR_LEVEL=0` (host-pin / no GPUDirect RDMA). No two-host performance acceptance threshold has been established. Host RDMA progress multiplexes local proxies on one thread. Small-message NCCL points can show cold-start spikes.",
                 "",
             ]
         )

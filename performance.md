@@ -11,7 +11,7 @@ Both hosts use two-socket Intel Xeon Platinum 8462Y+ CPUs (32 cores per socket, 
 | A | Linux 5.15.0-136-generic | 580.82.07 | GPU0 `2a:00.0`, GPU1 `3d:00.0`, GPU2 `ab:00.0`, GPU3 `bd:00.0` |
 | B | Linux 6.8.0-124-generic | 580.173.02 | GPU0 `2a:00.0`, GPU1 `3d:00.0`, GPU2 `ab:00.0`, GPU3 `bd:00.0` |
 
-On each host GPU0-GPU1 and GPU2-GPU3 are connected by four NVLinks. The two pairs are separated by `SYS` paths across NUMA nodes. The nano-nccl `auto` plan resolves each ring edge independently (P2P when bidirectional NVLink peer access is available, otherwise SHM). Two-host socket runs use TCP; NCCL socket runs set `NCCL_IB_DISABLE=1`. Two-host RDMA runs use nano `--transport rdma` with `NANO_NCCL_RDMA_USE_WRITE=1` (WRITE+CTS; local edges P2P when NVLink peer access is available, otherwise SHM) and NCCL IB/RoCE with `NCCL_NET_GDR_LEVEL=0`.
+On each host GPU0-GPU1 and GPU2-GPU3 are connected by four NVLinks. The two pairs are separated by `SYS` paths across NUMA nodes. The nano-nccl `auto` plan resolves each ring edge independently (P2P when bidirectional NVLink peer access is available, otherwise SHM). Two-host socket runs use TCP; NCCL socket runs set `NCCL_IB_DISABLE=1`. Two-host RDMA runs use nano `--transport rdma` with `NANO_NCCL_RDMA_USE_WRITE=1` (WRITE+CTS; local edges P2P when NVLink peer access is available, otherwise SHM; shared host RDMA progress thread) and NCCL IB/RoCE with `NCCL_NET_GDR_LEVEL=0`.
 
 All measurements use a Release build with `NANO_NCCL_ENABLE_BENCH_PROFILING=OFF`, message sizes 256 KiB through 64 MiB, `-w 5`, and `-n 20`. NCCL uses `Ring`, `Simple`, four channels, and a 32 MiB buffer. RDMA SEND/WriteCts always post from the registered mapped FIFO (no host bounce; visibility via a single publisher `__threadfence_system` after block sync + release/acquire steps). Small Simple slices may post recv credit immediately after consuming the recv FIFO.
 
@@ -275,7 +275,7 @@ All measurements use a Release build with `NANO_NCCL_ENABLE_BENCH_PROFILING=OFF`
 
 ## Two Hosts: 8 Ranks Over RDMA
 
-The nano-nccl runs explicitly request `--transport rdma` with `NANO_NCCL_RDMA_USE_WRITE=1` (WRITE+CTS over registered host-pinned FIFO). Aggregate transport is `mixed`: local ring edges resolve like `auto` (P2P when bidirectional NVLink peer access is available, otherwise SHM) while cross-host edges use RDMA. NCCL uses RDMA with `NCCL_NET_GDR_LEVEL=0` (host-pin / no GPUDirect RDMA). Recent ring Simple publish-path work (dual wait overlap, single publisher fence, fused RR publish barriers, and early recv credit on small slices) is included. No two-host performance acceptance threshold has been established. Small-message NCCL points can show cold-start spikes (very low NCCL busbw / high nano/NCCL ratio); treat those as baseline noise rather than nano speedups.
+The nano-nccl runs explicitly request `--transport rdma` with `NANO_NCCL_RDMA_USE_WRITE=1` (WRITE+CTS over registered host-pinned FIFO). Aggregate transport is `mixed`: local ring edges resolve like `auto` (P2P when bidirectional NVLink peer access is available, otherwise SHM) while cross-host edges use RDMA. Host RDMA progress uses a **shared progress thread** that multiplexes all local send/recv proxies (NCCL-like), rather than one thread per channel. NCCL uses RDMA with `NCCL_NET_GDR_LEVEL=0` (host-pin / no GPUDirect RDMA). Ring Simple publish-path work (dual wait overlap, single publisher fence, fused RR publish barriers, early recv credit on small slices) is included. No two-host performance acceptance threshold has been established. Small-message NCCL points can show cold-start spikes (very low NCCL busbw / high nano/NCCL ratio); treat those as baseline noise rather than nano speedups.
 
 ### Float
 
@@ -283,41 +283,41 @@ The nano-nccl runs explicitly request `--transport rdma` with `NANO_NCCL_RDMA_US
 
 | Size | nano time (us) | nano busbw | NCCL time (us) | NCCL busbw | nano/NCCL |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 256 KiB | 262.81 | 1.75 | 202.93 | 2.26 | 0.77 |
-| 1 MiB | 312.86 | 5.87 | 263.86 | 6.95 | 0.84 |
-| 4 MiB | 733.27 | 10.01 | 655.22 | 11.20 | 0.89 |
-| 16 MiB | 2670.26 | 11.00 | 2604.84 | 11.27 | 0.98 |
-| 64 MiB | 10628.9 | 11.05 | 11160.0 | 10.52 | 1.05 |
+| 256 KiB | 214.79 | 2.14 | 186.86 | 2.46 | 0.87 |
+| 1 MiB | 264.99 | 6.92 | 255.36 | 7.19 | 0.96 |
+| 4 MiB | 722.58 | 10.16 | 652.52 | 11.25 | 0.90 |
+| 16 MiB | 2662.80 | 11.03 | 2553.62 | 11.50 | 0.96 |
+| 64 MiB | 10543.2 | 11.14 | 10345.4 | 11.35 | 0.98 |
 
 #### Avg
 
 | Size | nano time (us) | nano busbw | NCCL time (us) | NCCL busbw | nano/NCCL |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 256 KiB | 219.11 | 2.09 | 516.30 | 0.89 | 2.36 |
-| 1 MiB | 267.22 | 6.87 | 259.05 | 7.08 | 0.97 |
-| 4 MiB | 719.99 | 10.19 | 657.50 | 11.16 | 0.91 |
-| 16 MiB | 2667.29 | 11.01 | 2610.61 | 11.25 | 0.98 |
-| 64 MiB | 10606.0 | 11.07 | 10903.7 | 10.77 | 1.03 |
+| 256 KiB | 216.80 | 2.12 | 514.19 | 0.89 | 2.37 |
+| 1 MiB | 273.67 | 6.71 | 261.84 | 7.01 | 0.96 |
+| 4 MiB | 718.17 | 10.22 | 654.19 | 11.22 | 0.91 |
+| 16 MiB | 2653.01 | 11.07 | 2553.00 | 11.50 | 0.96 |
+| 64 MiB | 10516.7 | 11.17 | 10239.9 | 11.47 | 0.97 |
 
 #### Max
 
 | Size | nano time (us) | nano busbw | NCCL time (us) | NCCL busbw | nano/NCCL |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 256 KiB | 280.37 | 1.64 | 219.39 | 2.09 | 0.78 |
-| 1 MiB | 267.72 | 6.85 | 271.70 | 6.75 | 1.01 |
-| 4 MiB | 721.29 | 10.18 | 681.17 | 10.78 | 0.94 |
-| 16 MiB | 2666.32 | 11.01 | 2569.84 | 11.42 | 0.96 |
-| 64 MiB | 10599.5 | 11.08 | 10580.0 | 11.10 | 1.00 |
+| 256 KiB | 209.83 | 2.19 | 530.51 | 0.86 | 2.53 |
+| 1 MiB | 265.61 | 6.91 | 258.27 | 7.11 | 0.97 |
+| 4 MiB | 721.63 | 10.17 | 653.19 | 11.24 | 0.91 |
+| 16 MiB | 2656.83 | 11.05 | 2555.06 | 11.49 | 0.96 |
+| 64 MiB | 10798.4 | 10.88 | 10255.0 | 11.45 | 0.95 |
 
 #### Min
 
 | Size | nano time (us) | nano busbw | NCCL time (us) | NCCL busbw | nano/NCCL |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 256 KiB | 217.63 | 2.11 | 211.29 | 2.17 | 0.97 |
-| 1 MiB | 269.96 | 6.80 | 261.09 | 7.03 | 0.97 |
-| 4 MiB | 722.43 | 10.16 | 655.98 | 11.19 | 0.91 |
-| 16 MiB | 2671.98 | 10.99 | 2610.12 | 11.25 | 0.98 |
-| 64 MiB | 10580.5 | 11.10 | 11046.1 | 10.63 | 1.04 |
+| 256 KiB | 219.03 | 2.09 | 571.73 | 0.80 | 2.61 |
+| 1 MiB | 270.76 | 6.78 | 272.37 | 6.74 | 1.01 |
+| 4 MiB | 722.07 | 10.17 | 684.05 | 10.73 | 0.95 |
+| 16 MiB | 2654.76 | 11.06 | 2566.27 | 11.44 | 0.97 |
+| 64 MiB | 10544.0 | 11.14 | 10343.1 | 11.35 | 0.98 |
 
 ### FP16
 
@@ -325,41 +325,41 @@ The nano-nccl runs explicitly request `--transport rdma` with `NANO_NCCL_RDMA_US
 
 | Size | nano time (us) | nano busbw | NCCL time (us) | NCCL busbw | nano/NCCL |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 256 KiB | 211.58 | 2.17 | 203.77 | 2.25 | 0.96 |
-| 1 MiB | 272.66 | 6.73 | 263.28 | 6.97 | 0.97 |
-| 4 MiB | 725.67 | 10.11 | 657.45 | 11.16 | 0.91 |
-| 16 MiB | 2665.18 | 11.02 | 2601.22 | 11.29 | 0.98 |
-| 64 MiB | 10630.2 | 11.05 | 10928.0 | 10.75 | 1.03 |
+| 256 KiB | 323.46 | 1.42 | 542.07 | 0.85 | 1.68 |
+| 1 MiB | 263.81 | 6.96 | 257.30 | 7.13 | 0.98 |
+| 4 MiB | 721.51 | 10.17 | 680.24 | 10.79 | 0.94 |
+| 16 MiB | 2657.79 | 11.05 | 2553.55 | 11.50 | 0.96 |
+| 64 MiB | 10521.2 | 11.16 | 10248.1 | 11.46 | 0.97 |
 
 #### Avg
 
 | Size | nano time (us) | nano busbw | NCCL time (us) | NCCL busbw | nano/NCCL |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 256 KiB | 215.18 | 2.13 | 518.03 | 0.89 | 2.41 |
-| 1 MiB | 265.01 | 6.92 | 256.11 | 7.16 | 0.97 |
-| 4 MiB | 721.57 | 10.17 | 679.12 | 10.81 | 0.94 |
-| 16 MiB | 2662.35 | 11.03 | 2564.65 | 11.45 | 0.96 |
-| 64 MiB | 10520.4 | 11.16 | 10236.7 | 11.47 | 0.97 |
+| 256 KiB | 218.63 | 2.10 | 193.98 | 2.36 | 0.89 |
+| 1 MiB | 266.46 | 6.89 | 259.24 | 7.08 | 0.97 |
+| 4 MiB | 724.28 | 10.13 | 653.01 | 11.24 | 0.90 |
+| 16 MiB | 2658.87 | 11.04 | 2556.57 | 11.48 | 0.96 |
+| 64 MiB | 10585.5 | 11.09 | 10272.2 | 11.43 | 0.97 |
 
 #### Max
 
 | Size | nano time (us) | nano busbw | NCCL time (us) | NCCL busbw | nano/NCCL |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 256 KiB | 208.86 | 2.20 | 203.48 | 2.25 | 0.97 |
-| 1 MiB | 265.95 | 6.90 | 270.41 | 6.79 | 1.02 |
-| 4 MiB | 718.25 | 10.22 | 679.10 | 10.81 | 0.95 |
-| 16 MiB | 2660.63 | 11.04 | 2607.73 | 11.26 | 0.98 |
-| 64 MiB | 10525.1 | 11.16 | 10267.7 | 11.44 | 0.98 |
+| 256 KiB | 226.74 | 2.02 | 191.57 | 2.39 | 0.84 |
+| 1 MiB | 277.63 | 6.61 | 255.37 | 7.19 | 0.92 |
+| 4 MiB | 723.29 | 10.15 | 655.69 | 11.19 | 0.91 |
+| 16 MiB | 2661.10 | 11.03 | 2553.52 | 11.50 | 0.96 |
+| 64 MiB | 10593.1 | 11.09 | 10270.1 | 11.44 | 0.97 |
 
 #### Min
 
 | Size | nano time (us) | nano busbw | NCCL time (us) | NCCL busbw | nano/NCCL |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 256 KiB | 216.87 | 2.12 | 192.03 | 2.39 | 0.89 |
-| 1 MiB | 271.05 | 6.77 | 258.02 | 7.11 | 0.95 |
-| 4 MiB | 716.31 | 10.25 | 653.53 | 11.23 | 0.91 |
-| 16 MiB | 2659.89 | 11.04 | 2553.91 | 11.50 | 0.96 |
-| 64 MiB | 10528.2 | 11.15 | 10258.3 | 11.45 | 0.97 |
+| 256 KiB | 212.63 | 2.16 | 202.09 | 2.27 | 0.95 |
+| 1 MiB | 272.84 | 6.73 | 261.76 | 7.01 | 0.96 |
+| 4 MiB | 718.03 | 10.22 | 1018.18 | 7.21 | 1.42 |
+| 16 MiB | 2654.92 | 11.06 | 2564.46 | 11.45 | 0.97 |
+| 64 MiB | 10539.2 | 11.14 | 10577.2 | 11.10 | 1.00 |
 
 ### BF16
 
@@ -367,41 +367,41 @@ The nano-nccl runs explicitly request `--transport rdma` with `NANO_NCCL_RDMA_US
 
 | Size | nano time (us) | nano busbw | NCCL time (us) | NCCL busbw | nano/NCCL |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 256 KiB | 211.51 | 2.17 | 517.55 | 0.89 | 2.45 |
-| 1 MiB | 262.57 | 6.99 | 253.01 | 7.25 | 0.96 |
-| 4 MiB | 718.03 | 10.22 | 652.49 | 11.25 | 0.91 |
-| 16 MiB | 2660.83 | 11.03 | 2552.31 | 11.50 | 0.96 |
-| 64 MiB | 10538.6 | 11.14 | 10235.1 | 11.47 | 0.97 |
+| 256 KiB | 220.55 | 2.08 | 192.09 | 2.39 | 0.87 |
+| 1 MiB | 271.60 | 6.76 | 273.45 | 6.71 | 1.01 |
+| 4 MiB | 720.29 | 10.19 | 653.83 | 11.23 | 0.91 |
+| 16 MiB | 2755.65 | 10.65 | 2554.97 | 11.49 | 0.93 |
+| 64 MiB | 10609.8 | 11.07 | 10283.7 | 11.42 | 0.97 |
 
 #### Avg
 
 | Size | nano time (us) | nano busbw | NCCL time (us) | NCCL busbw | nano/NCCL |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 256 KiB | 295.47 | 1.55 | 205.36 | 2.23 | 0.70 |
-| 1 MiB | 259.07 | 7.08 | 256.61 | 7.15 | 0.99 |
-| 4 MiB | 715.10 | 10.26 | 654.07 | 11.22 | 0.91 |
-| 16 MiB | 2654.95 | 11.06 | 2554.11 | 11.50 | 0.96 |
-| 64 MiB | 10517.9 | 11.17 | 10243.5 | 11.46 | 0.97 |
+| 256 KiB | 296.91 | 1.55 | 553.05 | 0.83 | 1.86 |
+| 1 MiB | 274.24 | 6.69 | 271.12 | 6.77 | 0.99 |
+| 4 MiB | 721.06 | 10.18 | 678.22 | 10.82 | 0.94 |
+| 16 MiB | 2655.58 | 11.06 | 2564.03 | 11.45 | 0.97 |
+| 64 MiB | 10613.1 | 11.07 | 10321.3 | 11.38 | 0.97 |
 
 #### Max
 
 | Size | nano time (us) | nano busbw | NCCL time (us) | NCCL busbw | nano/NCCL |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 256 KiB | 218.02 | 2.10 | 187.50 | 2.45 | 0.86 |
-| 1 MiB | 274.64 | 6.68 | 256.38 | 7.16 | 0.93 |
-| 4 MiB | 716.51 | 10.24 | 654.13 | 11.22 | 0.91 |
-| 16 MiB | 2659.96 | 11.04 | 2555.43 | 11.49 | 0.96 |
-| 64 MiB | 10529.2 | 11.15 | 10347.7 | 11.35 | 0.98 |
+| 256 KiB | 228.52 | 2.01 | 188.56 | 2.43 | 0.83 |
+| 1 MiB | 282.96 | 6.49 | 260.10 | 7.06 | 0.92 |
+| 4 MiB | 720.54 | 10.19 | 656.28 | 11.18 | 0.91 |
+| 16 MiB | 2688.01 | 10.92 | 2558.09 | 11.48 | 0.95 |
+| 64 MiB | 10654.9 | 11.02 | 10352.1 | 11.34 | 0.97 |
 
 #### Min
 
 | Size | nano time (us) | nano busbw | NCCL time (us) | NCCL busbw | nano/NCCL |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 256 KiB | 215.76 | 2.13 | 460.95 | 1.00 | 2.14 |
-| 1 MiB | 429.44 | 4.27 | 259.22 | 7.08 | 0.60 |
-| 4 MiB | 716.02 | 10.25 | 652.34 | 11.25 | 0.91 |
-| 16 MiB | 2656.84 | 11.05 | 2553.58 | 11.50 | 0.96 |
-| 64 MiB | 10518.1 | 11.17 | 10305.1 | 11.40 | 0.98 |
+| 256 KiB | 221.09 | 2.07 | 186.46 | 2.46 | 0.84 |
+| 1 MiB | 272.59 | 6.73 | 260.01 | 7.06 | 0.95 |
+| 4 MiB | 722.99 | 10.15 | 652.92 | 11.24 | 0.90 |
+| 16 MiB | 2660.03 | 11.04 | 2553.99 | 11.50 | 0.96 |
+| 64 MiB | 10526.7 | 11.16 | 10303.1 | 11.40 | 0.98 |
 
 
 ## Reproduction

@@ -263,8 +263,10 @@ built with MPI/RDMA support.
   worker stores, a single publisher `__threadfence_system` orders visibility
   before `send_tail` (plus system release/acquire steps; no host bounce).
   Small Simple slices may post recv credit immediately after consuming the
-  recv FIFO. Dual-host WRITE matrix (float/fp16/bf16 × sum/avg/max/min,
-  256 KiB–64 MiB) refreshed in [performance.md](performance.md) with `#wrong=0`.
+  recv FIFO. Cross-process RDMA edges share one host progress thread that
+  multiplexes all local send/recv proxies. Dual-host WRITE matrix (float/fp16/bf16 × sum/avg/max/min,
+  256 KiB–64 MiB) refreshed in [performance.md](performance.md) with `#wrong=0`
+  (includes shared RDMA progress).
 
 P2P is a single-node transport. It requires CUDA peer access for the complete
 configured ring; it is not a multi-node or network transport. Socket uses a
