@@ -114,6 +114,11 @@ public:
     RdmaSendProxy(const RdmaSendProxy&) = delete;
     RdmaSendProxy& operator=(const RdmaSendProxy&) = delete;
 
+    // prepare(): one-shot init (send: state only). progress(): one non-blocking
+    // iteration (try posts + one CQ poll). start() = prepare + own thread for
+    // unit tests; communicator uses a shared RdmaProgressEngine instead.
+    void prepare();
+    bool progress() noexcept;
     void start();
     void stop() noexcept;
     void shutdown() noexcept;
@@ -121,6 +126,10 @@ public:
     void join() noexcept;
 
     RdmaDataPlane data_plane() const noexcept { return plane_; }
+    int fifo_numa_node() const noexcept { return fifo_numa_node_; }
+    bool has_error() const noexcept {
+        return errors_ != nullptr && errors_->has_error();
+    }
 
     std::uint64_t posts() const noexcept {
         return posts_.load(std::memory_order_relaxed);
@@ -137,8 +146,8 @@ public:
 
 private:
     void run() noexcept;
-    void run_send_recv() noexcept;
-    void run_write_cts() noexcept;
+    bool progress_send_recv() noexcept;
+    bool progress_write_cts() noexcept;
     std::size_t max_inflight() const;
 #if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
     const char* timeline_plane_label() const noexcept;
@@ -153,6 +162,7 @@ private:
     std::shared_ptr<RdmaAsyncErrorState> errors_;
     RdmaDataPlane plane_ = RdmaDataPlane::SendRecv;
     RdmaWriteTargets write_targets_{};
+    bool prepared_ = false;
     std::atomic<bool> stop_requested_{false};
     std::thread thread_;
     std::atomic<std::uint64_t> step_{0};
@@ -199,6 +209,8 @@ public:
     RdmaRecvProxy(const RdmaRecvProxy&) = delete;
     RdmaRecvProxy& operator=(const RdmaRecvProxy&) = delete;
 
+    void prepare();
+    bool progress() noexcept;
     void start();
     void stop() noexcept;
     void shutdown() noexcept;
@@ -206,6 +218,10 @@ public:
     void join() noexcept;
 
     RdmaDataPlane data_plane() const noexcept { return plane_; }
+    int fifo_numa_node() const noexcept { return fifo_numa_node_; }
+    bool has_error() const noexcept {
+        return errors_ != nullptr && errors_->has_error();
+    }
 
 #if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
     void dump_timeline_if_enabled() const;
@@ -215,8 +231,8 @@ public:
 
 private:
     void run() noexcept;
-    void run_send_recv() noexcept;
-    void run_write_cts() noexcept;
+    bool progress_send_recv() noexcept;
+    bool progress_write_cts() noexcept;
     void pre_post_recv(std::uint64_t slot);
     void pre_post_imm_recv(std::uint64_t step);
     void post_cts(std::uint64_t step);
@@ -238,6 +254,7 @@ private:
     bool elide_zero_payload_ = false;
     std::unique_ptr<std::uint8_t[]> imm_scratch_;
     ibv_mr* imm_scratch_mr_ = nullptr;
+    bool prepared_ = false;
     std::atomic<bool> stop_requested_{false};
     std::thread thread_;
     std::atomic<std::uint64_t> step_{0};

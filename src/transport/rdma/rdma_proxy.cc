@@ -241,10 +241,31 @@ void RdmaSendProxy::dump_timeline_if_enabled() const {
 }
 #endif
 
+void RdmaSendProxy::prepare() {
+    if (prepared_) {
+        throw std::runtime_error("rdma send proxy already prepared");
+    }
+    if (thread_.joinable()) {
+        throw std::runtime_error("rdma send proxy already started");
+    }
+    prepared_ = true;
+}
+
+bool RdmaSendProxy::progress() noexcept {
+    if (stop_requested_.load(std::memory_order_acquire) || errors_->has_error()) {
+        return false;
+    }
+    if (plane_ == RdmaDataPlane::WriteCts) {
+        return progress_write_cts();
+    }
+    return progress_send_recv();
+}
+
 void RdmaSendProxy::start() {
     if (thread_.joinable()) {
         throw std::runtime_error("rdma send proxy already started");
     }
+    prepare();
     thread_ = std::thread(&RdmaSendProxy::run, this);
 }
 
@@ -274,16 +295,24 @@ void RdmaSendProxy::join() noexcept {
 }
 
 void RdmaSendProxy::run() noexcept {
-    if (plane_ == RdmaDataPlane::WriteCts) {
-        run_write_cts();
-    } else {
-        run_send_recv();
+    try {
+        core::pin_current_thread_to_numa_node(fifo_numa_node_);
+        while (!stop_requested_.load(std::memory_order_acquire) &&
+               !errors_->has_error()) {
+            if (!progress()) {
+                _mm_pause();
+            }
+        }
+    } catch (const std::exception& error) {
+        if (!stop_requested_.load(std::memory_order_acquire)) {
+            errors_->record_failure(identity_, step_.load(std::memory_order_acquire),
+                                    error.what());
+        }
     }
 }
 
-void RdmaSendProxy::run_send_recv() noexcept {
+bool RdmaSendProxy::progress_send_recv() noexcept {
     try {
-        core::pin_current_thread_to_numa_node(fifo_numa_node_);
         constexpr int kPollBatch = 16;
         // Signal every Kth post plus credit-full and burst-tail WRs so unsignaled
         // WQEs still free send_head in order without a CQ entry per slice.
@@ -291,8 +320,7 @@ void RdmaSendProxy::run_send_recv() noexcept {
         ibv_wc wcs[kPollBatch];
         const std::size_t max_if = max_inflight_;
         const std::uint64_t step_inc = fifo_.step_increment;
-        while (!stop_requested_.load(std::memory_order_acquire) &&
-               !errors_->has_error()) {
+        {
             bool did_work = false;
             while (inflight_ < max_if) {
                 const std::uint64_t tail = load_counter(control_.send_tail);
@@ -477,9 +505,7 @@ void RdmaSendProxy::run_send_recv() noexcept {
                 inflight_ -= static_cast<std::size_t>(advanced);
                 did_work = true;
             }
-            if (!did_work) {
-                _mm_pause();
-            }
+            return did_work;
         }
     } catch (const std::exception& error) {
         if (!stop_requested_.load(std::memory_order_acquire)) {
@@ -487,18 +513,17 @@ void RdmaSendProxy::run_send_recv() noexcept {
                                     error.what());
         }
     }
+    return false;
 }
 
-void RdmaSendProxy::run_write_cts() noexcept {
+bool RdmaSendProxy::progress_write_cts() noexcept {
     try {
-        core::pin_current_thread_to_numa_node(fifo_numa_node_);
         constexpr int kPollBatch = 16;
         constexpr std::uint64_t kSignalEvery = 4;
         ibv_wc wcs[kPollBatch];
         const std::size_t max_if = max_inflight_;
         const std::uint64_t step_inc = fifo_.step_increment;
-        while (!stop_requested_.load(std::memory_order_acquire) &&
-               !errors_->has_error()) {
+        {
             bool did_work = false;
             while (inflight_ < max_if) {
                 const std::size_t slot = next_post_step_ % fifo_.slot_count;
@@ -730,9 +755,7 @@ void RdmaSendProxy::run_write_cts() noexcept {
                 inflight_ -= static_cast<std::size_t>(advanced);
                 did_work = true;
             }
-            if (!did_work) {
-                _mm_pause();
-            }
+            return did_work;
         }
     } catch (const std::exception& error) {
         if (!stop_requested_.load(std::memory_order_acquire)) {
@@ -741,6 +764,7 @@ void RdmaSendProxy::run_write_cts() noexcept {
                                     error.what());
         }
     }
+    return false;
 }
 
 std::size_t RdmaRecvProxy::max_inflight() const {
@@ -854,7 +878,10 @@ bool RdmaRecvProxy::try_elide_zero_payload() {
     return true;
 }
 
-void RdmaRecvProxy::start() {
+void RdmaRecvProxy::prepare() {
+    if (prepared_) {
+        throw std::runtime_error("rdma recv proxy already prepared");
+    }
     if (thread_.joinable()) {
         throw std::runtime_error("rdma recv proxy already started");
     }
@@ -877,7 +904,7 @@ void RdmaRecvProxy::start() {
             next_cts_step_ += step_inc;
             ++inflight_cts_;
         }
-        thread_ = std::thread(&RdmaRecvProxy::run, this);
+        prepared_ = true;
         return;
     }
     // Simple 每个 slice 以 step_increment 前进；预投递必须与 kernel 的
@@ -895,6 +922,24 @@ void RdmaRecvProxy::start() {
         next_post_step_ += fifo_.step_increment;
         ++inflight_;
     }
+    prepared_ = true;
+}
+
+bool RdmaRecvProxy::progress() noexcept {
+    if (stop_requested_.load(std::memory_order_acquire) || errors_->has_error()) {
+        return false;
+    }
+    if (plane_ == RdmaDataPlane::WriteCts) {
+        return progress_write_cts();
+    }
+    return progress_send_recv();
+}
+
+void RdmaRecvProxy::start() {
+    if (thread_.joinable()) {
+        throw std::runtime_error("rdma recv proxy already started");
+    }
+    prepare();
     thread_ = std::thread(&RdmaRecvProxy::run, this);
 }
 
@@ -1045,21 +1090,28 @@ void RdmaRecvProxy::post_cts(std::uint64_t step) {
 }
 
 void RdmaRecvProxy::run() noexcept {
-    if (plane_ == RdmaDataPlane::WriteCts) {
-        run_write_cts();
-    } else {
-        run_send_recv();
+    try {
+        core::pin_current_thread_to_numa_node(fifo_numa_node_);
+        while (!stop_requested_.load(std::memory_order_acquire) &&
+               !errors_->has_error()) {
+            if (!progress()) {
+                _mm_pause();
+            }
+        }
+    } catch (const std::exception& error) {
+        if (!stop_requested_.load(std::memory_order_acquire)) {
+            errors_->record_failure(identity_, step_.load(std::memory_order_acquire),
+                                    error.what());
+        }
     }
 }
 
-void RdmaRecvProxy::run_send_recv() noexcept {
+bool RdmaRecvProxy::progress_send_recv() noexcept {
     try {
-        core::pin_current_thread_to_numa_node(fifo_numa_node_);
         constexpr int kPollBatch = 16;
         ibv_wc wcs[kPollBatch];
         const std::size_t max_if = max_inflight_;
-        while (!stop_requested_.load(std::memory_order_acquire) &&
-               !errors_->has_error()) {
+        {
             bool did_work = false;
             while (inflight_ < max_if &&
                    load_counter(control_.recv_head) + fifo_.slot_count >=
@@ -1119,9 +1171,7 @@ void RdmaRecvProxy::run_send_recv() noexcept {
                 --inflight_;
                 did_work = true;
             }
-            if (!did_work) {
-                _mm_pause();
-            }
+            return did_work;
         }
     } catch (const std::exception& error) {
         if (!stop_requested_.load(std::memory_order_acquire)) {
@@ -1129,17 +1179,16 @@ void RdmaRecvProxy::run_send_recv() noexcept {
                                     error.what());
         }
     }
+    return false;
 }
 
-void RdmaRecvProxy::run_write_cts() noexcept {
+bool RdmaRecvProxy::progress_write_cts() noexcept {
     try {
-        core::pin_current_thread_to_numa_node(fifo_numa_node_);
         constexpr int kPollBatch = 16;
         ibv_wc wcs[kPollBatch];
         const std::size_t max_if = max_inflight_;
         const std::uint64_t step_inc = fifo_.step_increment;
-        while (!stop_requested_.load(std::memory_order_acquire) &&
-               !errors_->has_error()) {
+        {
             bool did_work = false;
 
             // Refresh CTS for free slots (recv_head + slot_count credit).
@@ -1240,9 +1289,7 @@ void RdmaRecvProxy::run_write_cts() noexcept {
                 --inflight_;
                 did_work = true;
             }
-            if (!did_work) {
-                _mm_pause();
-            }
+            return did_work;
         }
     } catch (const std::exception& error) {
         if (!stop_requested_.load(std::memory_order_acquire)) {
@@ -1251,6 +1298,7 @@ void RdmaRecvProxy::run_write_cts() noexcept {
                                     error.what());
         }
     }
+    return false;
 }
 
 }  // namespace nano_nccl::transport::rdma

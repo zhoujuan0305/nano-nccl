@@ -11,8 +11,10 @@ import sys
 
 
 def extract_fn_body(text: str, qualified_name: str) -> str:
-    """Return the body of `void qualified_name() ... { ... }` (brace-balanced)."""
-    m = re.search(rf"void\s+{re.escape(qualified_name)}\s*\(\)[^{{]*\{{", text)
+    """Return the body of `(void|bool) qualified_name() ... { ... }` (brace-balanced)."""
+    m = re.search(
+        rf"(?:void|bool)\s+{re.escape(qualified_name)}\s*\(\)[^{{]*\{{", text
+    )
     if m is None:
         raise AssertionError(f"could not locate {qualified_name}")
     start = m.end()
@@ -77,8 +79,8 @@ def main() -> int:
     # Analyze data-plane send paths only (not the thin run() dispatcher, and not
     # recv-proxy CTS posts which may always signal).
     for method in (
-        "RdmaSendProxy::run_send_recv",
-        "RdmaSendProxy::run_write_cts",
+        "RdmaSendProxy::progress_send_recv",
+        "RdmaSendProxy::progress_write_cts",
     ):
         body = extract_fn_body(text, method)
         check_multi_flight_data_path(body, method)

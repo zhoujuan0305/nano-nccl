@@ -17,6 +17,7 @@
 #endif
 #if defined(NANO_NCCL_ENABLE_RDMA)
 #include "transport/rdma/rdma_endpoint.h"
+#include "transport/rdma/rdma_progress.h"
 #include "transport/rdma/rdma_proxy.h"
 #include "transport/rdma/rdma_qp.h"
 #include "transport/socket/socket_protocol.h"
@@ -212,12 +213,12 @@ public:
         for (const auto& proxy : socket_send_proxies_) proxy->join();
         for (const auto& proxy : socket_recv_proxies_) proxy->join();
 #if defined(NANO_NCCL_ENABLE_RDMA)
+        // Drain while the shared progress thread is still running.
         for (const auto& proxy : rdma_send_proxies_) proxy->drain();
-        for (const auto& proxy : rdma_recv_proxies_) proxy->drain();
         for (const auto& proxy : rdma_send_proxies_) proxy->shutdown();
         for (const auto& proxy : rdma_recv_proxies_) proxy->shutdown();
-        for (const auto& proxy : rdma_send_proxies_) proxy->join();
-        for (const auto& proxy : rdma_recv_proxies_) proxy->join();
+        rdma_progress_.shutdown();
+        rdma_progress_.join();
         for (const auto& proxy : rdma_send_proxies_) proxy->dump_timeline_if_enabled();
         for (const auto& proxy : rdma_recv_proxies_) proxy->dump_timeline_if_enabled();
 #endif
@@ -684,11 +685,12 @@ private:
             // qp_taken (moved-from state) destructs here; r.qp holds nullptr.
         }
 
-        // 3. Start receive proxies first. start() posts the next expected
-        //    Simple-protocol slot (and WriteCts initial CTS) before launching
-        //    its worker; a peer-ready byte proves the first sender WQE cannot
-        //    hit an empty RQ / missing CTS.
-        for (const auto& proxy : rdma_recv_proxies_) proxy->start();
+        // 3. prepare() posts the next expected Simple-protocol slot (and
+        //    WriteCts initial CTS) without spawning per-proxy threads. A
+        //    peer-ready byte proves the first sender WQE cannot hit an empty
+        //    RQ / missing CTS. One shared progress thread then multiplexes all
+        //    local proxies (recv-first).
+        for (const auto& proxy : rdma_recv_proxies_) proxy->prepare();
         const std::uint8_t ready = 1;
         for (const auto& connection : rdma_ready_connections) {
             std::uint8_t peer_ready = 0;
@@ -700,8 +702,14 @@ private:
         }
         rdma_ready_connections.clear();
 
-        // Both sides confirmed pre-posted recv WQEs; send proxies can now run.
-        for (const auto& proxy : rdma_send_proxies_) proxy->start();
+        for (const auto& proxy : rdma_send_proxies_) proxy->prepare();
+        for (const auto& proxy : rdma_recv_proxies_) {
+            rdma_progress_.add_recv(proxy.get());
+        }
+        for (const auto& proxy : rdma_send_proxies_) {
+            rdma_progress_.add_send(proxy.get());
+        }
+        rdma_progress_.start();
     }
 #endif
 
@@ -1170,6 +1178,7 @@ private:
     std::shared_ptr<transport::rdma::RdmaAsyncErrorState> rdma_errors_;
     std::vector<std::unique_ptr<transport::rdma::RdmaSendProxy>> rdma_send_proxies_;
     std::vector<std::unique_ptr<transport::rdma::RdmaRecvProxy>> rdma_recv_proxies_;
+    transport::rdma::RdmaProgressEngine rdma_progress_;
 #endif
     MappedU64Array simple_fifo_steps_;
     MappedU64Array simple_fifo_base_step_;

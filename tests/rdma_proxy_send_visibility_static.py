@@ -32,25 +32,25 @@ def main() -> int:
             raise AssertionError(msg)
 
     send_recv = re.search(
-        r"void RdmaSendProxy::run_send_recv\(\)[^{]*\{(?P<body>.*)\n\}\n\n"
-        r"void RdmaSendProxy::run_write_cts",
+        r"bool RdmaSendProxy::progress_send_recv\(\)[^{]*\{(?P<body>.*)\n\}\n\n"
+        r"bool RdmaSendProxy::progress_write_cts",
         text,
         re.S,
     )
     if send_recv is None:
-        raise AssertionError("could not locate RdmaSendProxy::run_send_recv")
+        raise AssertionError("could not locate RdmaSendProxy::progress_send_recv")
     write_cts = re.search(
-        r"void RdmaSendProxy::run_write_cts\(\)[^{]*\{(?P<body>.*)\n\}\n\n"
+        r"bool RdmaSendProxy::progress_write_cts\(\)[^{]*\{(?P<body>.*)\n\}\n\n"
         r"std::size_t RdmaRecvProxy::max_inflight",
         text,
         re.S,
     )
     if write_cts is None:
-        raise AssertionError("could not locate RdmaSendProxy::run_write_cts")
+        raise AssertionError("could not locate RdmaSendProxy::progress_write_cts")
 
     for name, body in (
-        ("run_send_recv", send_recv.group("body")),
-        ("run_write_cts", write_cts.group("body")),
+        ("progress_send_recv", send_recv.group("body")),
+        ("progress_write_cts", write_cts.group("body")),
     ):
         if "ibv_post_send" not in body:
             raise AssertionError(f"{name} missing ibv_post_send")
