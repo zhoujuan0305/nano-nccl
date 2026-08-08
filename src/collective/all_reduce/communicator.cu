@@ -1205,7 +1205,7 @@ private:
     std::vector<std::unique_ptr<transport::rdma::RdmaSendProxy>> rdma_send_proxies_;
     std::vector<std::unique_ptr<transport::rdma::RdmaRecvProxy>> rdma_recv_proxies_;
     transport::rdma::RdmaProgressEngine rdma_progress_;
-    bool rdma_shared_progress_ = true;
+    bool rdma_shared_progress_ = false;
 #endif
     MappedU64Array simple_fifo_steps_;
     MappedU64Array simple_fifo_base_step_;

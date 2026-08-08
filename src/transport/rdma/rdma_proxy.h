@@ -27,8 +27,8 @@ enum class RdmaDataPlane { SendRecv, WriteCts };
 // 1/true/on → WriteCts; otherwise throws.
 RdmaDataPlane parse_rdma_data_plane_env();
 
-// NANO_NCCL_RDMA_SHARED_PROGRESS unset/""/1/true/on → true (shared engine);
-// 0/false/off → false (dedicated per-proxy threads); otherwise throws.
+// NANO_NCCL_RDMA_SHARED_PROGRESS unset/""/0/false/off → false (dedicated
+// per-proxy threads, default); 1/true/on → true (shared engine); otherwise throws.
 bool parse_rdma_shared_progress_env();
 
 struct RdmaWriteTargets {

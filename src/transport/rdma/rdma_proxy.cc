@@ -143,13 +143,15 @@ RdmaDataPlane parse_rdma_data_plane_env() {
 
 bool parse_rdma_shared_progress_env() {
     const char* env = std::getenv("NANO_NCCL_RDMA_SHARED_PROGRESS");
-    if (env == nullptr || env[0] == '\0' || std::strcmp(env, "1") == 0 ||
-        std::strcmp(env, "true") == 0 || std::strcmp(env, "on") == 0) {
-        return true;
-    }
-    if (std::strcmp(env, "0") == 0 || std::strcmp(env, "false") == 0 ||
-        std::strcmp(env, "off") == 0) {
+    // Default dedicated: A/B on this platform showed equal-or-better nano busbw
+    // vs shared; keep shared available via explicit 1/true/on.
+    if (env == nullptr || env[0] == '\0' || std::strcmp(env, "0") == 0 ||
+        std::strcmp(env, "false") == 0 || std::strcmp(env, "off") == 0) {
         return false;
+    }
+    if (std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0 ||
+        std::strcmp(env, "on") == 0) {
+        return true;
     }
     throw std::runtime_error(
         "NANO_NCCL_RDMA_SHARED_PROGRESS must be unset/\"\"/0/1/true/false/on/off");

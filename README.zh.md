@@ -87,7 +87,7 @@ host-pinned CTS slot ring）；未设置/`0` 保持 SEND/RECV。两种数据面�
   由 publisher 单次 `__threadfence_system` 再发布 `send_tail`，并配合
   system-scope release/acquire step counter（无 host bounce 路径）。双机 WRITE
   矩阵（float/fp16/bf16 × sum/avg/max/min，256 KiB–64 MiB）已刷新于
-  [performance.md](performance.md)，`#wrong=0`（含 shared RDMA progress）。MPI binding 使用 MPI C API，
+  [performance.md](performance.md)，`#wrong=0`（默认 dedicated progress；可用 env 切 shared）。MPI binding 使用 MPI C API，
   因此 Open MPI 不需要提供已废弃的 C++ binding library。
 
 ```bash
@@ -250,7 +250,7 @@ unsupported-operation 错误。
   双机须同一 commit（64 字节 `RdmaPeerInfo`）。SEND/WriteCts 从已注册 mapped
   FIFO 直接 post；worker 写完后由 publisher 单次 `__threadfence_system` 再推进
   `send_tail`（配合 system release/acquire step，无 host bounce）。小 Simple
-  slice 可在消费完 recv FIFO 后立刻 `post_recv_credit`。跨进程 RDMA edge 共用一个 host progress 线程复用全部本地 send/recv proxy。双机 WRITE 矩阵
+  slice 可在消费完 recv FIFO 后立刻 `post_recv_credit`。跨进程 RDMA edge 默认每条 proxy 独立 host 线程；设 `NANO_NCCL_RDMA_SHARED_PROGRESS=1` 可改为单线程 shared progress。双机 WRITE 矩阵
   （float/fp16/bf16 × sum/avg/max/min，256 KiB–64 MiB）已刷新于
   [performance.md](performance.md)，`#wrong=0`。
 

@@ -41,8 +41,8 @@ Optional environment:
   CUDA_VISIBLE_DEVICES
 
 Modes:
-  NANO_NCCL_RDMA_SHARED_PROGRESS=1  shared progress engine (default)
-  NANO_NCCL_RDMA_SHARED_PROGRESS=0  dedicated per-proxy threads
+  NANO_NCCL_RDMA_SHARED_PROGRESS=0  dedicated per-proxy threads (default)
+  NANO_NCCL_RDMA_SHARED_PROGRESS=1  shared progress engine
 
 Outputs under --out-dir:
   busbw.csv                 mode,run,size_bytes,nano_busbw,nccl_busbw,ratio

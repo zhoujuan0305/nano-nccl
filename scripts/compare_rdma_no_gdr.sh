@@ -38,7 +38,7 @@ Required environment (live run):
 Optional environment:
   NANO_NCCL_RDMA_GID_INDEX    forwarded to nano MPI ranks when set
   NANO_NCCL_RDMA_USE_WRITE    forwarded when set (1=WRITE+CTS, default SEND/RECV)
-  NANO_NCCL_RDMA_SHARED_PROGRESS  forwarded when set (1=shared engine, 0=dedicated)
+  NANO_NCCL_RDMA_SHARED_PROGRESS  forwarded when set (0/unset=dedicated default, 1=shared)
   NCCL_IB_GID_INDEX           forwarded to NCCL ranks when set
   CUDA_VISIBLE_DEVICES        default 0,1,2,3
   LD_LIBRARY_PATH             extra library path prefix (NCCL lib is prepended)
