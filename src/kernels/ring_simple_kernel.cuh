@@ -466,6 +466,108 @@ __device__ inline void reduce_broadcast_volatile_worker(
     }
 }
 
+// Early recv-credit two-phase path only for small slices: copy-out + credit
+// before local reduce helps 256 KiB-class (~few KiB/slice) but a second full
+// pass hurts large 1 MiB+ slices. Prefer single-pass reduce_volatile there.
+constexpr std::size_t kEarlyRecvCreditMaxBytes = 4096;
+
+// In-place reduce after recv was copied into dst (non-volatile). Enables early
+// post_recv_credit once the FIFO slot is fully consumed.
+template <typename T, RedOp kRedOp>
+__device__ inline void reduce_local_into_dst(const T* local, T* dst,
+                                             std::size_t count, int nworkers) {
+    if (threadIdx.x >= nworkers) return;
+    if constexpr (std::is_same_v<T, float>) {
+        if (aligned_vec4(local, dst, dst, count)) {
+            std::size_t vec_count = count / 4;
+            const float4* local4 = reinterpret_cast<const float4*>(local);
+            float4* dst4 = reinterpret_cast<float4*>(dst);
+            for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
+                float4 a = local4[i];
+                float4 b = dst4[i];
+                dst4[i] = make_float4(
+                    RedOpTraits<kRedOp, T>::apply(a.x, b.x),
+                    RedOpTraits<kRedOp, T>::apply(a.y, b.y),
+                    RedOpTraits<kRedOp, T>::apply(a.z, b.z),
+                    RedOpTraits<kRedOp, T>::apply(a.w, b.w));
+            }
+            return;
+        }
+    } else if constexpr (kIsPacked16<T>) {
+        if (aligned_packed16(local, dst, dst, count)) {
+            std::size_t vec_count = count / 8;
+            const uint4* local4 = reinterpret_cast<const uint4*>(local);
+            uint4* dst4 = reinterpret_cast<uint4*>(dst);
+            for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
+                dst4[i] = reduce_packed16<T, kRedOp>(local4[i], dst4[i]);
+            }
+            return;
+        }
+    }
+    for (std::size_t i = threadIdx.x; i < count; i += nworkers) {
+        dst[i] = RedOpTraits<kRedOp, T>::apply(local[i], dst[i]);
+    }
+}
+
+// dst1 holds consumed recv; reduce with local, optional Avg scale, write out+send.
+template <typename T, RedOp kRedOp>
+__device__ inline void reduce_local_broadcast_worker(
+    const T* local, T* dst0, T* dst1, std::size_t count, float inverse_nranks,
+    int nworkers) {
+    if (threadIdx.x >= nworkers) return;
+    if constexpr (std::is_same_v<T, float>) {
+        if (aligned_vec4(local, dst0, dst1, count)) {
+            std::size_t vec_count = count / 4;
+            const float4* local4 = reinterpret_cast<const float4*>(local);
+            float4* dst04 = reinterpret_cast<float4*>(dst0);
+            float4* dst14 = reinterpret_cast<float4*>(dst1);
+            for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
+                float4 a = local4[i];
+                float4 b = dst14[i];
+                float4 v = make_float4(
+                    RedOpTraits<kRedOp, T>::apply(a.x, b.x),
+                    RedOpTraits<kRedOp, T>::apply(a.y, b.y),
+                    RedOpTraits<kRedOp, T>::apply(a.z, b.z),
+                    RedOpTraits<kRedOp, T>::apply(a.w, b.w));
+                if constexpr (kRedOp == RedOp::Avg) {
+                    v.x = scale_avg(v.x, inverse_nranks);
+                    v.y = scale_avg(v.y, inverse_nranks);
+                    v.z = scale_avg(v.z, inverse_nranks);
+                    v.w = scale_avg(v.w, inverse_nranks);
+                }
+                dst04[i] = v;
+                dst14[i] = v;
+            }
+            return;
+        }
+    } else if constexpr (kIsPacked16<T>) {
+        if (aligned_packed16(local, dst0, dst1, count)) {
+            std::size_t vec_count = count / 8;
+            const uint4* local4 = reinterpret_cast<const uint4*>(local);
+            uint4* dst04 = reinterpret_cast<uint4*>(dst0);
+            uint4* dst14 = reinterpret_cast<uint4*>(dst1);
+            for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
+                uint4 value =
+                    reduce_packed16<T, kRedOp>(local4[i], dst14[i]);
+                if constexpr (kRedOp == RedOp::Avg) {
+                    value = scale_avg_packed16<T>(value, inverse_nranks);
+                }
+                dst04[i] = value;
+                dst14[i] = value;
+            }
+            return;
+        }
+    }
+    for (std::size_t i = threadIdx.x; i < count; i += nworkers) {
+        T v = RedOpTraits<kRedOp, T>::apply(local[i], dst1[i]);
+        if constexpr (kRedOp == RedOp::Avg) {
+            v = scale_avg(v, inverse_nranks);
+        }
+        dst0[i] = v;
+        dst1[i] = v;
+    }
+}
+
 // 等待 send 方有可用 slot（credit）。专用 threadIdx==1 轮询，对齐 NCCL connStepCache。
 template <typename T>
 __device__ inline bool wait_send_credit(
@@ -682,6 +784,45 @@ __device__ inline void post_recv_credit(
     }
 }
 
+// Fused RR publish: one full-block sync then recv_head + send_tail stores.
+// Avoids post_send_ready's nested __syncthreads after post_recv_credit.
+template <typename T>
+__device__ inline void post_recv_credit_and_send_ready(
+    transport::SimpleChannelArgs<T> args, std::uint64_t recv_step,
+    std::uint64_t send_step, std::size_t payload_bytes, bool data_stored,
+    int nworkers) {
+    (void)nworkers;
+    __syncthreads();
+    if (threadIdx.x == blockDim.x - 2) {
+        transport::shm::store_step(args.recv_head,
+                                   recv_step + transport::shm::kSimpleFifoSliceSteps);
+    }
+    if (threadIdx.x == blockDim.x - 1) {
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+        unsigned long long t_post0 = 0;
+        if (args.turnaround != nullptr) {
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_post0));
+        }
+#endif
+        if (args.send_payload_bytes != nullptr) {
+            args.send_payload_bytes[send_step % transport::shm::kSimpleFifoSteps] =
+                static_cast<std::uint32_t>(payload_bytes);
+        }
+        if (data_stored || args.send_payload_bytes != nullptr) {
+            __threadfence_system();
+        }
+        transport::shm::store_step(args.send_tail,
+                                   send_step + transport::shm::kSimpleFifoSliceSteps);
+#if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
+        if (args.turnaround != nullptr) {
+            unsigned long long t_post1;
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_post1));
+            atomicAdd(&args.turnaround->post_ns, t_post1 - t_post0);
+        }
+#endif
+    }
+}
+
 template <typename T, RedOp kRedOp>
 __device__ inline bool direct_send(
     transport::SimpleChannelArgs<T> args, const T* src,
@@ -756,9 +897,22 @@ __device__ inline bool recv_reduce_send(
         T* dst = args.send_fifo +
                      ((*send_step % transport::shm::kSimpleFifoSteps) *
                       args.slot_elems);
-        reduce_volatile_worker<T, kRedOp>(local + slice_offset, recv, dst, work,
-                                          nworkers);
-        __syncthreads();
+        if (work * sizeof(T) <= kEarlyRecvCreditMaxBytes) {
+            // Small: consume recv FIFO, credit peer early, then local reduce.
+            copy_volatile_worker(recv, dst, work, nworkers);
+            __syncthreads();
+            post_recv_credit<T>(args, *recv_step);
+            reduce_local_into_dst<T, kRedOp>(local + slice_offset, dst, work,
+                                             nworkers);
+            post_send_ready<T>(args, *send_step, work * sizeof(T), true,
+                               nworkers);
+        } else {
+            // Large: single-pass reduce_volatile + fused credit/send publish.
+            reduce_volatile_worker<T, kRedOp>(local + slice_offset, recv, dst,
+                                              work, nworkers);
+            post_recv_credit_and_send_ready<T>(args, *recv_step, *send_step,
+                                               work * sizeof(T), true, nworkers);
+        }
 #if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
         if (args.turnaround != nullptr && threadIdx.x == 0) {
             unsigned long long t_comp1;
@@ -767,8 +921,6 @@ __device__ inline bool recv_reduce_send(
             atomicAdd(&args.turnaround->count, 1ULL);
         }
 #endif
-        post_recv_credit<T>(args, *recv_step);
-        post_send_ready<T>(args, *send_step, work * sizeof(T), true, nworkers);
         *recv_step += transport::shm::kSimpleFifoSliceSteps;
         *send_step += transport::shm::kSimpleFifoSliceSteps;
         slice_offset += slice_size;
@@ -813,10 +965,24 @@ __device__ inline bool recv_reduce_copy_send(
         T* dst = args.send_fifo +
                      ((*send_step % transport::shm::kSimpleFifoSteps) *
                       args.slot_elems);
-        reduce_broadcast_volatile_worker<T, kRedOp>(
-            local + slice_offset, recv, out + slice_offset, dst, work,
-            inverse_nranks, nworkers);
-        __syncthreads();
+        if (work * sizeof(T) <= kEarlyRecvCreditMaxBytes) {
+            // Small: consume recv, credit early, then reduce+broadcast (Avg).
+            copy_volatile_worker(recv, dst, work, nworkers);
+            __syncthreads();
+            post_recv_credit<T>(args, *recv_step);
+            reduce_local_broadcast_worker<T, kRedOp>(
+                local + slice_offset, out + slice_offset, dst, work,
+                inverse_nranks, nworkers);
+            post_send_ready<T>(args, *send_step, work * sizeof(T), true,
+                               nworkers);
+        } else {
+            // Large: single-pass reduce_broadcast_volatile + fused publish.
+            reduce_broadcast_volatile_worker<T, kRedOp>(
+                local + slice_offset, recv, out + slice_offset, dst, work,
+                inverse_nranks, nworkers);
+            post_recv_credit_and_send_ready<T>(args, *recv_step, *send_step,
+                                               work * sizeof(T), true, nworkers);
+        }
 #if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
         if (args.turnaround != nullptr && threadIdx.x == 0) {
             unsigned long long t_comp1;
@@ -825,8 +991,6 @@ __device__ inline bool recv_reduce_copy_send(
             atomicAdd(&args.turnaround->count, 1ULL);
         }
 #endif
-        post_recv_credit<T>(args, *recv_step);
-        post_send_ready<T>(args, *send_step, work * sizeof(T), true, nworkers);
         *recv_step += transport::shm::kSimpleFifoSliceSteps;
         *send_step += transport::shm::kSimpleFifoSliceSteps;
         slice_offset += slice_size;
@@ -871,9 +1035,21 @@ __device__ inline bool recv_copy_send(
         T* dst = args.send_fifo +
                      ((*send_step % transport::shm::kSimpleFifoSteps) *
                       args.slot_elems);
-        copy_broadcast_volatile_worker<T, kRedOp>(
-            recv, out + slice_offset, dst, work, nworkers);
-        __syncthreads();
+        if (work * sizeof(T) <= kEarlyRecvCreditMaxBytes) {
+            // Small: broadcast copy then early credit + send publish.
+            copy_broadcast_volatile_worker<T, kRedOp>(
+                recv, out + slice_offset, dst, work, nworkers);
+            __syncthreads();
+            post_recv_credit<T>(args, *recv_step);
+            post_send_ready<T>(args, *send_step, work * sizeof(T), true,
+                               nworkers);
+        } else {
+            // Large: single copy + fused credit/send publish.
+            copy_broadcast_volatile_worker<T, kRedOp>(
+                recv, out + slice_offset, dst, work, nworkers);
+            post_recv_credit_and_send_ready<T>(args, *recv_step, *send_step,
+                                               work * sizeof(T), true, nworkers);
+        }
 #if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
         if (args.turnaround != nullptr && threadIdx.x == 0) {
             unsigned long long t_comp1;
@@ -882,8 +1058,6 @@ __device__ inline bool recv_copy_send(
             atomicAdd(&args.turnaround->count, 1ULL);
         }
 #endif
-        post_recv_credit<T>(args, *recv_step);
-        post_send_ready<T>(args, *send_step, work * sizeof(T), true, nworkers);
         *recv_step += transport::shm::kSimpleFifoSliceSteps;
         *send_step += transport::shm::kSimpleFifoSliceSteps;
         slice_offset += slice_size;
