@@ -166,9 +166,9 @@ enables WRITE+CTS (RC `WRITE_WITH_IMM` plus a host-pinned CTS slot ring). Both
 planes use registered host-pinned FIFO memory only — no GPUDirect RDMA; fair
 NCCL comparisons use `NCCL_NET_GDR_LEVEL=0`. The host proxy multi-flights WQEs
 up to Simple FIFO slice depth. SEND and WriteCts always post SGE from the
-registered mapped FIFO; correctness relies on all-worker
-`__threadfence_system` before `send_tail` publish plus system-scope
-release/acquire step counters (no host bounce path). Dual-host WRITE matrix
+registered mapped FIFO; correctness relies on publisher `fence.acq_rel.sys`
+plus relaxed `send_tail` store after the block sync (NCCL Simple postPeer
+pairing; no host bounce path). Dual-host WRITE matrix
 (float/fp16/bf16 × sum/avg/max/min, 256 KiB–64 MiB) validated `#wrong=0`.
 Both hosts must build the same commit (`RdmaPeerInfo` is 64 bytes). Set
 `NANO_NCCL_RDMA_IFNAME=<rdma-interface>` in every MPI process; set

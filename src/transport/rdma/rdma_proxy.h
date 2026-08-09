@@ -103,8 +103,8 @@ private:
 class RdmaSendProxy {
 public:
     // Always posts SGE from fifo_.data + fifo_mr_ (registered mapped FIFO).
-    // Visibility: all-worker __threadfence_system before send_tail +
-    // system-scope release/acquire step counters (no host bounce).
+    // Visibility: publisher fence.acq_rel.sys before send_tail (relaxed
+    // store) + host acquire loads (no host bounce).
     RdmaSendProxy(RdmaQp qp, ibv_mr* fifo_mr, RdmaProxyFifo fifo,
                   RdmaSendControl control, RdmaProxyIdentity identity,
                   int fifo_numa_node,

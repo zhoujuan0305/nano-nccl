@@ -31,6 +31,15 @@ __host__ __device__ inline int step_idx(int kind, int channel, int edge) {
     return (kind * kChannels + channel) * kRanks + edge;
 }
 
+// Match NCCL fence_acq_rel_sys + st_relaxed_sys_global publish pairing.
+__device__ __forceinline__ void fence_acq_rel_sys() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    asm volatile("fence.acq_rel.sys;" ::: "memory");
+#else
+    asm volatile("membar.sys;" ::: "memory");
+#endif
+}
+
 __device__ __forceinline__ std::uint64_t load_step(std::uint64_t* ptr) {
     std::uint64_t ans;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
@@ -51,6 +60,20 @@ __device__ __forceinline__ void store_step(std::uint64_t* ptr,
                                            std::uint64_t value) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     asm volatile("st.release.sys.global.u64 [%0], %1;"
+                 ::"l"(__cvta_generic_to_global(ptr)), "l"(value)
+                 : "memory");
+#else
+    asm volatile("st.volatile.global.u64 [%0], %1;"
+                 ::"l"(__cvta_generic_to_global(ptr)), "l"(value)
+                 : "memory");
+#endif
+}
+
+// After fence_acq_rel_sys, step publish is relaxed (NCCL postPeer).
+__device__ __forceinline__ void store_step_relaxed(std::uint64_t* ptr,
+                                                    std::uint64_t value) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    asm volatile("st.relaxed.sys.global.u64 [%0], %1;"
                  ::"l"(__cvta_generic_to_global(ptr)), "l"(value)
                  : "memory");
 #else

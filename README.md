@@ -86,12 +86,12 @@ opt into the WRITE+CTS data plane (RC `WRITE_WITH_IMM` plus a host-pinned CTS
 slot ring); unset/`0` keeps SEND/RECV. Both planes stay host-pin only — no
   GPUDirect RDMA. Compare against NCCL with `NCCL_NET_GDR_LEVEL=0`. SEND and
   WriteCts always post SGE from the registered mapped FIFO (`fifo_mr_`).
-  After worker FIFO stores, a single publisher `__threadfence_system` orders
-  visibility before `send_tail`, with system-scope release/acquire step
-  counters (no host bounce path). Dual-host WRITE matrix (float/fp16/bf16 ×
-  sum/avg/max/min, 256 KiB–64 MiB) is refreshed in [performance.md](performance.md)
-  with `#wrong=0`. The MPI binding uses the MPI C API, so an Open MPI
-  installation need not ship the retired C++ binding library.
+  After worker FIFO stores, the publisher uses NCCL-style `fence.acq_rel.sys`
+  plus a relaxed `send_tail` store (no host bounce path). Dual-host WRITE matrix
+  (float/fp16/bf16 × sum/avg/max/min, 256 KiB–64 MiB) is refreshed in
+  [performance.md](performance.md) with `#wrong=0` (dedicated progress default).
+  The MPI binding uses the MPI C API, so an Open MPI installation need not ship
+  the retired C++ binding library.
 
 ```bash
 cmake -S . -B build-rdma -DCMAKE_BUILD_TYPE=Release \
@@ -260,13 +260,13 @@ built with MPI/RDMA support.
   selects WRITE+CTS (still host-pin; fair NCCL baseline is
   `NCCL_NET_GDR_LEVEL=0`). Both hosts must build the same commit (64-byte
   `RdmaPeerInfo`). SEND/WriteCts post from the registered mapped FIFO; after
-  worker stores, a single publisher `__threadfence_system` orders visibility
-  before `send_tail` (plus system release/acquire steps; no host bounce).
-  Small Simple slices may post recv credit immediately after consuming the
-  recv FIFO. Cross-process RDMA edges default to dedicated per-proxy host threads;
-  set `NANO_NCCL_RDMA_SHARED_PROGRESS=1` for one shared progress thread. Dual-host WRITE matrix (float/fp16/bf16 × sum/avg/max/min,
-  256 KiB–64 MiB) refreshed in [performance.md](performance.md) with `#wrong=0`
-  (dedicated progress default; optional shared via env).
+  worker stores, the publisher uses `fence.acq_rel.sys` + relaxed `send_tail`
+  (NCCL Simple postPeer pairing; no host bounce). Small Simple slices may post
+  recv credit immediately after consuming the recv FIFO. Cross-process RDMA
+  edges default to dedicated per-proxy host threads; set
+  `NANO_NCCL_RDMA_SHARED_PROGRESS=1` for one shared progress thread. Dual-host
+  WRITE matrix (float/fp16/bf16 × sum/avg/max/min, 256 KiB–64 MiB) refreshed in
+  [performance.md](performance.md) with `#wrong=0`.
 
 P2P is a single-node transport. It requires CUDA peer access for the complete
 configured ring; it is not a multi-node or network transport. Socket uses a
