@@ -24,20 +24,12 @@ __host__ __device__ constexpr std::size_t simple_fifo_grain_elems() {
     return 512 / sizeof(T);
 }
 
-// step counter 在 mapped host memory 上；sm_70+ 用 system release/acquire，
-// 保证 GPU FIFO 写对 host proxy 可见后再推进 send_tail。
+// step counter 在 mapped host memory 上；sm_70+ 用 system release/acquire。
+// Publish path: block sync then st.release.sys(send_tail); consumers use
+// ld.acquire.sys so FIFO writes become visible with the doorbell.
 // kind: 0=send head / recv credit, 1=send ready / recv tail。
 __host__ __device__ inline int step_idx(int kind, int channel, int edge) {
     return (kind * kChannels + channel) * kRanks + edge;
-}
-
-// Match NCCL fence_acq_rel_sys + st_relaxed_sys_global publish pairing.
-__device__ __forceinline__ void fence_acq_rel_sys() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-    asm volatile("fence.acq_rel.sys;" ::: "memory");
-#else
-    asm volatile("membar.sys;" ::: "memory");
-#endif
 }
 
 __device__ __forceinline__ std::uint64_t load_step(std::uint64_t* ptr) {
@@ -60,20 +52,6 @@ __device__ __forceinline__ void store_step(std::uint64_t* ptr,
                                            std::uint64_t value) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     asm volatile("st.release.sys.global.u64 [%0], %1;"
-                 ::"l"(__cvta_generic_to_global(ptr)), "l"(value)
-                 : "memory");
-#else
-    asm volatile("st.volatile.global.u64 [%0], %1;"
-                 ::"l"(__cvta_generic_to_global(ptr)), "l"(value)
-                 : "memory");
-#endif
-}
-
-// After fence_acq_rel_sys, step publish is relaxed (NCCL postPeer).
-__device__ __forceinline__ void store_step_relaxed(std::uint64_t* ptr,
-                                                    std::uint64_t value) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-    asm volatile("st.relaxed.sys.global.u64 [%0], %1;"
                  ::"l"(__cvta_generic_to_global(ptr)), "l"(value)
                  : "memory");
 #else

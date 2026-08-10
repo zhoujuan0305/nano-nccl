@@ -61,7 +61,7 @@ def render_section(name: str, body: dict) -> str:
     if name == "rdma":
         parts.extend(
             [
-                "The nano-nccl runs explicitly request `--transport rdma` with `NANO_NCCL_RDMA_USE_WRITE=1` (WRITE+CTS over registered host-pinned FIFO). Aggregate transport is `mixed`: local ring edges resolve like `auto` (P2P when bidirectional NVLink peer access is available, otherwise SHM) while cross-host edges use RDMA. Host RDMA progress defaults to dedicated per-proxy threads (`NANO_NCCL_RDMA_SHARED_PROGRESS` unset/`0`); set `NANO_NCCL_RDMA_SHARED_PROGRESS=1` for a single shared progress thread. NCCL uses RDMA with `NCCL_NET_GDR_LEVEL=0` (host-pin / no GPUDirect RDMA). Ring Simple publish uses NCCL-style `fence.acq_rel.sys` + relaxed `send_tail` store after the publisher block sync. No two-host performance acceptance threshold has been established. Small-message NCCL points can show cold-start spikes (very low NCCL busbw / high nano/NCCL ratio); treat those as baseline noise rather than nano speedups.",
+                "The nano-nccl runs explicitly request `--transport rdma` with `NANO_NCCL_RDMA_USE_WRITE=1` (WRITE+CTS over registered host-pinned FIFO). Aggregate transport is `mixed`: local ring edges resolve like `auto` (P2P when bidirectional NVLink peer access is available, otherwise SHM) while cross-host edges use RDMA. Host RDMA progress defaults to dedicated per-proxy threads (`NANO_NCCL_RDMA_SHARED_PROGRESS` unset/`0`); set `NANO_NCCL_RDMA_SHARED_PROGRESS=1` for a single shared progress thread. NCCL uses RDMA with `NCCL_NET_GDR_LEVEL=0` (host-pin / no GPUDirect RDMA). Ring Simple publish advances `send_tail` with `st.release.sys` after the publisher block sync (host acquire loads). No two-host performance acceptance threshold has been established. Small-message NCCL points can show cold-start spikes (very low NCCL busbw / high nano/NCCL ratio); treat those as baseline noise rather than nano speedups.",
                 "",
             ]
         )
@@ -130,7 +130,7 @@ def render(doc: dict) -> str:
         "message sizes 256 KiB through 64 MiB, `-w 5`, and `-n 20`. "
         "NCCL uses `Ring`, `Simple`, four channels, and a 32 MiB buffer. "
         "RDMA SEND/WriteCts always post from the registered mapped FIFO (no host bounce; "
-        "visibility via publisher `fence.acq_rel.sys` + relaxed `send_tail` store, matching NCCL Simple postPeer)."
+        "visibility via publisher `st.release.sys(send_tail)` after block sync and host acquire loads)."
     )
     out.append("")
 

@@ -83,12 +83,12 @@ send/receive；host proxy 按 Simple FIFO slice 深度 multi-flight 提交 SEND/
 `NANO_NCCL_RDMA_USE_WRITE=1` 可选用 WRITE+CTS 数据面（RC `WRITE_WITH_IMM` +
 host-pinned CTS slot ring）；未设置/`0` 保持 SEND/RECV。两种数据面均为 host-pin，
   不使用 GPUDirect RDMA；与 NCCL 对比时请设 `NCCL_NET_GDR_LEVEL=0`。SEND 与
-  WriteCts 始终从已注册的 mapped FIFO（`fifo_mr_`）直接 post SGE。worker 写完后
-  publisher 使用与 NCCL Simple 一致的 `fence.acq_rel.sys` + relaxed `send_tail`
-  （无 host bounce 路径）。双机 WRITE 矩阵（float/fp16/bf16 × sum/avg/max/min，
-  256 KiB–64 MiB）已刷新于 [performance.md](performance.md)，`#wrong=0`（默认
-  dedicated progress；可用 env 切 shared）。MPI binding 使用 MPI C API，
-  因此 Open MPI 不需要提供已废弃的 C++ binding library。
+  WriteCts 始终从已注册的 mapped FIFO（`fifo_mr_`）直接 post SGE。worker 写完并
+  block sync 后，publisher 以 `st.release.sys` 推进 `send_tail`，proxy 侧
+  acquire 加载（无 host bounce 路径）。双机 WRITE 矩阵（float/fp16/bf16 ×
+  sum/avg/max/min，256 KiB–64 MiB）已刷新于 [performance.md](performance.md)，
+  `#wrong=0`（默认 dedicated progress；可用 env 切 shared）。MPI binding 使用
+  MPI C API，因此 Open MPI 不需要提供已废弃的 C++ binding library。
 
 ```bash
 cmake -S . -B build-rdma -DCMAKE_BUILD_TYPE=Release \
@@ -248,12 +248,12 @@ unsupported-operation 错误。
   时用 P2P，否则 SHM）。默认数据面为 SEND/RECV；`NANO_NCCL_RDMA_USE_WRITE=1`
   选用 WRITE+CTS（仍为 host-pin；与 NCCL 公平对比请用 `NCCL_NET_GDR_LEVEL=0`）。
   双机须同一 commit（64 字节 `RdmaPeerInfo`）。SEND/WriteCts 从已注册 mapped
-  FIFO 直接 post；worker 写完后 publisher 使用 `fence.acq_rel.sys` + relaxed
-  `send_tail`（对齐 NCCL Simple postPeer；无 host bounce）。小 Simple slice
-  可在消费完 recv FIFO 后立刻 `post_recv_credit`。跨进程 RDMA edge 默认每条
-  proxy 独立 host 线程；设 `NANO_NCCL_RDMA_SHARED_PROGRESS=1` 可改为单线程
-  shared progress。双机 WRITE 矩阵（float/fp16/bf16 × sum/avg/max/min，
-  256 KiB–64 MiB）已刷新于 [performance.md](performance.md)，`#wrong=0`。
+  FIFO 直接 post；worker 写完并 block sync 后 publisher 以 `st.release.sys`
+  推进 `send_tail`（host acquire；无 host bounce）。小 Simple slice 可在消费完
+  recv FIFO 后立刻 `post_recv_credit`。跨进程 RDMA edge 默认每条 proxy 独立
+  host 线程；设 `NANO_NCCL_RDMA_SHARED_PROGRESS=1` 可改为单线程 shared
+  progress。双机 WRITE 矩阵（float/fp16/bf16 × sum/avg/max/min，256 KiB–64 MiB）
+  已刷新于 [performance.md](performance.md)，`#wrong=0`。
 
 P2P 是单机通信路径，需要每对完整配置环邻居之间的双向 CUDA peer access；它不是多机或网络通信路径。socket 使用可信、仅 IPv4 的 TCP 网络边界，不提供 TLS 或自动重连。
 

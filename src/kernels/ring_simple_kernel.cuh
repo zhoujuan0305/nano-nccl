@@ -745,10 +745,11 @@ __device__ inline void post_send_ready(
     std::size_t payload_bytes, bool data_stored, int nworkers) {
     std::uint64_t* tail = args.send_tail;
     // Workers wrote FIFO before entry. Full-block sync (publisher is
-    // blockDim-1, outside nworkers) then NCCL-style fence.acq_rel.sys +
-    // st.relaxed.sys on send_tail for host RDMA/socket proxies — no
-    // per-worker fence and no release store after the system fence.
+    // blockDim-1, outside nworkers) then a single st.release.sys on
+    // send_tail for host RDMA/socket proxies (acquire loads on the
+    // consumer). No separate fence.acq_rel.sys before the doorbell.
     (void)nworkers;
+    (void)data_stored;
     __syncthreads();
     if (threadIdx.x == blockDim.x - 1) {
 #if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
@@ -761,16 +762,8 @@ __device__ inline void post_send_ready(
             args.send_payload_bytes[step % transport::shm::kSimpleFifoSteps] =
                 static_cast<std::uint32_t>(payload_bytes);
         }
-        const bool need_fence =
-            data_stored || args.send_payload_bytes != nullptr;
-        if (need_fence) {
-            transport::shm::fence_acq_rel_sys();
-            transport::shm::store_step_relaxed(
-                tail, step + transport::shm::kSimpleFifoSliceSteps);
-        } else {
-            transport::shm::store_step(
-                tail, step + transport::shm::kSimpleFifoSliceSteps);
-        }
+        transport::shm::store_step(
+            tail, step + transport::shm::kSimpleFifoSliceSteps);
 #if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
         if (args.turnaround != nullptr) {
             unsigned long long t_post1;
@@ -814,18 +807,10 @@ __device__ inline void post_recv_credit_and_send_ready(
             args.send_payload_bytes[send_step % transport::shm::kSimpleFifoSteps] =
                 static_cast<std::uint32_t>(payload_bytes);
         }
-        const bool need_fence =
-            data_stored || args.send_payload_bytes != nullptr;
-        if (need_fence) {
-            transport::shm::fence_acq_rel_sys();
-            transport::shm::store_step_relaxed(
-                args.send_tail,
-                send_step + transport::shm::kSimpleFifoSliceSteps);
-        } else {
-            transport::shm::store_step(
-                args.send_tail,
-                send_step + transport::shm::kSimpleFifoSliceSteps);
-        }
+        (void)data_stored;
+        transport::shm::store_step(
+            args.send_tail,
+            send_step + transport::shm::kSimpleFifoSliceSteps);
 #if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
         if (args.turnaround != nullptr) {
             unsigned long long t_post1;
