@@ -1,298 +1,401 @@
 # AGENTS.md
 
-## Project Positioning
+## Project Mission
 
-This project is a GPU collective communication library targeting NCCL-equivalent All Reduce performance.
+nano-nccl is a deliberately narrow GPU collective communication library and an
+NCCL differential performance research project. It focuses on one algorithm
+and one protocol so that their implementation can be understood end to end:
 
-Current capabilities:
+- algorithm: Ring only
+- protocol: Simple only
+- collectives: out-of-place AllReduce, ReduceScatter, and AllGather
+- transports: per-edge SHM, P2P, and NET
+- NET backends: Socket reference path, host-pinned RDMA, and eventually
+  GPUDirect RDMA
+- device code: generated specialization registry backed by readable,
+  handwritten CUDA templates
 
-- Single-node multi-GPU performance path (tested with `CUDA_VISIBLE_DEVICES=0,1,2,3`; rank count configurable via CMake `NANO_NCCL_NRANKS`)
-- Optional MPI/socket and MPI/RDMA multi-host, out-of-place `all_reduce` correctness paths; Open MPI 4.1.2 and the same MPI ABI are required on all hosts. MPI targets use the MPI C API and do not require Open MPI's retired C++ binding library.
-- `float`, FP16, and BF16 dtypes with `sum`, `avg`, `max`, and `min` reduce ops, out-of-place; `avg` is `sum / nranks`, `max`/`min` propagate NaN. `float` and FP16 require SM70+ because Simple FIFO counters use system-scope release/acquire operations; BF16 requires SM80+
-- Ring + Simple protocol, with SHM FIFO, device P2P FIFO, optional MPI/socket transport, and optional MPI/RDMA transport
-- MPI/RDMA correctness is validated across `float`, FP16, and BF16; `sum`, `avg`, `max`, and `min`; and 256 KiB through 64 MiB. The BF16 device-capability validation is cached after its first successful use; the full A6000 single-host performance gate is pending revalidation (see Acceptance section below)
+The primary engineering question is not merely whether nano-nccl is fast. The
+project must explain why NCCL is fast on the scoped Ring + Simple path, where
+nano-nccl is equivalent, where it is intentionally different, and which
+differences cause measured performance gaps.
 
-Future expansion axes:
+This is intended to be a solid, explainable systems project. Prefer depth,
+causal evidence, and complete vertical paths over feature count.
 
-- **dtype**: `float`/FP16/BF16 → `double`/`int8`
-- **reduce op**: `sum`/`avg`/`max`/`min` → `prod`
-- **rank count**: 4 → 2/8/16 (runtime parameter, no template specialization needed)
-- **collective**: `all_reduce` → `all_gather`/`reduce_scatter`/`broadcast`
-- **transport**: SHM FIFO/P2P FIFO → network
+## Scope Contract
 
-`all_gather` and `reduce_scatter` are unsupported. There is no multi-host performance gate. Socket has no TLS or automatic reconnect; use it only on a trusted network. RDMA defaults to RC send/receive over registered host-pinned FIFO memory; `NANO_NCCL_RDMA_USE_WRITE=1` enables WRITE+CTS. Neither path uses GPUDirect RDMA (compare with `NCCL_NET_GDR_LEVEL=0`); the host proxy multi-flights WQEs up to Simple FIFO slice depth. Both hosts must use the same commit (`RdmaPeerInfo` is 64 bytes). Do not claim general NCCL replacement capability until expansion is complete.
+The target supported matrix is:
+
+- **Collectives**: AllReduce, ReduceScatter, AllGather
+- **Buffer semantics**: out-of-place only; arbitrary overlap and in-place are
+  unsupported
+- **Dtypes**: `float`, FP16, BF16
+- **Reduce ops**: `sum`, `avg`, `max`, `min`; AllGather has no reduce op
+- **Algorithms**: Ring only
+- **Protocols**: Simple only
+- **Rank specializations**: 2, 4, and 8
+- **API**: a small native C++ API; no NCCL API or ABI compatibility promise
+
+Do not add Tree, CollNet, NVLS, LL, LL128, `double`, `int8`, `prod`, in-place
+semantics, broadcast, or ranks outside 2/4/8 unless this contract is explicitly
+revisited. Do not add placeholder abstractions for out-of-scope features.
+
+nano-nccl is not a general NCCL replacement and must never be described as a
+drop-in replacement.
+
+## Current Implementation Snapshot
+
+Keep the distinction between current behavior and target architecture clear:
+
+- AllReduce is the only implemented collective. Public ReduceScatter and
+  AllGather methods currently report unsupported operations.
+- dtype and reduce op are compile-time kernel dimensions, but `nranks` is still
+  a runtime kernel argument and `NANO_NCCL_NRANKS` fixes host-side sizing.
+- Single-host SHM and P2P paths exist. Transport selection is resolved per Ring
+  edge and can produce a mixed plan.
+- MPI/socket and MPI/RDMA paths exist for cross-process AllReduce.
+- RDMA currently uses registered host-pinned FIFO memory. SEND/RECV and
+  WRITE+CTS modes exist; GPUDirect RDMA does not.
+- `src/collective/collective.h` and `src/transport/transport.h` are empty virtual
+  seams, not the target abstraction.
+- The active Simple implementation lives under `src/transport/simple/`; a
+  future ownership cleanup must be evidence-driven rather than a mechanical
+  rename.
+
+Do not claim target features as implemented until their correctness and
+acceptance matrices pass.
+
+## Research-First Development Order
+
+Do not begin broad collective or architecture expansion before the scoped NCCL
+mechanism model is established.
+
+### Phase 1: Explain Existing AllReduce
+
+Study NCCL and nano-nccl from public call through device and transport progress:
+
+1. collective semantics and enqueue path
+2. communicator, topology, channel planning, and kernel dispatch
+3. generated function tables and compile-time specialization
+4. Ring phase, chunk, channel, and slice work partition
+5. Simple FIFO, step, credit, and persistent progress
+6. device thread/warp roles, barriers, copy/reduce vectorization
+7. memory ordering and GPU/device/host visibility
+8. SHM, P2P, NET memory placement and progress
+9. async failure, abort, teardown, and resource ownership
+
+Phase 1 is complete only when:
+
+- the NCCL AllReduce + Ring + Simple host-to-device path has a source map;
+- every performance-critical nano-nccl mechanism is classified as equivalent,
+  different, missing, extra, or unknown;
+- confirmed causal claims have controlled A/B or profiling evidence;
+- unresolved performance-critical unknowns have explicit experiment plans;
+- current contract-size performance gaps can be explained without relying on a
+  single benchmark run; and
+- adopted and rejected NCCL mechanisms both have written rationale.
+
+### Phase 2: Build the Scoped Library Architecture
+
+Use Phase 1 evidence to implement typed collective descriptors, real Ring and
+Simple boundaries, generated rank specializations, ReduceScatter, AllGather,
+and a shared composition for AllReduce.
+
+### Phase 3: Deepen NET
+
+Retain Socket as a reference NET data-plane backend, characterize host-pinned
+RDMA, then implement and compare GPUDirect RDMA. Compare host-pinned paths with
+NCCL GDR disabled and GDR paths with NCCL GDR enabled.
+
+## Local Workspace And Worktrees
+
+Machine-specific paths are stored in an untracked workspace registry. Locate it
+with:
+
+```bash
+git config --local --get nano-nccl.workspaceConfig
+```
+
+The configured file is normally named `.local/workspace.yaml` in the primary
+nano-nccl checkout. It records the local nano-nccl, NCCL, nccl-tests, and
+experiments repositories, the external worktree root, and the raw artifact
+root. Never copy its absolute paths into tracked files.
+
+All development, rebuilds, commit switching, and temporary experiments for
+nano-nccl, NCCL, and nccl-tests must run in dedicated Git worktrees:
+
+```text
+<worktree-root>/<repository>/<branch-name>/
+```
+
+Rules:
+
+- Primary checkouts are coordination points only. Do not switch their commits,
+  build in them, or apply experimental patches there.
+- Create a dedicated worktree before modifying source, rebuilding a reference
+  project, or running a commit-specific experiment.
+- Inspect `git status` and `git worktree list` before acting.
+- Treat unknown changes as user work. Never discard, reset, clean, or overwrite
+  them.
+- Switching detached commits and applying temporary instrumentation are allowed
+  only in the worktree created for that experiment.
+- Do not delete worktrees or branches unless explicitly requested.
+- Build directories and large captures stay in the worktree or configured raw
+  artifact root, never in a primary checkout.
+- If the local registry is unavailable, ask for the local setup instead of
+  guessing absolute paths.
+
+The NCCL and nccl-tests source trees are research inputs, not nano-nccl build
+dependencies.
+
+## Evidence And NCCL Differential Analysis
+
+Experiment records live in the configured experiments repository under its
+`nano-nccl/` domain and follow that directory's `AGENTS.md`. Large raw logs,
+Nsight captures, binaries, and generated files live under the configured local
+artifact root.
+
+Every performance-oriented change must have this evidence chain:
+
+```text
+GAP-ID
+  -> hypothesis
+  -> NCCL source reference
+  -> nano-nccl source reference
+  -> controlled experiment
+  -> correctness result
+  -> profiling or counter evidence
+  -> repeated performance result
+  -> keep, reject, or remain-unknown decision
+```
+
+Source references include repository, commit SHA, relative file path, and
+symbol. Never claim how NCCL works from memory when the configured NCCL source
+can be inspected.
+
+Use these gap classifications:
+
+- `Equivalent`: mechanism and relevant semantics are equivalent.
+- `Different`: same purpose, materially different implementation.
+- `Missing`: NCCL has a scoped mechanism that nano-nccl lacks.
+- `Extra`: nano-nccl has a mechanism not present in the scoped NCCL path.
+- `Unknown`: evidence is insufficient.
+
+Also label each difference as correctness-critical, performance-critical,
+engineering trade-off, or intentional scope difference.
+
+Implementation difference alone does not establish performance causality. NCCL
+having a mechanism does not imply nano-nccl should copy it. Failed experiments
+are durable results and must be recorded so they are not repeated.
+
+## Target Architecture
+
+The target data flow is:
+
+```text
+typed collective descriptor
+  -> semantic validation and normalization
+  -> collective lowering
+  -> Ring schedule and work partition
+  -> generated specialization registry
+  -> handwritten Ring + Simple kernel template
+  -> per-edge SimpleConnectionView
+  -> SHM | P2P | NET(Socket | host-pinned RDMA | GDR)
+```
+
+### Collective Semantics
+
+The semantic layer describes what the operation means, not how to execute it.
+Use distinct typed descriptors for AllReduce, ReduceScatter, and AllGather.
+They own buffer layout, element counts, dtype, applicable redop, streams, and
+out-of-place validation.
+
+Do not use a generic bag of optional fields and do not encode Ring phases,
+channels, Simple steps, transport policy, or kernel specialization in public
+descriptors. If internal unified dispatch is needed, use a typed variant of
+normalized tasks.
+
+### Ring And Simple
+
+- Collective lowering maps a normalized task to Ring phases.
+- Ring owns rank order, phase ordering, channel/chunk work partition, and
+  collective-specific chunk ownership.
+- Simple owns FIFO layout, slice/step geometry, credit, persistent directional
+  progress, memory ordering, and device send/recv/reduce primitives.
+- Collective code must not duplicate Simple primitives.
+- Simple must not own transport allocation or NET progress.
+
+### Transport
+
+Transport answers how one directed Ring edge stores, exposes, and progresses
+Simple data. It does not know collective semantics.
+
+- Resolve transport per directed edge; mixed SHM/P2P/NET Rings are supported.
+- SHM owns mapped host storage and mapping.
+- P2P owns peer device storage, peer mapping, and capability checks.
+- NET is a first-class transport family. Socket, host-pinned RDMA, and GDR are
+  NET backends or data-plane modes.
+- Backends own connection establishment, memory placement/registration,
+  proxy/progress, capability checks, and teardown.
+- Kernels consume one transport-neutral device-side `SimpleConnectionView`.
+- Transport backend must not become a kernel template dimension.
+- `auto` may select according to topology and capabilities. An explicitly
+  requested backend must fail rather than silently fall back.
+- Report the actual backend of every directed edge; an aggregate `mixed` label
+  alone is insufficient.
+
+### Kernel Generation
+
+Handwrite readable CUDA templates. Generate only explicit instantiations,
+launch wrappers, and the runtime registry.
+
+The valid specialization dimensions are:
+
+```text
+collective x dtype x applicable redop x nranks
+```
+
+The default rank set is exactly 2, 4, and 8. AllGather has no redop dimension.
+Transport and channel count are not specialization dimensions. Rank is a
+non-type template parameter so Ring phases and rank arithmetic can be compiled
+and unrolled for each supported rank.
+
+Generated files belong in the build directory and are not committed. A missing
+specialization must fail during communicator setup or dispatch and list the
+compiled rank set. Build reporting should expose generated combination count,
+compile time, and binary size so specialization does not grow without review.
+
+## Error Model
+
+- Invalid descriptors, unsupported rank specialization, and unavailable
+  explicitly selected backends fail synchronously before launch.
+- Asynchronous NET/proxy failures latch the communicator's first stable error
+  and publish a GPU-visible abort so kernels do not spin forever.
+- After a latched async error, the communicator rejects new collective work.
+- `check_async_error()` reports the stable root error.
+- Teardown is idempotent and handles partial initialization and asynchronous
+  failure.
+- Mixed-plan errors identify the directed edge and actual backend.
+- All CUDA API calls use checked error handling.
+
+## Testing Strategy
+
+Required coverage includes:
+
+- typed descriptor count, layout, dtype/redop, stream, and out-of-place rules;
+- Ring phase and chunk ownership for ranks 2/4/8 and boundary message sizes;
+- Simple FIFO layout, step/credit persistence, ordering, and abort behavior;
+- generator completeness for valid combinations and rejection of invalid ones;
+- SHM, P2P, Socket, host-pinned RDMA, GDR, and mixed edge plans;
+- correctness for every combination claimed as supported;
+- differential outputs against NCCL for matching semantics;
+- bootstrap, peer disconnect, proxy failure, partial initialization, and cleanup
+  fault injection; and
+- performance regression and NCCL-relative acceptance campaigns.
+
+Only claim combinations tested on the stated hardware, rank count, and
+transport. Generated code without execution coverage is not validated support.
+
+## Performance Acceptance
+
+Use `-w 5 -n 20` for acceptance measurements. Candidate binaries must have
+profiling and investigation-only instrumentation disabled. Observability builds
+cannot provide acceptance numbers.
+
+NCCL comparisons must be same-round and match all relevant conditions:
+
+- Ring algorithm and Simple protocol
+- collective and out-of-place semantics
+- ranks, dtype, redop, and message sizes
+- channels and buffer size
+- topology and transport class
+- GDR disabled for host-pinned comparison, enabled for GDR comparison
+
+For each declared contract matrix:
+
+- nano-nccl/NCCL busbw geomean must be at least `0.95`;
+- every contract message-size ratio must be at least `0.90`; and
+- regression against the accepted nano-nccl baseline must not exceed `3%`.
+
+Every result below NCCL requires a written causal explanation or remains an
+open `Unknown` gap. Per-size parity or wins are stretch results, not the sole
+definition of project correctness. Correctness must pass before performance is
+interpreted.
+
+Historical performance tables predate this contract unless explicitly
+revalidated under it.
 
 ## Sensitive Information
 
-Do not write hostnames, IP addresses, physical interface names, MAC addresses, GPU UUIDs, absolute user home paths, credentials, or tokens to files that can be committed to Git. Use placeholders such as `<host-a>`, `<interface>`, and `<path-to-nccl-lib>` in documentation, examples, tests, and logs.
+Do not write hostnames, IP addresses, physical interface names, MAC addresses,
+GPU UUIDs, absolute user paths, credentials, or tokens to files that can be
+committed. Use placeholders such as `<host-a>`, `<interface>`,
+`<path-to-nccl-lib>`, and `<local-artifact-root>`.
 
-## Directory Structure
-
-```
-nano-nccl/
-├── CMakeLists.txt
-├── AGENTS.md
-├── include/nano_nccl/
-│   ├── types.h                        # dtype/redop/config enums and structs
-│   ├── traits.h                       # dtype traits (pack/unpack), redop traits
-│   ├── communicator.h                 # public communicator and collective API
-│   ├── mpi.h                          # optional MPI communicator factory
-│   └── all_reduce.h                   # public benchmark API
-├── src/
-│   ├── CMakeLists.txt
-│   ├── core/
-│   │   ├── buffer.h / buffer.cu       # DeviceBuffer/MappedBuffer/RegisteredMappedBuffer
-│   │   ├── numa.h / numa.cu           # NUMA mapping
-│   │   └── stream.h                   # Stream/Event/GraphExec RAII wrappers
-│   ├── transport/
-│   │   ├── transport.h                # Transport interface (seam for network)
-│   │   ├── simple/
-│   │   │   ├── protocol.h             # Simple FIFO layout and protocol constants
-│   │   │   ├── step.h                 # System-scope FIFO step ordering
-│   │   │   └── geometry.h             # Simple FIFO slice geometry
-│   │   ├── p2p/
-│   │   │   ├── p2p_fifo.h / .cu       # Device FIFO storage
-│   │   │   ├── p2p_step_counters.h/.cu # Device P2P step counters
-│   │   │   └── p2p_topology.h / .cu   # Ring peer-access checks
-│   │   ├── shm/
-│   │   │   └── shm_fifo.h             # Mapped host FIFO storage/control only
-│   │   ├── socket/
-│   │       ├── socket_endpoint.h / .cc # IPv4 endpoint and HELLO exchange
-│   │       ├── socket_protocol.h       # framed socket slice protocol
-│   │       └── socket_proxy.h / .cc    # host send/receive proxy threads
-│   │   └── rdma/
-│   │       ├── rdma_endpoint.h / .cc   # HCA selection, PD/CQ allocation
-│   │       ├── rdma_qp.h / .cc         # RC QP lifecycle
-│   │       ├── rdma_protocol.h          # QP bootstrap peer information
-│   │       └── rdma_proxy.h / .cc       # host send/receive proxy threads
-│   ├── collective/
-│   │   ├── collective.h               # Collective interface (seam for all_gather etc.)
-│   │   └── all_reduce/
-│   │       ├── communicator.cu         # communicator orchestration and transports
-│   │       ├── communicator_internal.h  # factory and owned socket connections
-│   │       ├── mpi_communicator.cc     # MPI bootstrap and socket connection exchange
-│   │       ├── topology.h / .cc         # local/global rank and edge topology
-│   │       ├── ring_simple_geometry.h  # Ring channel/rank work partitioning
-│   │       └── ring_simple.h / .cu      # single-host benchmark implementation
-│   └── kernels/
-│       └── ring_simple_kernel.cuh     # device kernel template
-├── benchmarks/
-│   ├── CMakeLists.txt
-│   └── all_reduce_bench.cu            # correctness + perf integrated benchmark
-├── tests/
-│   ├── CMakeLists.txt
-│   ├── communicator_cleanup_static.py # communicator cleanup static regression check
-│   ├── communicator_bf16_validation_static.py # BF16 validation-cache static regression check
-│   ├── smoke.cu                       # CUDA device/P2P smoke test
-│   ├── correctness.cu                 # single-host all_reduce correctness
-│   ├── public_api.cu                   # public communicator API coverage
-│   ├── p2p_step_counters.cu            # P2P step-counter coverage
-│   ├── p2p_topology.cu                 # P2P topology coverage
-│   ├── mpi_bootstrap.cu               # MPI bootstrap and socket smoke coverage
-│   ├── mpi_correctness.cu             # MPI/socket correctness and fault injection
-│   ├── socket_protocol_test.cc         # socket framing and proxy behavior
-│   └── simple_protocol.cu              # Simple protocol layout invariants
-└── LICENSE
-```
-
-Directory responsibilities:
-
-- `include/nano_nccl/`: public headers; `mpi.h` is available only in an MPI build
-- `src/core/`: infrastructure, collective-agnostic (buffer, NUMA, stream)
-- `src/transport/`: transport abstraction, subdirectories per transport type
-- `src/transport/simple/`: Simple FIFO layout, step ordering, and slice geometry
-- `src/transport/shm/`: mapped host FIFO storage and control only
-- `src/collective/all_reduce/ring_simple_geometry.h`: Ring channel/rank work partitioning
-- `src/collective/`: collective operation abstraction, subdirectories per collective type
-- `src/kernels/`: device kernel template headers (`.cuh`), referenced and instantiated by collective implementations
-- `benchmarks/`: perf + correctness integrated benchmark
-- `tests/`: single-host, MPI/socket, transport, and protocol regression coverage
-
-## Naming Conventions
-
-| Category | Style | Examples |
-|---|---|---|
-| Class/struct | PascalCase | `MappedBuffer`, `AllReduceRunner` |
-| Function | snake_case | `wait_send_credit`, `run_ring_simple` |
-| Constants | kPascalCase | `kRanks`, `kChannels`, `transport::simple::kFifoSteps` |
-| Namespace | snake_case, layered | `nano_nccl::core`, `nano_nccl::transport::shm` |
-| File | snake_case | `buffer.h`, `ring_simple.cu` |
-| Algorithm name | snake_case | `ring_simple` |
-| Kernel template | snake_case + template params | `ring_simple_kernel<T, RedOp>` |
-
-Namespace layering maps 1:1 to directory structure:
-
-- `nano_nccl::core` — buffer, numa, stream
-- `nano_nccl::transport::simple` — Simple FIFO layout, step ordering, and slice geometry
-- `nano_nccl::transport::p2p` — device FIFO, P2P ring validation
-- `nano_nccl::transport::shm` — mapped host FIFO storage and control
-- `nano_nccl::transport::socket` — IPv4 endpoints and socket proxy threads
-- `nano_nccl::transport::rdma` — RoCE/IB endpoint, RC QP, and send/recv proxy threads
-- `nano_nccl::collective::all_reduce` — all_reduce host-side orchestration
-- `nano_nccl::kernels` — device kernel templates
+The untracked workspace registry may contain local absolute paths. Raw local
+artifacts may contain machine details, but they must remain outside tracked
+content. Before committing experiment-derived material, scan it for sensitive
+values.
 
 ## Coding Standards
 
-- **Indentation**: 4 spaces, no tabs
-- **Error handling**: `CUDA_CHECK_THROW` macro + `throw std::runtime_error`; all CUDA API calls must check errors
-- **Header guard**: `#pragma once`
-- **Include order**: self → C++ standard library → CUDA → system
-- **Line width**: no hard limit
-- **Comments**:
-  - Write comments when code logic is not intuitive
-  - Comments explain "why", not "what"
-  - Comments go on the line above the code
-  - Write comments where things are easy to misunderstand
-  - Do not add comments to obvious code
+- Indent with 4 spaces; do not use tabs.
+- Use `#pragma once` for headers.
+- Include order: own header, C++ standard library, CUDA, then system headers.
+- Use `CUDA_CHECK_THROW` and `throw std::runtime_error`; check every CUDA API
+  call.
+- Classes and structs use PascalCase; functions and files use snake_case;
+  constants use kPascalCase; namespaces mirror directory ownership.
+- Comments explain non-obvious reasons, invariants, ordering, or ownership.
+  Do not comment obvious mechanics.
+- Prefer the smallest change that can test the current hypothesis.
+- Do not add compatibility layers, generic factories, or virtual interfaces
+  without a concrete current consumer.
 
-## Architecture
+## Build Snapshot
 
-**Hybrid polymorphism: device templates + host runtime**
-
-- **Device kernel** is templated: `template<typename T, typename RedOp> __global__ void ring_simple_kernel(...)` with `int nranks` as a runtime argument. dtype and reduce op are compile-time parameters; rank count is runtime (benchmarked lossless vs. template specialization on 4× A6000: geomean busbw ratio 1.003/0.997/0.998 for float/fp16/bf16 across 256 KiB – 64 MiB).
-- **Host side** uses runtime parameters to select algo/transport/collective, does not require compiling all combinations.
-- **Transport**: SHM FIFO, device P2P FIFO, MPI/socket, or optional MPI/RDMA for cross-process ring edges. SHM GPUs read/write mapped host memory directly over PCIe (`cudaHostAllocMapped`), with no proxy thread or `cudaMemcpy`; FIFO buffers are allocated on the receiver NUMA node to avoid cross-NUMA bandwidth loss. P2P FIFO buffers are allocated on the receiver GPU and require bidirectional CUDA peer access between every ring-neighbor pair. Socket uses an IPv4 listener chosen by `NANO_NCCL_SOCKET_IFNAME`; it is a trusted-network transport without TLS or auto reconnect. RDMA defaults to RC send/recv over a host-pinned, registered FIFO; set `NANO_NCCL_RDMA_USE_WRITE=1` for the WRITE+CTS host-pin data plane. The proxy multi-flights WQEs up to Simple FIFO slice depth and does not use GPUDirect RDMA (compare with `NCCL_NET_GDR_LEVEL=0`); it is selected only by explicit `--transport rdma` and requires the MPI/RDMA build plus `NANO_NCCL_RDMA_IFNAME`. Both hosts must build the same commit (`RdmaPeerInfo` is 64 bytes).
-- **Protocol ownership**: `src/transport/simple/` owns FIFO layout, step ordering, and slice geometry, including distinct send and recv base steps for persistent directional progress; `src/transport/shm/` owns mapped host FIFO storage/control only; `src/collective/all_reduce/ring_simple_geometry.h` owns Ring channel/rank work partitioning. Transport runtime lifecycle and orchestration remain in `Communicator::Impl`; they have not moved into the Simple protocol module.
-
-### Transport selection
-
-The benchmark `--transport` option accepts `auto`, `shm`, `p2p`, and `rdma`. `auto`
-(the default) resolves each ring edge independently: it selects P2P for an edge
-only when that edge has an active, direct NVLink and CUDA peer access in both
-directions (`rank i -> rank (i + 1) % nranks` and the reverse); all other edges
-use SHM. Its aggregate transport is `shm`, `p2p`, or `mixed` according to the
-resolved edge plan. `shm` always selects SHM. Explicit `p2p` validates those
-directions and fails on the first unavailable direction; it does not fall back.
-P2P is single-node only and is not a network transport.
-
-`rdma` requires `NANO_NCCL_ENABLE_MPI=ON` and `NANO_NCCL_ENABLE_RDMA=ON` at
-build time. It resolves cross-process ring edges to RDMA and resolves local
-edges like `auto` (P2P when bidirectional NVLink peer access is available,
-otherwise SHM). Aggregate transport is still `mixed` when local and RDMA edges
-coexist. The default data plane is RC SEND/RECV; `NANO_NCCL_RDMA_USE_WRITE=1`
-enables WRITE+CTS (RC `WRITE_WITH_IMM` plus a host-pinned CTS slot ring). Both
-planes use registered host-pinned FIFO memory only — no GPUDirect RDMA; fair
-NCCL comparisons use `NCCL_NET_GDR_LEVEL=0`. The host proxy multi-flights WQEs
-up to Simple FIFO slice depth. SEND and WriteCts always post SGE from the
-registered mapped FIFO; correctness relies on publisher `st.release.sys` on
-`send_tail` after the block sync and host `ld.acquire.sys` loads (no host
-bounce path). Dual-host WRITE matrix
-(float/fp16/bf16 × sum/avg/max/min, 256 KiB–64 MiB) validated `#wrong=0`.
-Both hosts must build the same commit (`RdmaPeerInfo` is 64 bytes). Set
-`NANO_NCCL_RDMA_IFNAME=<rdma-interface>` in every MPI process; set
-`NANO_NCCL_RDMA_GID_INDEX` when the default GID table entry is not routable for
-the target RoCE deployment. QP information and receive-ready coordination reuse
-the trusted TCP bootstrap connection. There is no multi-host performance gate
-for this path.
-
-For MPI/socket launches, set `NANO_NCCL_SOCKET_IFNAME` to an interface with exactly one usable IPv4 address in every MPMD app context. `NANO_NCCL_SOCKET_TEST_FAULT_INJECTION=ON` builds a separate test-only library for `nano_nccl_mpi_correctness`; ordinary MPI benchmarks always link the library without the `NANO_NCCL_SOCKET_FAIL_AFTER_SLICES` hook.
-
-**Key design points**:
-
-- Step counter persists across iterations (matching NCCL `conn->step`); `run_batch` uses CUDA events for cross-stream barriers instead of per-iteration `cudaStreamSynchronize`, aligning with NCCL `BenchTime` timing methodology.
-- `transport::simple::kSliceSteps = 2` (two slices per chunk), matching the active Simple protocol constants.
-- Wait cache (`send_head_cache`/`recv_tail_cache`) matches NCCL `connStepCache`, avoiding reloading step counter from host memory on every wait.
-- Optional benchmark profiling is guarded by `NANO_NCCL_ENABLE_BENCH_PROFILING`; when `OFF`, the default performance path compiles no NVTX or CUDA profiler calls and has no iteration-time profiling condition. When `ON`, every size starts capture after warmup, creates an outer `all_reduce size=<bytes>B` range plus `all_reduce size=<bytes>B iteration=<iteration>` per-iteration ranges, synchronizes, stops capture, then validates. CUDA 12.8 warns that NVTX 2 `<nvToolsExt.h>` is deprecated; the supported range API remains in use.
-- Optional `NANO_NCCL_RDMA_SHARED_PROGRESS` (default dedicated/`0`; `1` enables one shared host progress thread for all local RDMA proxies).
-Optional `NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE` (default `OFF`) can record per-event RDMA host-proxy metrics including tail-vs-CTS arm times and inter-post spacing; investigation-only, not for production perf claims.
-
-## Build
-
-`NANO_NCCL_CUDA_ARCH` defaults to 70, and CMake rejects values below 70. This
-matches the SM70+ floor for `float` and FP16; BF16 additionally requires SM80+.
+The current implementation still uses one build-time rank count:
 
 ```bash
-mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release \
-  -DNANO_NCCL_NRANKS=<your_gpu_count> \
-  -DNANO_NCCL_CUDA_ARCH=<your_cuda_arch>
-make -j$(nproc)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DNANO_NCCL_NRANKS=<rank-count> \
+  -DNANO_NCCL_CUDA_ARCH=<cuda-arch>
+cmake --build build -j$(nproc)
+ctest --test-dir build --output-on-failure
 ```
 
-Optional benchmark profiling build (CUDA 12.8):
+MPI/RDMA currently requires:
 
 ```bash
-cmake -S . -B build-profile -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
-  -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=86 \
-  -DNANO_NCCL_ENABLE_BENCH_PROFILING=ON
-cmake --build build-profile -j$(nproc)
+cmake -S . -B build-rdma -DCMAKE_BUILD_TYPE=Release \
+  -DNANO_NCCL_ENABLE_MPI=ON \
+  -DNANO_NCCL_ENABLE_RDMA=ON \
+  -DNANO_NCCL_NRANKS=<global-rank-count> \
+  -DNANO_NCCL_CUDA_ARCH=<cuda-arch>
+cmake --build build-rdma -j$(nproc)
 ```
 
-Optional two-host MPI/socket build (both hosts must build the same commit and use the same Open MPI 4.1.2 ABI):
+The specialization generator will replace the single-rank build contract only
+after its design is justified by Phase 1 evidence and implemented with registry
+tests.
 
-```bash
-cmake -S . -B build-mpi -DCMAKE_BUILD_TYPE=Release \
-  -DNANO_NCCL_ENABLE_MPI=ON -DNANO_NCCL_NRANKS=8 -DNANO_NCCL_CUDA_ARCH=86
-cmake --build build-mpi -j$(nproc)
-```
+`float` and FP16 require SM70+ because the current Simple counters use
+system-scope ordering. BF16 requires SM80+. Distributed builds require matching
+Open MPI 4.1.2 C ABI and the same nano-nccl commit on every host.
 
-Build artifacts:
+## Communication And Resume Claims
 
-- `build/benchmarks/nano_nccl_all_reduce_bench` — perf + correctness benchmark
-- `build/tests/nano_nccl_correctness` — correctness-only test
-- `build/tests/nano_nccl_smoke` — smoke test
-- `build/tests/nano_nccl_public_api` — public C++ API coverage
-- `build/tests/nano_nccl_p2p_step_counters` — P2P step-counter coverage
-- `build/tests/nano_nccl_p2p_topology` — P2P topology coverage
-- `build/tests/nano_nccl_simple_protocol` — Simple protocol layout coverage
-- `build-mpi/tests/nano_nccl_mpi_correctness` — MPI/socket correctness and test-only fault injection
-- `build-mpi/tests/nano_nccl_mpi_bootstrap` — MPI bootstrap smoke test
-- `build-mpi/tests/nano_nccl_socket_protocol` — socket framing and proxy behavior
+Project documentation and resume statements must separate:
 
-When `BUILD_TESTING` is enabled (the default), `ctest --test-dir build
---output-on-failure` also runs the static BF16 capability-validation regression
-and benchmark profiling static regressions.
+- implemented and validated behavior;
+- target architecture;
+- measured NCCL-equivalent mechanisms;
+- intentional differences;
+- confirmed performance gaps; and
+- unresolved hypotheses.
 
-## Acceptance
-
-Current status: **REVALIDATION PENDING** (2026-07-16)
-
-Candidate path: `ring_simple` (Ring + Simple protocol, `--transport auto`)
-
-Use `-w 5 -n 20` for all future performance measurements and NCCL comparisons.
-
-Only default-OFF binaries may provide candidate performance results; profiling-enabled binaries are observability-only.
-
-The prior full `PASS` table is retired: its BF16 figures conflicted with the
-README and predated the BF16 validation-cache fix. A same-round BF16 comparison
-(out-of-place busbw) on 4× NVIDIA RTX A6000 (Ampere sm_86), CUDA 12.8, was
-rerun on 2026-07-16. `auto` resolved to a mixed P2P/SHM edge plan. All points
-had `#wrong=0`; however, the 4 MiB and 16 MiB points were below the NCCL
-baseline, so this result restores BF16 performance but does not satisfy the
-full per-size acceptance gate.
-
-| dtype | 256 KiB | 1 MiB | 4 MiB | 16 MiB | 64 MiB | geomean |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| BF16 | 1.066 | 1.028 | 0.971 | 0.987 | 1.025 | 1.015 |
-
-Re-verification commands:
-
-```bash
-# Candidate
-CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
-  --algo ring_simple --transport auto --dtype <float|fp16|bf16> \
-  -b 262144 -e 67108864 -f 4 -w 5 -n 20
-
-# NCCL baseline (same-round, requires nccl-tests installed and NCCL library path)
-cd <nccl-tests-build-dir>
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-LD_LIBRARY_PATH=<nccl-lib-path> \
-NCCL_ALGO=Ring NCCL_PROTO=Simple \
-NCCL_MIN_NCHANNELS=4 NCCL_MAX_NCHANNELS=4 NCCL_BUFFSIZE=33554432 \
-./build/all_reduce_perf -b 262144 -e 67108864 -f 4 -g 4 -w 5 -n 20 -d <float|half|bfloat16>
-```
-
-Pass criterion: for each contract message size `s`, `candidate_busbw(s) >= nccl_busbw(s)`.
-
-This is a single-host acceptance criterion only; no multi-host socket performance criterion has been established.
-
-## Extension Guide
-
-- **New dtype**: implement pack/unpack trait in `include/nano_nccl/traits.h`, add template instantiation in `ring_simple.cu`; current `float` and FP16 require SM70+, while BF16 requires SM80+, and all three support `sum`/`avg`/`max`/`min`
-- **New reduce op**: implement RedOp trait in `include/nano_nccl/traits.h`, add template instantiation in `ring_simple.cu`
-- **New rank count**: pass the new rank count to `ring_simple_kernel` as runtime `nranks` argument; `kRanks` (from `NANO_NCCL_NRANKS`) still controls host-side buffer sizing and array dimensions
-- **New collective**: create subdirectory under `src/collective/`, implement collective interface
-- **Simple protocol change**: update FIFO layout, step ordering, or slice geometry in `src/transport/simple/`; update Ring channel/rank work partitioning in `src/collective/all_reduce/ring_simple_geometry.h`; keep mapped host storage/control in `src/transport/shm/`
-- **New transport**: create a subdirectory under `src/transport/` and implement the transport interface (for example, RoCE RC send/recv); RDMA v1 uses registered host FIFO memory, while RDMA write and GPUDirect RDMA remain future work
-- **RDMA build**: `cmake -S . -B build-rdma -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_ENABLE_MPI=ON -DNANO_NCCL_ENABLE_RDMA=ON -DNANO_NCCL_NRANKS=<ranks> -DNANO_NCCL_CUDA_ARCH=<arch>`; requires `libibverbs-dev` and reuses the TCP bootstrap connection for `RdmaPeerInfo` exchange and receive-ready coordination. Default data plane is SEND/RECV; `NANO_NCCL_RDMA_USE_WRITE=1` enables WRITE+CTS (host-pin only; no GDR)
+Prefer claims such as "identified and closed a system-fence publication gap
+with source-guided A/B evidence" over broad claims such as "reimplemented
+NCCL". A result is credible only when another engineer can trace it from claim
+to source references, experiment, correctness, measurements, and decision.
