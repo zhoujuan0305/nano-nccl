@@ -50,6 +50,7 @@ def main() -> int:
                 "Simple FIFO layout",
                 "step ordering",
                 "slice geometry",
+                "distinct send and recv base steps",
             ),
             "SHM ownership": ("`src/transport/shm/` owns mapped host FIFO storage and control only",),
             "Ring scheduling ownership": (
@@ -70,6 +71,7 @@ def main() -> int:
                 "`src/transport/simple/` 负责 Simple FIFO layout",
                 "step ordering",
                 "slice geometry",
+                "独立持久化 send 和 recv base step",
             ),
             "SHM ownership": ("`src/transport/shm/` 仅负责 mapped host FIFO storage 和 control",),
             "Ring scheduling ownership": (
@@ -88,6 +90,7 @@ def main() -> int:
             ),
             "Simple protocol ownership": (
                 "`src/transport/simple/` owns FIFO layout, step ordering, and slice geometry",
+                "distinct send and recv base steps",
             ),
             "SHM ownership": ("`src/transport/shm/` owns mapped host FIFO storage/control only",),
             "Ring scheduling ownership": (

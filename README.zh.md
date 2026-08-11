@@ -266,6 +266,9 @@ P2P 是单机通信路径，需要每对完整配置环邻居之间的双向 CUD
 - `src/transport/shm/` 仅负责 mapped host FIFO storage 和 control。
 - `src/collective/all_reduce/ring_simple_geometry.h` 负责 Ring channel/rank work partitioning。
 
+每个 rank/channel 独立持久化 send 和 recv base step。kernel 分别初始化并持久化
+两个方向，因此 empty slice elision 不会耦合 incoming 与 outgoing progress。
+
 transport runtime lifecycle 与 orchestration 仍由 `Communicator::Impl` 管理；本次模块拆分
 没有将其移入 `src/transport/simple/`。Simple protocol 变更应在
 `src/transport/simple/` 中完成，Ring scheduling 变更应在

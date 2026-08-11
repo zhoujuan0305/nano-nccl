@@ -281,6 +281,10 @@ trusted, IPv4-only TCP network boundary and has no TLS or auto reconnect.
 - `src/transport/shm/` owns mapped host FIFO storage and control only.
 - `src/collective/all_reduce/ring_simple_geometry.h` owns Ring channel/rank work partitioning.
 
+Persistent progress uses distinct send and recv base steps for every rank/channel.
+The kernel initializes and persists each direction independently so elided empty
+slices do not couple incoming and outgoing progress.
+
 Transport runtime lifecycle and orchestration remain in `Communicator::Impl`;
 this module split does not move them into `src/transport/simple/`. Make Simple
 protocol changes in `src/transport/simple/` and Ring scheduling changes in

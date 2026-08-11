@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <mutex>
 #include <stdexcept>
@@ -155,6 +156,11 @@ bool bf16_supported() {
         }
     }
     return true;
+}
+
+bool nan_only_requested() {
+    const char* value = std::getenv("NANO_NCCL_PUBLIC_API_NAN_ONLY");
+    return value != nullptr && std::string(value) == "1";
 }
 
 template <nano_nccl::DType kDType>
@@ -614,6 +620,32 @@ int main(int argc, char** argv) {
     }
     if (argc == 2 && std::string(argv[1]) == "--socket-stride") {
         return run_socket_stride_test() ? 0 : 1;
+    }
+    if (nan_only_requested()) {
+        std::vector<cudaStream_t> streams(kRanks);
+        for (int rank = 0; rank < kRanks; ++rank) {
+            CUDA_CHECK(cudaSetDevice(rank));
+            CUDA_CHECK(cudaStreamCreateWithFlags(&streams[rank], cudaStreamNonBlocking));
+        }
+        try {
+            nano_nccl::CommunicatorConfig config;
+            config.devices = {0, 1, 2, 3};
+            auto communicator = nano_nccl::create_communicator(config);
+            if (!run_nan_propagation_test<nano_nccl::DType::Float>(
+                    communicator.get(), streams)) {
+                std::fprintf(stderr, "float max/min NaN propagation failed\n");
+                return 1;
+            }
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "%s\n", error.what());
+            return 1;
+        }
+        for (int rank = 0; rank < kRanks; ++rank) {
+            CUDA_CHECK(cudaSetDevice(rank));
+            CUDA_CHECK(cudaStreamDestroy(streams[rank]));
+        }
+        std::puts("public_api_nan=PASS");
+        return 0;
     }
     std::vector<const void*> send_buffers(kRanks);
     std::vector<void*> recv_buffers(kRanks);

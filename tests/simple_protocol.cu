@@ -48,7 +48,7 @@ static_assert(std::is_standard_layout<simple::ControlArgs>::value);
 static_assert(std::is_standard_layout<simple::FifoArgs<float>>::value);
 static_assert(std::is_standard_layout<simple::ChannelArgs<float>>::value);
 static_assert(sizeof(simple::ControlArgs) ==
-              sizeof(void*) * (4 * nano_nccl::kChannels + 1));
+              sizeof(void*) * (4 * nano_nccl::kChannels + 2));
 static_assert(offsetof(simple::ControlArgs, send_head) == 0);
 static_assert(offsetof(simple::ControlArgs, recv_tail) ==
               sizeof(void*) * nano_nccl::kChannels);
@@ -56,8 +56,10 @@ static_assert(offsetof(simple::ControlArgs, send_tail) ==
               sizeof(void*) * 2 * nano_nccl::kChannels);
 static_assert(offsetof(simple::ControlArgs, recv_head) ==
               sizeof(void*) * 3 * nano_nccl::kChannels);
-static_assert(offsetof(simple::ControlArgs, base_steps) ==
-              sizeof(void*) * 4 * nano_nccl::kChannels);
+static_assert(offsetof(simple::ControlArgs, send_base_steps) ==
+               sizeof(void*) * 4 * nano_nccl::kChannels);
+static_assert(offsetof(simple::ControlArgs, recv_base_steps) ==
+              sizeof(void*) * (4 * nano_nccl::kChannels + 1));
 static_assert(offsetof(simple::FifoArgs<float>, rank) == 0);
 static_assert(offsetof(simple::FifoArgs<float>, count) == 8);
 static_assert(offsetof(simple::FifoArgs<float>, input) == 32);
@@ -80,14 +82,14 @@ static_assert(offsetof(simple::ChannelArgs<float>, abort) == 80);
 static_assert(offsetof(simple::ChannelArgs<float>, wait_observer) == 88);
 #if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
 static_assert(offsetof(simple::FifoArgs<float>, turnaround) ==
-              56 + sizeof(void*) * (8 * nano_nccl::kChannels + 1));
+              56 + sizeof(void*) * (8 * nano_nccl::kChannels + 2));
 static_assert(sizeof(simple::FifoArgs<float>) ==
-              56 + sizeof(void*) * (9 * nano_nccl::kChannels + 1));
+              56 + sizeof(void*) * (9 * nano_nccl::kChannels + 2));
 static_assert(offsetof(simple::ChannelArgs<float>, turnaround) == 96);
 static_assert(sizeof(simple::ChannelArgs<float>) == 104);
 #else
 static_assert(sizeof(simple::FifoArgs<float>) ==
-              56 + sizeof(void*) * (8 * nano_nccl::kChannels + 1));
+              56 + sizeof(void*) * (8 * nano_nccl::kChannels + 2));
 static_assert(sizeof(simple::ChannelArgs<float>) == 96);
 #endif
 static_assert(simple::slice_elems<float>(100, 1024) == 64);

@@ -31,6 +31,10 @@ endif()
 
 if(BUILD_TESTING)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(NAME nano_nccl_public_api_nan COMMAND nano_nccl_public_api)
+    set_tests_properties(nano_nccl_public_api_nan PROPERTIES
+        ENVIRONMENT NANO_NCCL_PUBLIC_API_NAN_ONLY=1
+        TIMEOUT 8)
     add_test(NAME nano_nccl_simple_protocol COMMAND nano_nccl_simple_protocol)
     set_tests_properties(nano_nccl_simple_protocol PROPERTIES SKIP_RETURN_CODE 77)
     add_test(

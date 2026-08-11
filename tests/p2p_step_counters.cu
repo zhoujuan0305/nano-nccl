@@ -99,7 +99,8 @@ bool check_isolated_rank_control_directions(
             return false;
         }
     }
-    if (isolated.base_steps != nullptr) {
+    if (isolated.send_base_steps != nullptr ||
+        isolated.recv_base_steps != nullptr) {
         std::fprintf(stderr, "isolated rank base steps are incorrect\\n");
         return false;
     }
@@ -168,7 +169,8 @@ int main() {
             for (int channel = 0; channel < nano_nccl::kChannels; ++channel) {
                 if (!check_owner(control.send_head[channel], rank) ||
                     !check_owner(control.recv_tail[channel], rank) ||
-                    !check_owner(control.base_steps + channel, rank) ||
+                    !check_owner(control.send_base_steps + channel, rank) ||
+                    !check_owner(control.recv_base_steps + channel, rank) ||
                     !check_owner(control.send_tail[channel],
                                  (rank + 1) % nano_nccl::kRanks) ||
                     !check_owner(control.recv_head[channel],

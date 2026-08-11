@@ -31,7 +31,8 @@ public:
 private:
     static constexpr std::size_t kHeadOffset = 0;
     static constexpr std::size_t kTailOffset = kChannels;
-    static constexpr std::size_t kBaseStepOffset = 2 * kChannels;
+    static constexpr std::size_t kSendBaseStepOffset = 2 * kChannels;
+    static constexpr std::size_t kRecvBaseStepOffset = 3 * kChannels;
 
     void cleanup();
 

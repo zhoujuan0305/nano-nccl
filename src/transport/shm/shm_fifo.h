@@ -25,7 +25,9 @@ inline transport::simple::ControlArgs make_simple_control_args(
         control.recv_head[channel] =
             steps + step_idx(0, channel, recv_edge);
     }
-    control.base_steps = base_steps + rank * kChannels;
+    control.send_base_steps = base_steps + rank * kChannels;
+    control.recv_base_steps =
+        base_steps + (kRanks + rank) * kChannels;
     return control;
 }
 

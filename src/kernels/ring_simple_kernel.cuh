@@ -1101,7 +1101,7 @@ __device__ inline bool direct_recv(
 
 // Ring + Simple 协议主 kernel。
 //   T / RedOp 为编译期参数；nranks 为运行时参数，内循环按 ring 位置展开。
-//   base_steps 跨迭代持久化（对齐 NCCL conn->step），避免每轮重置 step counter。
+//   send/recv base steps 独立跨迭代持久化，允许空 slice 在两个方向非对称消除。
 //   nworkers = blockDim - 32：留 3 个专用线程做 wait/post，其余做数据搬运。
 template <typename T, RedOp kRedOp>
 __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel(
@@ -1137,17 +1137,18 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
         return;
     }
 
-    __shared__ std::uint64_t s_base_step;
+    __shared__ std::uint64_t s_send_base_step;
+    __shared__ std::uint64_t s_recv_base_step;
     __shared__ int s_wait_status;
     if (threadIdx.x == 0) {
-        s_base_step = args.control.base_steps[channel];
+        s_send_base_step = args.control.send_base_steps[channel];
+        s_recv_base_step = args.control.recv_base_steps[channel];
     }
     __syncthreads();
-    std::uint64_t base_step = s_base_step;
-    std::uint64_t send_step = base_step;
-    std::uint64_t recv_step = base_step;
-    std::uint64_t send_head_cache = base_step;
-    std::uint64_t recv_tail_cache = base_step;
+    std::uint64_t send_step = s_send_base_step;
+    std::uint64_t recv_step = s_recv_base_step;
+    std::uint64_t send_head_cache = s_send_base_step;
+    std::uint64_t recv_tail_cache = s_recv_base_step;
     int ring_ix = args.rank;
     float inverse_nranks = 1.0f;
     if constexpr (kRedOp == RedOp::Avg) {
@@ -1218,7 +1219,8 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
 
     __syncthreads();
     if (threadIdx.x == 0) {
-        args.control.base_steps[channel] = send_step;
+        args.control.send_base_steps[channel] = send_step;
+        args.control.recv_base_steps[channel] = recv_step;
     }
 }
 

@@ -39,7 +39,7 @@ P2pStepCounters::P2pStepCounters(int nranks)
     try {
         for (int local_rank = 0; local_rank < kRanks; ++local_rank) {
             counters_[local_rank] = new core::DeviceBuffer<std::uint64_t>(
-                topology_.devices[local_rank], 3 * kChannels);
+                topology_.devices[local_rank], 4 * kChannels);
         }
     } catch (...) {
         cleanup();
@@ -65,7 +65,7 @@ P2pStepCounters::P2pStepCounters(
                 continue;
             }
             counters_[global_rank] = new core::DeviceBuffer<std::uint64_t>(
-                topology_.devices[local_rank], 3 * kChannels);
+                topology_.devices[local_rank], 4 * kChannels);
         }
     } catch (...) {
         cleanup();
@@ -92,7 +92,7 @@ void P2pStepCounters::reset(const std::vector<cudaStream_t>& streams) {
         CUDA_CHECK_THROW(cudaSetDevice(topology_.devices[local_rank]));
         CUDA_CHECK_THROW(cudaMemsetAsync(
             counters_[global_rank]->get(), 0,
-            3 * kChannels * sizeof(std::uint64_t), streams[local_rank]));
+            4 * kChannels * sizeof(std::uint64_t), streams[local_rank]));
     }
 }
 
@@ -114,7 +114,10 @@ nano_nccl::transport::simple::ControlArgs P2pStepCounters::control_args(int rank
         }
     }
     if (counters_[rank] != nullptr) {
-        control.base_steps = counters_[rank]->get() + kBaseStepOffset;
+        control.send_base_steps =
+            counters_[rank]->get() + kSendBaseStepOffset;
+        control.recv_base_steps =
+            counters_[rank]->get() + kRecvBaseStepOffset;
     }
     return control;
 }

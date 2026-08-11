@@ -162,7 +162,7 @@ public:
                 transport_plan_, topology_);
         }
         simple_fifo_steps_.reset(2 * kChannels * kRanks, -1, devices_);
-        simple_fifo_base_step_.reset(kRanks * kChannels, -1, devices_);
+        simple_fifo_base_steps_.reset(2 * kRanks * kChannels, -1, devices_);
         completion_events_.resize(devices_.size());
         fallback_streams_.resize(devices_.size());
         completion_recorded_.resize(devices_.size());
@@ -186,7 +186,7 @@ public:
                 transport_plan_, topology_);
         }
         simple_fifo_steps_.reset(2 * kChannels * kRanks, -1, devices_);
-        simple_fifo_base_step_.reset(kRanks * kChannels, -1, devices_);
+        simple_fifo_base_steps_.reset(2 * kRanks * kChannels, -1, devices_);
         completion_events_.resize(devices_.size());
         fallback_streams_.resize(devices_.size());
         completion_recorded_.resize(devices_.size());
@@ -898,7 +898,7 @@ private:
 
     void reset_control(const std::vector<cudaStream_t>& streams) {
         simple_fifo_steps_.clear_host();
-        simple_fifo_base_step_.clear_host();
+        simple_fifo_base_steps_.clear_host();
         if (!transport_plan_.uses_p2p()) return;
 
         p2p_steps_->reset(streams);
@@ -933,7 +933,7 @@ private:
 
             ControlArgs shm_control = transport::shm::make_simple_control_args(
                 simple_fifo_steps_.device_ptr(devices_[rank]),
-                simple_fifo_base_step_.device_ptr(devices_[rank]), global_rank);
+                simple_fifo_base_steps_.device_ptr(devices_[rank]), global_rank);
             ControlArgs p2p_control{};
             if (p2p_steps_ != nullptr) {
                 p2p_control = p2p_steps_->control_args(global_rank);
@@ -1021,8 +1021,12 @@ private:
             kernel_args.abort = socket_errors_ == nullptr
                 ? nullptr : socket_abort_.device_ptr(devices_[rank]);
 #endif
-            kernel_args.control.base_steps = p2p_control.base_steps != nullptr
-                ? p2p_control.base_steps : shm_control.base_steps;
+            kernel_args.control.send_base_steps =
+                p2p_control.send_base_steps != nullptr
+                    ? p2p_control.send_base_steps : shm_control.send_base_steps;
+            kernel_args.control.recv_base_steps =
+                p2p_control.recv_base_steps != nullptr
+                    ? p2p_control.recv_base_steps : shm_control.recv_base_steps;
 #if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
             if (turnaround_enabled_ && turnaround_stats_ != nullptr) {
                 auto* base = reinterpret_cast<collective::all_reduce::RingTurnaroundStats*>(
@@ -1212,7 +1216,7 @@ private:
     bool rdma_shared_progress_ = false;
 #endif
     MappedU64Array simple_fifo_steps_;
-    MappedU64Array simple_fifo_base_step_;
+    MappedU64Array simple_fifo_base_steps_;
     std::unique_ptr<transport::p2p::P2pStepCounters> p2p_steps_;
     FifoResources<float> float_resources_;
     FifoResources<__half> float16_resources_;

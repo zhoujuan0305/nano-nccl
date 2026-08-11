@@ -28,7 +28,8 @@ struct ControlArgs {
     std::uint64_t* recv_tail[kChannels];
     std::uint64_t* send_tail[kChannels];
     std::uint64_t* recv_head[kChannels];
-    std::uint64_t* base_steps;
+    std::uint64_t* send_base_steps;
+    std::uint64_t* recv_base_steps;
 };
 
 template <typename T>
