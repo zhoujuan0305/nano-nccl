@@ -2,12 +2,14 @@
 #include "nano_nccl/traits.h"
 
 #include "collective/all_reduce/topology.h"
+#include "collective/all_reduce/ring_simple_geometry.h"
 #include "core/buffer.h"
 #include "kernels/ring_simple_kernel.cuh"
 #include "transport/p2p/p2p_fifo.h"
 #include "transport/p2p/p2p_step_counters.h"
 #include "transport/p2p/p2p_topology.h"
-#include "transport/simple_protocol.h"
+#include "transport/simple/protocol.h"
+#include "transport/simple/step.h"
 
 #include <cmath>
 #include <condition_variable>
@@ -361,7 +363,7 @@ bool run_topology_test() {
 }
 
 __global__ void abort_aware_send_wait(
-    nano_nccl::transport::SimpleChannelArgs<float> args, int* result) {
+    nano_nccl::transport::simple::ChannelArgs<float> args, int* result) {
     std::uint64_t cache = 0;
     __shared__ int wait_status;
     bool ready = nano_nccl::kernels::wait_send_credit<float>(
@@ -370,7 +372,7 @@ __global__ void abort_aware_send_wait(
 }
 
 __global__ void abort_after_send_wait_starts(
-    nano_nccl::transport::SimpleChannelArgs<float> args, int* result) {
+    nano_nccl::transport::simple::ChannelArgs<float> args, int* result) {
     std::uint64_t cache = 0;
     __shared__ int wait_status;
     bool ready = nano_nccl::kernels::wait_send_credit<float>(
@@ -379,7 +381,7 @@ __global__ void abort_after_send_wait_starts(
 }
 
 __global__ void abort_after_recv_wait_starts(
-    nano_nccl::transport::SimpleChannelArgs<float> args, int* result) {
+    nano_nccl::transport::simple::ChannelArgs<float> args, int* result) {
     std::uint64_t cache = 0;
     __shared__ int wait_status;
     bool ready = nano_nccl::kernels::wait_recv_ready<float>(
@@ -388,7 +390,7 @@ __global__ void abort_after_recv_wait_starts(
 }
 
 __global__ void abort_after_dual_wait_starts(
-    nano_nccl::transport::SimpleChannelArgs<float> args, int* result) {
+    nano_nccl::transport::simple::ChannelArgs<float> args, int* result) {
     std::uint64_t recv_cache = 0;
     std::uint64_t send_cache = 0;
     __shared__ int wait_status;
@@ -399,7 +401,7 @@ __global__ void abort_after_dual_wait_starts(
 }
 
 __global__ void dual_wait_both_ready(
-    nano_nccl::transport::SimpleChannelArgs<float> args, int* result) {
+    nano_nccl::transport::simple::ChannelArgs<float> args, int* result) {
     std::uint64_t recv_cache = 0;
     std::uint64_t send_cache = 0;
     __shared__ int wait_status;
@@ -413,7 +415,7 @@ __global__ void dual_wait_both_ready(
 }
 
 __global__ void publish_socket_slice(
-    nano_nccl::transport::SimpleChannelArgs<float> args, const float* input) {
+    nano_nccl::transport::simple::ChannelArgs<float> args, const float* input) {
     std::uint64_t step = 0;
     std::uint64_t cache = 0;
     __shared__ int wait_status;
@@ -425,7 +427,7 @@ __global__ void publish_socket_slice(
 bool run_socket_abort_test() {
     using nano_nccl::core::MappedU32Array;
     using nano_nccl::core::MappedU64Array;
-    using nano_nccl::transport::SimpleChannelArgs;
+    using nano_nccl::transport::simple::ChannelArgs;
 
     constexpr int kDevice = 0;
     MappedU64Array counters;
@@ -439,7 +441,7 @@ bool run_socket_abort_test() {
         cudaMalloc(&result, 3 * sizeof(int)) != cudaSuccess) {
         return false;
     }
-    SimpleChannelArgs<float> args{
+    ChannelArgs<float> args{
         1, 1, nullptr, nullptr,
         counters.device_ptr(kDevice), counters.device_ptr(kDevice) + 1,
         counters.device_ptr(kDevice) + 2, counters.device_ptr(kDevice) + 3,
@@ -488,7 +490,7 @@ bool run_socket_abort_test() {
     }
     if (ok) {
         // recv_tail must cover slice steps; send step 0 already has credit at head=0.
-        counters.host_ptr()[1] = nano_nccl::transport::kSimpleFifoSliceSteps;
+        counters.host_ptr()[1] = nano_nccl::transport::simple::kSliceSteps;
         __atomic_store_n(abort.host_ptr(), 0U, __ATOMIC_RELEASE);
         int dual_ready[3] = {};
         dual_wait_both_ready<<<1, 32>>>(args, result);
@@ -497,7 +499,7 @@ bool run_socket_abort_test() {
                         cudaMemcpyDeviceToHost) == cudaSuccess &&
              dual_ready[0] == 1 &&
              dual_ready[1] >=
-                 static_cast<int>(nano_nccl::transport::kSimpleFifoSliceSteps);
+                 static_cast<int>(nano_nccl::transport::simple::kSliceSteps);
     }
     cudaFree(result);
     std::puts(ok ? "socket_abort=PASS" : "socket_abort=FAIL");
@@ -508,16 +510,16 @@ bool run_socket_kernel_test() {
     using nano_nccl::core::MappedBuffer;
     using nano_nccl::core::MappedU32Array;
     using nano_nccl::core::MappedU64Array;
-    using nano_nccl::transport::SimpleChannelArgs;
+    using nano_nccl::transport::simple::ChannelArgs;
 
     constexpr int kDevice = 0;
     std::vector<int> devices{kDevice};
-    MappedBuffer<float> fifo(nano_nccl::transport::kSimpleFifoSteps * 16, -1,
+    MappedBuffer<float> fifo(nano_nccl::transport::simple::kFifoSteps * 16, -1,
                              devices);
     MappedU64Array counters;
     counters.reset(4, -1, devices);
     MappedU32Array sizes;
-    sizes.reset(nano_nccl::transport::kSimpleFifoSteps, -1, devices);
+    sizes.reset(nano_nccl::transport::simple::kFifoSteps, -1, devices);
     MappedU32Array abort;
     abort.reset(1, -1, devices);
 
@@ -530,7 +532,7 @@ bool run_socket_kernel_test() {
     }
     bool ok = false;
     try {
-        SimpleChannelArgs<float> args{
+        ChannelArgs<float> args{
             16,
             16,
             fifo.device_ptr(kDevice),
@@ -558,7 +560,7 @@ bool run_socket_kernel_test() {
                 ready = __atomic_load_n(counters.host_ptr() + 2, __ATOMIC_ACQUIRE);
             }
             ok = cudaGetLastError() == cudaSuccess &&
-                 ready >= nano_nccl::transport::kSimpleFifoSliceSteps &&
+                 ready >= nano_nccl::transport::simple::kSliceSteps &&
                  __atomic_load_n(sizes.host_ptr(), __ATOMIC_ACQUIRE) ==
                      4 * sizeof(float) &&
                  cudaDeviceSynchronize() == cudaSuccess;
@@ -581,17 +583,19 @@ bool run_socket_stride_test() {
     std::size_t part_offset = 0;
     std::size_t part_count = 0;
     std::size_t chunk_count = 0;
-    nano_nccl::transport::shm::cbd_part<float>(kCount, 0, &part_offset,
-                                               &part_count, &chunk_count);
-    const std::size_t stride = nano_nccl::transport::shm::simple_fifo_step_elems<float>();
+    nano_nccl::collective::all_reduce::cbd_part<float>(
+        kCount, 0, &part_offset, &part_count, &chunk_count);
+    const std::size_t stride = nano_nccl::transport::simple::step_elems<float>();
     const std::size_t socket_loop_chunk =
-        nano_nccl::transport::shm::simple_fifo_loop_chunk_elems<float>(chunk_count, stride);
+        nano_nccl::collective::all_reduce::loop_chunk_elems<float>(chunk_count,
+                                                                   stride);
     const std::size_t local_loop_chunk =
-        nano_nccl::transport::shm::simple_fifo_loop_chunk_elems<float>(chunk_count, 2 * stride);
+        nano_nccl::collective::all_reduce::loop_chunk_elems<float>(chunk_count,
+                                                                   2 * stride);
     bool ok = chunk_count > stride && socket_loop_chunk == stride &&
               local_loop_chunk == 2 * stride &&
-              nano_nccl::transport::kSimpleFifoSteps * stride * sizeof(float) ==
-                  nano_nccl::transport::kSimpleFifoBuffBytes;
+              nano_nccl::transport::simple::kFifoSteps * stride * sizeof(float) ==
+                  nano_nccl::transport::simple::kFifoBytes;
     std::puts(ok ? "socket_stride=PASS" : "socket_stride=FAIL");
     return ok;
 }

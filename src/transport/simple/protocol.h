@@ -11,24 +11,19 @@ struct RingTurnaroundStats;
 }
 #endif
 
-namespace nano_nccl::transport {
+namespace nano_nccl::transport::simple {
 
-// FIFO 布局常量，对齐 NCCL Simple 协议：
-//   buff 切成 kSimpleFifoSteps 个 step，容量按 storage dtype 计算；
-//   一个 chunk 占 kSimpleFifoChunkSteps 个 step，按 kSimpleFifoSliceSteps 粒度收发。
-//   一个 chunk 固定分为两个 slice，与 NCCL ProtoSimple<2, 2> 对齐。
-constexpr int kSimpleFifoSteps = 8;
-constexpr int kSimpleFifoSliceSteps = 2;
-constexpr int kSimpleFifoChunkSteps = 4;
-constexpr std::size_t kSimpleFifoVectorBytes = 16;
+constexpr int kFifoSteps = 8;
+constexpr int kSliceSteps = 2;
+constexpr int kChunkSteps = 4;
+constexpr std::size_t kVectorBytes = 16;
 
-// FIFO buffer 总字节由 CMake 通过 NANO_NCCL_FIFO_BUFF_BYTES 注入，默认 32MiB。
 #ifndef NANO_NCCL_FIFO_BUFF_BYTES
 #define NANO_NCCL_FIFO_BUFF_BYTES 33554432
 #endif
-constexpr std::size_t kSimpleFifoBuffBytes = NANO_NCCL_FIFO_BUFF_BYTES;
+constexpr std::size_t kFifoBytes = NANO_NCCL_FIFO_BUFF_BYTES;
 
-struct SimpleControlArgs {
+struct ControlArgs {
     std::uint64_t* send_head[kChannels];
     std::uint64_t* recv_tail[kChannels];
     std::uint64_t* send_tail[kChannels];
@@ -37,7 +32,7 @@ struct SimpleControlArgs {
 };
 
 template <typename T>
-struct SimpleFifoArgs {
+struct FifoArgs {
     int rank;
     std::size_t count;
     std::size_t slot_elems;
@@ -49,14 +44,14 @@ struct SimpleFifoArgs {
     std::uint32_t* send_payload_bytes[kChannels];
     const std::uint32_t* recv_payload_bytes[kChannels];
     const std::uint32_t* abort;
-    SimpleControlArgs control;
+    ControlArgs control;
 #if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
     collective::all_reduce::RingTurnaroundStats* turnaround[kChannels];
 #endif
 };
 
 template <typename T>
-struct SimpleChannelArgs {
+struct ChannelArgs {
     std::size_t slot_elems;
     std::size_t step_elems;
     T* send_fifo;
@@ -74,4 +69,4 @@ struct SimpleChannelArgs {
 #endif
 };
 
-}  // namespace nano_nccl::transport
+}  // namespace nano_nccl::transport::simple

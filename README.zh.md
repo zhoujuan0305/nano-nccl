@@ -54,13 +54,16 @@ cmake .. -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=8
 |---|---|---|
 | `NANO_NCCL_NRANKS` | 4 | GPU 数 |
 | `NANO_NCCL_NCHANNELS` | 4 | channel 数 |
-| `NANO_NCCL_CUDA_ARCH` | 61 | CUDA 算力（如 61 对应 sm_61，75 对应 Turing，86 对应 Ampere） |
+| `NANO_NCCL_CUDA_ARCH` | 70 | CUDA 算力（如 70 对应 Volta，75 对应 Turing，86 对应 Ampere）；低于 70 的值会被拒绝 |
 | `NANO_NCCL_BLOCK_THREADS` | 512 | 每 block 线程数 |
 | `NANO_NCCL_FIFO_BUFF_BYTES` | 33554432 | FIFO buffer 大小（字节，默认 32 MiB） |
 | `NANO_NCCL_ENABLE_MPI` | `OFF` | 构建 MPI communicator bootstrap 与分布式 benchmark/test |
 | `NANO_NCCL_ENABLE_RDMA` | `OFF` | 构建 RC send/receive RDMA 通信路径；需要 `NANO_NCCL_ENABLE_MPI=ON` 与 libibverbs |
 | `NANO_NCCL_SOCKET_TEST_FAULT_INJECTION` | `OFF` | 为 `nano_nccl_mpi_correctness` 构建独立的仅测试故障注入库；普通 MPI benchmark 永不包含该钩子 |
 | `NANO_NCCL_ENABLE_BENCH_PROFILING` | `OFF` | 将 NVTX/CUDA profiler instrumentation 编译到 all-reduce benchmark；报告带宽时保持 `OFF` |
+
+`float` 和 FP16 需要 SM70+，因为 Simple FIFO counter 使用 system-scope
+release/acquire 操作。BF16 需要 SM80+。
 
 NUMA 拓扑在运行时从 `/sys/bus/pci/devices/*/numa_node` 自动检测，换机器不需要改源码。
 
@@ -257,6 +260,17 @@ unsupported-operation 错误。
 
 P2P 是单机通信路径，需要每对完整配置环邻居之间的双向 CUDA peer access；它不是多机或网络通信路径。socket 使用可信、仅 IPv4 的 TCP 网络边界，不提供 TLS 或自动重连。
 
+### 实现归属
+
+- `src/transport/simple/` 负责 Simple FIFO layout、step ordering 和 slice geometry。
+- `src/transport/shm/` 仅负责 mapped host FIFO storage 和 control。
+- `src/collective/all_reduce/ring_simple_geometry.h` 负责 Ring channel/rank work partitioning。
+
+transport runtime lifecycle 与 orchestration 仍由 `Communicator::Impl` 管理；本次模块拆分
+没有将其移入 `src/transport/simple/`。Simple protocol 变更应在
+`src/transport/simple/` 中完成，Ring scheduling 变更应在
+`ring_simple_geometry.h` 中完成。
+
 ---
 
 ## 当前限制
@@ -264,7 +278,7 @@ P2P 是单机通信路径，需要每对完整配置环邻居之间的双向 CUD
 当前仅支持：
 
 - 单机多 GPU 性能路径（已验证 `CUDA_VISIBLE_DEVICES=0,1,2,3`）；可选 MPI/socket 与 MPI/RDMA 多机 `all_reduce`，最新点表见 [performance.md](performance.md)
-- `float`、FP16（`fp16`）和 BF16（`bf16`）类型；BF16 需要 SM80+
+- SM70+ 上的 `float` 和 FP16（`fp16`），以及 SM80+ 上的 BF16（`bf16`）
 - `sum`、`avg`、`max`、`min` 规约操作；`avg` 为 `sum / nranks`，`max`/`min` 会传播 NaN
 - out-of-place
 - SHM FIFO、device P2P FIFO，以及跨进程 ring edge 的可选 MPI/socket 或 MPI/RDMA；P2P 仅单机；RDMA 为 host-pin RC（无 GPUDirect RDMA）

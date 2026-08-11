@@ -55,13 +55,16 @@ and benchmark profiling static regressions.
 |---|---|---|
 | `NANO_NCCL_NRANKS` | 4 | Number of GPU ranks |
 | `NANO_NCCL_NCHANNELS` | 4 | Number of channels |
-| `NANO_NCCL_CUDA_ARCH` | 61 | CUDA compute capability (e.g. 61 for sm_61, 75 for Turing, 86 for Ampere) |
+| `NANO_NCCL_CUDA_ARCH` | 70 | CUDA compute capability (e.g. 70 for Volta, 75 for Turing, 86 for Ampere); values below 70 are rejected |
 | `NANO_NCCL_BLOCK_THREADS` | 512 | Threads per block |
 | `NANO_NCCL_FIFO_BUFF_BYTES` | 33554432 | FIFO buffer size in bytes (32 MiB) |
 | `NANO_NCCL_ENABLE_MPI` | `OFF` | Build the MPI communicator bootstrap and distributed benchmark/test |
 | `NANO_NCCL_ENABLE_RDMA` | `OFF` | Build the RC send/receive RDMA transport; requires `NANO_NCCL_ENABLE_MPI=ON` and libibverbs |
 | `NANO_NCCL_SOCKET_TEST_FAULT_INJECTION` | `OFF` | Build a separate test-only fault-injection library for `nano_nccl_mpi_correctness`; ordinary MPI benchmarks never include the hook |
 | `NANO_NCCL_ENABLE_BENCH_PROFILING` | `OFF` | Compile NVTX/CUDA-profiler instrumentation into the all-reduce benchmark; keep `OFF` for reported bandwidth |
+
+`float` and FP16 require SM70+ because Simple FIFO counters use system-scope
+release/acquire operations. BF16 requires SM80+.
 
 NUMA topology is detected at runtime by reading `/sys/bus/pci/devices/*/numa_node` — no source code changes needed when moving to a different machine.
 
@@ -272,6 +275,17 @@ P2P is a single-node transport. It requires CUDA peer access for the complete
 configured ring; it is not a multi-node or network transport. Socket uses a
 trusted, IPv4-only TCP network boundary and has no TLS or auto reconnect.
 
+### Implementation ownership
+
+- `src/transport/simple/` owns the Simple FIFO layout, step ordering, and slice geometry.
+- `src/transport/shm/` owns mapped host FIFO storage and control only.
+- `src/collective/all_reduce/ring_simple_geometry.h` owns Ring channel/rank work partitioning.
+
+Transport runtime lifecycle and orchestration remain in `Communicator::Impl`;
+this module split does not move them into `src/transport/simple/`. Make Simple
+protocol changes in `src/transport/simple/` and Ring scheduling changes in
+`ring_simple_geometry.h`.
+
 ---
 
 ## Limitations
@@ -279,7 +293,7 @@ trusted, IPv4-only TCP network boundary and has no TLS or auto reconnect.
 Currently supports only:
 
 - Single-node multi-GPU performance path (tested with `CUDA_VISIBLE_DEVICES=0,1,2,3`); optional MPI/socket and MPI/RDMA multi-host `all_reduce` paths with published point tables in [performance.md](performance.md)
-- `float`, FP16 (`fp16`), and BF16 (`bf16`) dtypes; BF16 requires SM80+
+- `float` and FP16 (`fp16`) on SM70+, and BF16 (`bf16`) on SM80+
 - `sum`, `avg`, `max`, and `min` reduce ops; `avg` is `sum / nranks`, and `max`/`min` propagate NaN
 - out-of-place
 - SHM FIFO and device P2P FIFO transports, plus optional MPI/socket or MPI/RDMA for cross-process ring edges; P2P is single-node only; RDMA is host-pin RC (no GPUDirect RDMA)

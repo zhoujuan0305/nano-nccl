@@ -1,7 +1,7 @@
 #include "transport/p2p/p2p_fifo.h"
 
 #include "collective/all_reduce/topology.h"
-#include "transport/simple_protocol.h"
+#include "transport/simple/protocol.h"
 
 #include <stdexcept>
 #include <string>
@@ -122,7 +122,7 @@ P2pFifo<T>::P2pFifo(
                         topology, receiver_global_rank);
                 buffers_[channel][edge] = new core::DeviceBuffer<T>(
                     topology.devices[receiver_local_rank],
-                    kSimpleFifoSteps * slot_elems);
+                    nano_nccl::transport::simple::kFifoSteps * slot_elems);
             }
         }
     } catch (...) {

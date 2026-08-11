@@ -96,8 +96,8 @@ void P2pStepCounters::reset(const std::vector<cudaStream_t>& streams) {
     }
 }
 
-SimpleControlArgs P2pStepCounters::control_args(int rank) const {
-    SimpleControlArgs control{};
+nano_nccl::transport::simple::ControlArgs P2pStepCounters::control_args(int rank) const {
+    nano_nccl::transport::simple::ControlArgs control{};
     int prev = (rank + kRanks - 1) % kRanks;
     for (int channel = 0; channel < kChannels; ++channel) {
         if (plan_.edge_kind(rank) == TransportKind::P2p) {

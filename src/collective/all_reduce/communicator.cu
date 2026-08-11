@@ -3,6 +3,7 @@
 #include "core/buffer.h"
 #include "core/numa.h"
 #include "collective/all_reduce/communicator_internal.h"
+#include "collective/all_reduce/ring_simple_geometry.h"
 #include "collective/all_reduce/topology.h"
 #include "kernels/ring_simple_kernel.cuh"
 #include "transport/socket/socket_proxy.h"
@@ -10,6 +11,7 @@
 #include "transport/p2p/p2p_fifo.h"
 #include "transport/p2p/p2p_step_counters.h"
 #include "transport/p2p/p2p_topology.h"
+#include "transport/simple/step.h"
 #include "transport/shm/shm_fifo.h"
 #if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
 #include "collective/all_reduce/ring_turnaround.h"
@@ -48,8 +50,8 @@ using core::MappedBuffer;
 using core::MappedU32Array;
 using core::MappedU64Array;
 using kernels::ring_simple_kernel;
-using transport::SimpleControlArgs;
-using transport::SimpleFifoArgs;
+using transport::simple::ControlArgs;
+using transport::simple::FifoArgs;
 
 void require_single_process_devices(const std::vector<int>& devices) {
     if (devices.size() != kRanks) {
@@ -282,9 +284,9 @@ private:
     std::unique_ptr<SocketChannelResources> make_socket_resources(int device) {
         auto resources = std::make_unique<SocketChannelResources>();
         resources->fifo = std::make_unique<MappedBuffer<std::uint8_t>>(
-            transport::kSimpleFifoBuffBytes, core::gpu_numa_node(device), devices_);
+            transport::simple::kFifoBytes, core::gpu_numa_node(device), devices_);
         resources->control.reset(2, core::gpu_numa_node(device), devices_);
-        resources->payload_bytes.reset(transport::kSimpleFifoSteps,
+        resources->payload_bytes.reset(transport::simple::kFifoSteps,
                                        core::gpu_numa_node(device), devices_);
         return resources;
     }
@@ -348,10 +350,10 @@ private:
                 auto& resources = *socket_send_resources_[hello.channel][edge];
                 transport::socket::SocketProxyFifo fifo{
                     resources.fifo->host_ptr(),
-                    transport::kSimpleFifoBuffBytes / transport::kSimpleFifoSteps,
-                    transport::kSimpleFifoSteps,
+                    transport::simple::kFifoBytes / transport::simple::kFifoSteps,
+                    transport::simple::kFifoSteps,
                     resources.payload_bytes.host_ptr(),
-                    transport::shm::kSimpleFifoSliceSteps,
+                    transport::simple::kSliceSteps,
                 };
                 socket_send_proxies_.push_back(std::make_unique<transport::socket::SocketSendProxy>(
                     std::move(connection), fifo,
@@ -367,10 +369,10 @@ private:
                 auto& resources = *socket_recv_resources_[hello.channel][edge];
                 transport::socket::SocketProxyFifo fifo{
                     resources.fifo->host_ptr(),
-                    transport::kSimpleFifoBuffBytes / transport::kSimpleFifoSteps,
-                    transport::kSimpleFifoSteps,
+                    transport::simple::kFifoBytes / transport::simple::kFifoSteps,
+                    transport::simple::kFifoSteps,
                     resources.payload_bytes.host_ptr(),
-                    transport::shm::kSimpleFifoSliceSteps,
+                    transport::simple::kSliceSteps,
                 };
                 socket_recv_proxies_.push_back(std::make_unique<transport::socket::SocketRecvProxy>(
                     std::move(connection), fifo,
@@ -423,18 +425,18 @@ private:
     std::unique_ptr<RdmaChannelResources> make_rdma_resources(int device) {
         auto resources = std::make_unique<RdmaChannelResources>();
         resources->fifo = std::make_unique<MappedBuffer<std::uint8_t>>(
-            transport::kSimpleFifoBuffBytes, core::gpu_numa_node(device), devices_);
+            transport::simple::kFifoBytes, core::gpu_numa_node(device), devices_);
         resources->control.reset(2, core::gpu_numa_node(device), devices_);
-        resources->payload_bytes.reset(transport::kSimpleFifoSteps,
+        resources->payload_bytes.reset(transport::simple::kFifoSteps,
                                        core::gpu_numa_node(device), devices_);
         return resources;
     }
 
     void register_rdma_cts_buffer(RdmaChannelResources& r, bool remote_write) {
         constexpr std::size_t kCtsBytes =
-            static_cast<std::size_t>(transport::kSimpleFifoSteps) *
+            static_cast<std::size_t>(transport::simple::kFifoSteps) *
             sizeof(transport::rdma::RdmaCtsSlot);
-        r.cts_slots.reset(new transport::rdma::RdmaCtsSlot[transport::kSimpleFifoSteps]());
+        r.cts_slots.reset(new transport::rdma::RdmaCtsSlot[transport::simple::kFifoSteps]());
         int access = IBV_ACCESS_LOCAL_WRITE;
         if (remote_write) {
             access |= IBV_ACCESS_REMOTE_WRITE;
@@ -495,7 +497,7 @@ private:
                         transport::rdma::RdmaQp::create_init(
                             *rdma_endpoint_, kRdmaProxyWr, kRdmaProxyWr));
                     ibv_mr* mr = ibv_reg_mr(rdma_endpoint_->pd(), r.fifo->host_ptr(),
-                        transport::kSimpleFifoBuffBytes,
+                        transport::simple::kFifoBytes,
                         IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                         IBV_ACCESS_REMOTE_READ);
                     if (mr == nullptr) {
@@ -522,7 +524,7 @@ private:
                         transport::rdma::RdmaQp::create_init(
                             *rdma_endpoint_, kRdmaProxyWr, kRdmaProxyWr));
                     ibv_mr* mr = ibv_reg_mr(rdma_endpoint_->pd(), r.fifo->host_ptr(),
-                        transport::kSimpleFifoBuffBytes,
+                        transport::simple::kFifoBytes,
                         IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                         IBV_ACCESS_REMOTE_READ);
                     if (mr == nullptr) {
@@ -583,14 +585,14 @@ private:
                         reinterpret_cast<std::uint64_t>(r.fifo->host_ptr());
                     local_info.recv_fifo_rkey = r.fifo_mr_raw->rkey;
                     local_info.recv_fifo_bytes =
-                        static_cast<std::uint32_t>(transport::kSimpleFifoBuffBytes);
+                        static_cast<std::uint32_t>(transport::simple::kFifoBytes);
                 }
                 if (is_send) {
                     local_info.cts_fifo_addr =
                         reinterpret_cast<std::uint64_t>(r.cts_slots.get());
                     local_info.cts_fifo_rkey = r.cts_mr_raw->rkey;
                     local_info.cts_slot_count =
-                        static_cast<std::uint32_t>(transport::kSimpleFifoSteps);
+                        static_cast<std::uint32_t>(transport::simple::kFifoSteps);
                 }
             }
 
@@ -613,7 +615,7 @@ private:
                 }
                 if (is_recv &&
                     remote_info.cts_slot_count !=
-                        static_cast<std::uint32_t>(transport::kSimpleFifoSteps)) {
+                        static_cast<std::uint32_t>(transport::simple::kFifoSteps)) {
                     throw std::runtime_error(
                         "rdma WriteCts peer CTS slot_count mismatch");
                 }
@@ -630,10 +632,10 @@ private:
 
             transport::rdma::RdmaProxyFifo fifo{
                 r.fifo->host_ptr(),
-                transport::kSimpleFifoBuffBytes / transport::kSimpleFifoSteps,
-                transport::kSimpleFifoSteps,
+                transport::simple::kFifoBytes / transport::simple::kFifoSteps,
+                transport::simple::kFifoSteps,
                 r.payload_bytes.host_ptr(),
-                transport::shm::kSimpleFifoSliceSteps,
+                transport::simple::kSliceSteps,
             };
             transport::rdma::RdmaProxyIdentity identity{
                 edge, receiver, hello.channel};
@@ -645,7 +647,7 @@ private:
                     targets.remote_fifo_bytes = remote_info.recv_fifo_bytes;
                     targets.local_cts = r.cts_slots.get();
                     targets.cts_slot_count =
-                        static_cast<std::size_t>(transport::kSimpleFifoSteps);
+                        static_cast<std::size_t>(transport::simple::kFifoSteps);
                     targets.local_cts_mr = r.cts_mr_raw;
                     rdma_send_proxies_.push_back(
                         std::make_unique<transport::rdma::RdmaSendProxy>(
@@ -852,13 +854,13 @@ private:
             std::size_t part_offset = 0;
             std::size_t part_count = 0;
             std::size_t chunk_count = 0;
-            transport::shm::cbd_part<T>(count, channel, &part_offset,
-                                        &part_count, &chunk_count);
+            collective::all_reduce::cbd_part<T>(count, channel, &part_offset,
+                                                &part_count, &chunk_count);
             required_slot_elems = std::max(required_slot_elems, chunk_count);
         }
         required_slot_elems = std::max<std::size_t>(required_slot_elems, 1);
         if (topology_.distributed) {
-            required_slot_elems = transport::shm::simple_fifo_step_elems<T>();
+            required_slot_elems = transport::simple::step_elems<T>();
         }
         if (required_slot_elems <= resources->slot_elems) return;
 
@@ -883,7 +885,7 @@ private:
                     }
                 }
                 replacement.shm_fifo[channel][edge] = std::make_unique<MappedBuffer<T>>(
-                    transport::shm::kSimpleFifoSteps * replacement.slot_elems,
+                    transport::simple::kFifoSteps * replacement.slot_elems,
                     core::gpu_numa_node(devices_[receiver_local]), devices_);
             }
         }
@@ -920,27 +922,29 @@ private:
     void launch_ring_simple(const CollectiveArgs& args, FifoResources<T>* resources) {
         ensure_completion_events();
         for (int rank = 0; rank < local_rank_count(); ++rank) {
-            SimpleFifoArgs<T> kernel_args{};
+            FifoArgs<T> kernel_args{};
             int global_rank = topology_.local_rank_offset + rank;
             kernel_args.rank = global_rank;
             kernel_args.count = args.count;
             kernel_args.slot_elems = resources->slot_elems;
-            kernel_args.step_elems = transport::shm::simple_fifo_step_elems<T>();
+            kernel_args.step_elems = transport::simple::step_elems<T>();
             kernel_args.input = static_cast<const T*>(args.send_buffers[rank]);
             kernel_args.output = static_cast<T*>(args.recv_buffers[rank]);
 
-            SimpleControlArgs shm_control = transport::shm::make_simple_control_args(
+            ControlArgs shm_control = transport::shm::make_simple_control_args(
                 simple_fifo_steps_.device_ptr(devices_[rank]),
                 simple_fifo_base_step_.device_ptr(devices_[rank]), global_rank);
-            SimpleControlArgs p2p_control{};
+            ControlArgs p2p_control{};
             if (p2p_steps_ != nullptr) {
                 p2p_control = p2p_steps_->control_args(global_rank);
             }
 
             int next = (global_rank + 1) % kRanks;
             int previous = (global_rank + kRanks - 1) % kRanks;
-            int send_edge = transport::shm::ring_edge_index(global_rank, next, kRanks);
-            int recv_edge = transport::shm::ring_edge_index(previous, global_rank, kRanks);
+            int send_edge = collective::all_reduce::ring_edge_index(
+                global_rank, next, kRanks);
+            int recv_edge = collective::all_reduce::ring_edge_index(
+                previous, global_rank, kRanks);
             if (send_edge < 0 || recv_edge < 0) {
                 throw std::runtime_error("ring_simple saw an unexpected ring edge");
             }

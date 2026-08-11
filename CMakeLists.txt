@@ -12,14 +12,24 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# 编译期可配置参数：默认值对应当前单机 4 GPU / sm_61 基线。
+# 编译期可配置参数：默认值对应当前单机 4 GPU / sm_70 最低架构。
 # NRANKS/NCHANNELS/BLOCK_THREADS/FIFO_BUFF_BYTES 通过 compile definitions
-# 注入代码；CUDA_ARCH 仅用于 -arch=sm_X，不作为宏传递。
+# 注入代码；CUDA_ARCH 统一设置所有 CUDA target 的编译架构，不作为宏传递。
 set(NANO_NCCL_NRANKS 4 CACHE STRING "Number of GPU ranks")
 set(NANO_NCCL_NCHANNELS 4 CACHE STRING "Number of channels")
-set(NANO_NCCL_CUDA_ARCH 61 CACHE STRING "CUDA compute capability (e.g. 61 for sm_61)")
+set(NANO_NCCL_CUDA_ARCH 70 CACHE STRING "CUDA compute capability (minimum 70)")
 set(NANO_NCCL_BLOCK_THREADS 512 CACHE STRING "Threads per block")
 set(NANO_NCCL_FIFO_BUFF_BYTES 33554432 CACHE STRING "FIFO buffer size in bytes")
+
+if(NOT NANO_NCCL_CUDA_ARCH MATCHES "^[0-9]+$")
+    message(FATAL_ERROR "NANO_NCCL_CUDA_ARCH must be a numeric compute capability")
+endif()
+if(NANO_NCCL_CUDA_ARCH LESS 70)
+    message(FATAL_ERROR
+        "NANO_NCCL_CUDA_ARCH must be at least 70 for system-scope Simple protocol ordering")
+endif()
+set(CMAKE_CUDA_ARCHITECTURES ${NANO_NCCL_CUDA_ARCH})
+
 option(NANO_NCCL_ENABLE_MPI "Build the optional MPI communicator bootstrap adapter" OFF)
 option(NANO_NCCL_SOCKET_TEST_FAULT_INJECTION
        "Build a test-only MPI socket fault-injection library" OFF)

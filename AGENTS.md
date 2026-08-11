@@ -8,7 +8,7 @@ Current capabilities:
 
 - Single-node multi-GPU performance path (tested with `CUDA_VISIBLE_DEVICES=0,1,2,3`; rank count configurable via CMake `NANO_NCCL_NRANKS`)
 - Optional MPI/socket and MPI/RDMA multi-host, out-of-place `all_reduce` correctness paths; Open MPI 4.1.2 and the same MPI ABI are required on all hosts. MPI targets use the MPI C API and do not require Open MPI's retired C++ binding library.
-- `float`, FP16, and BF16 dtypes with `sum`, `avg`, `max`, and `min` reduce ops, out-of-place; `avg` is `sum / nranks`, `max`/`min` propagate NaN, and BF16 requires SM80+
+- `float`, FP16, and BF16 dtypes with `sum`, `avg`, `max`, and `min` reduce ops, out-of-place; `avg` is `sum / nranks`, `max`/`min` propagate NaN. `float` and FP16 require SM70+ because Simple FIFO counters use system-scope release/acquire operations; BF16 requires SM80+
 - Ring + Simple protocol, with SHM FIFO, device P2P FIFO, optional MPI/socket transport, and optional MPI/RDMA transport
 - MPI/RDMA correctness is validated across `float`, FP16, and BF16; `sum`, `avg`, `max`, and `min`; and 256 KiB through 64 MiB. The BF16 device-capability validation is cached after its first successful use; the full A6000 single-host performance gate is pending revalidation (see Acceptance section below)
 
@@ -46,14 +46,16 @@ nano-nccl/
 │   │   └── stream.h                   # Stream/Event/GraphExec RAII wrappers
 │   ├── transport/
 │   │   ├── transport.h                # Transport interface (seam for network)
-│   │   ├── simple_protocol.h          # Shared Simple protocol constants
+│   │   ├── simple/
+│   │   │   ├── protocol.h             # Simple FIFO layout and protocol constants
+│   │   │   ├── step.h                 # System-scope FIFO step ordering
+│   │   │   └── geometry.h             # Simple FIFO slice geometry
 │   │   ├── p2p/
 │   │   │   ├── p2p_fifo.h / .cu       # Device FIFO storage
 │   │   │   ├── p2p_step_counters.h/.cu # Device P2P step counters
 │   │   │   └── p2p_topology.h / .cu   # Ring peer-access checks
 │   │   ├── shm/
-│   │       ├── shm_fifo.h / .cu       # SHM FIFO buffer management
-│   │       └── shm_step.h             # step counter (wait/post)
+│   │   │   └── shm_fifo.h             # Mapped host FIFO storage/control only
 │   │   ├── socket/
 │   │       ├── socket_endpoint.h / .cc # IPv4 endpoint and HELLO exchange
 │   │       ├── socket_protocol.h       # framed socket slice protocol
@@ -70,6 +72,7 @@ nano-nccl/
 │   │       ├── communicator_internal.h  # factory and owned socket connections
 │   │       ├── mpi_communicator.cc     # MPI bootstrap and socket connection exchange
 │   │       ├── topology.h / .cc         # local/global rank and edge topology
+│   │       ├── ring_simple_geometry.h  # Ring channel/rank work partitioning
 │   │       └── ring_simple.h / .cu      # single-host benchmark implementation
 │   └── kernels/
 │       └── ring_simple_kernel.cuh     # device kernel template
@@ -97,6 +100,9 @@ Directory responsibilities:
 - `include/nano_nccl/`: public headers; `mpi.h` is available only in an MPI build
 - `src/core/`: infrastructure, collective-agnostic (buffer, NUMA, stream)
 - `src/transport/`: transport abstraction, subdirectories per transport type
+- `src/transport/simple/`: Simple FIFO layout, step ordering, and slice geometry
+- `src/transport/shm/`: mapped host FIFO storage and control only
+- `src/collective/all_reduce/ring_simple_geometry.h`: Ring channel/rank work partitioning
 - `src/collective/`: collective operation abstraction, subdirectories per collective type
 - `src/kernels/`: device kernel template headers (`.cuh`), referenced and instantiated by collective implementations
 - `benchmarks/`: perf + correctness integrated benchmark
@@ -108,7 +114,7 @@ Directory responsibilities:
 |---|---|---|
 | Class/struct | PascalCase | `MappedBuffer`, `AllReduceRunner` |
 | Function | snake_case | `wait_send_credit`, `run_ring_simple` |
-| Constants | kPascalCase | `kRanks`, `kChannels`, `kSimpleFifoSteps` |
+| Constants | kPascalCase | `kRanks`, `kChannels`, `transport::simple::kFifoSteps` |
 | Namespace | snake_case, layered | `nano_nccl::core`, `nano_nccl::transport::shm` |
 | File | snake_case | `buffer.h`, `ring_simple.cu` |
 | Algorithm name | snake_case | `ring_simple` |
@@ -117,8 +123,9 @@ Directory responsibilities:
 Namespace layering maps 1:1 to directory structure:
 
 - `nano_nccl::core` — buffer, numa, stream
+- `nano_nccl::transport::simple` — Simple FIFO layout, step ordering, and slice geometry
 - `nano_nccl::transport::p2p` — device FIFO, P2P ring validation
-- `nano_nccl::transport::shm` — SHM FIFO, step counter
+- `nano_nccl::transport::shm` — mapped host FIFO storage and control
 - `nano_nccl::transport::socket` — IPv4 endpoints and socket proxy threads
 - `nano_nccl::transport::rdma` — RoCE/IB endpoint, RC QP, and send/recv proxy threads
 - `nano_nccl::collective::all_reduce` — all_reduce host-side orchestration
@@ -145,6 +152,7 @@ Namespace layering maps 1:1 to directory structure:
 - **Device kernel** is templated: `template<typename T, typename RedOp> __global__ void ring_simple_kernel(...)` with `int nranks` as a runtime argument. dtype and reduce op are compile-time parameters; rank count is runtime (benchmarked lossless vs. template specialization on 4× A6000: geomean busbw ratio 1.003/0.997/0.998 for float/fp16/bf16 across 256 KiB – 64 MiB).
 - **Host side** uses runtime parameters to select algo/transport/collective, does not require compiling all combinations.
 - **Transport**: SHM FIFO, device P2P FIFO, MPI/socket, or optional MPI/RDMA for cross-process ring edges. SHM GPUs read/write mapped host memory directly over PCIe (`cudaHostAllocMapped`), with no proxy thread or `cudaMemcpy`; FIFO buffers are allocated on the receiver NUMA node to avoid cross-NUMA bandwidth loss. P2P FIFO buffers are allocated on the receiver GPU and require bidirectional CUDA peer access between every ring-neighbor pair. Socket uses an IPv4 listener chosen by `NANO_NCCL_SOCKET_IFNAME`; it is a trusted-network transport without TLS or auto reconnect. RDMA defaults to RC send/recv over a host-pinned, registered FIFO; set `NANO_NCCL_RDMA_USE_WRITE=1` for the WRITE+CTS host-pin data plane. The proxy multi-flights WQEs up to Simple FIFO slice depth and does not use GPUDirect RDMA (compare with `NCCL_NET_GDR_LEVEL=0`); it is selected only by explicit `--transport rdma` and requires the MPI/RDMA build plus `NANO_NCCL_RDMA_IFNAME`. Both hosts must build the same commit (`RdmaPeerInfo` is 64 bytes).
+- **Protocol ownership**: `src/transport/simple/` owns FIFO layout, step ordering, and slice geometry; `src/transport/shm/` owns mapped host FIFO storage/control only; `src/collective/all_reduce/ring_simple_geometry.h` owns Ring channel/rank work partitioning. Transport runtime lifecycle and orchestration remain in `Communicator::Impl`; they have not moved into the Simple protocol module.
 
 ### Transport selection
 
@@ -182,13 +190,16 @@ For MPI/socket launches, set `NANO_NCCL_SOCKET_IFNAME` to an interface with exac
 **Key design points**:
 
 - Step counter persists across iterations (matching NCCL `conn->step`); `run_batch` uses CUDA events for cross-stream barriers instead of per-iteration `cudaStreamSynchronize`, aligning with NCCL `BenchTime` timing methodology.
-- `kSimpleFifoSliceSteps = 2` (two slices per chunk), matching the active Simple protocol constants.
+- `transport::simple::kSliceSteps = 2` (two slices per chunk), matching the active Simple protocol constants.
 - Wait cache (`send_head_cache`/`recv_tail_cache`) matches NCCL `connStepCache`, avoiding reloading step counter from host memory on every wait.
 - Optional benchmark profiling is guarded by `NANO_NCCL_ENABLE_BENCH_PROFILING`; when `OFF`, the default performance path compiles no NVTX or CUDA profiler calls and has no iteration-time profiling condition. When `ON`, every size starts capture after warmup, creates an outer `all_reduce size=<bytes>B` range plus `all_reduce size=<bytes>B iteration=<iteration>` per-iteration ranges, synchronizes, stops capture, then validates. CUDA 12.8 warns that NVTX 2 `<nvToolsExt.h>` is deprecated; the supported range API remains in use.
 - Optional `NANO_NCCL_RDMA_SHARED_PROGRESS` (default dedicated/`0`; `1` enables one shared host progress thread for all local RDMA proxies).
 Optional `NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE` (default `OFF`) can record per-event RDMA host-proxy metrics including tail-vs-CTS arm times and inter-post spacing; investigation-only, not for production perf claims.
 
 ## Build
+
+`NANO_NCCL_CUDA_ARCH` defaults to 70, and CMake rejects values below 70. This
+matches the SM70+ floor for `float` and FP16; BF16 additionally requires SM80+.
 
 ```bash
 mkdir -p build && cd build
@@ -278,9 +289,10 @@ This is a single-host acceptance criterion only; no multi-host socket performanc
 
 ## Extension Guide
 
-- **New dtype**: implement pack/unpack trait in `include/nano_nccl/traits.h`, add template instantiation in `ring_simple.cu`; current `float`, FP16, and BF16 support `sum`/`avg`/`max`/`min`, and BF16 requires SM80+
+- **New dtype**: implement pack/unpack trait in `include/nano_nccl/traits.h`, add template instantiation in `ring_simple.cu`; current `float` and FP16 require SM70+, while BF16 requires SM80+, and all three support `sum`/`avg`/`max`/`min`
 - **New reduce op**: implement RedOp trait in `include/nano_nccl/traits.h`, add template instantiation in `ring_simple.cu`
 - **New rank count**: pass the new rank count to `ring_simple_kernel` as runtime `nranks` argument; `kRanks` (from `NANO_NCCL_NRANKS`) still controls host-side buffer sizing and array dimensions
 - **New collective**: create subdirectory under `src/collective/`, implement collective interface
+- **Simple protocol change**: update FIFO layout, step ordering, or slice geometry in `src/transport/simple/`; update Ring channel/rank work partitioning in `src/collective/all_reduce/ring_simple_geometry.h`; keep mapped host storage/control in `src/transport/shm/`
 - **New transport**: create a subdirectory under `src/transport/` and implement the transport interface (for example, RoCE RC send/recv); RDMA v1 uses registered host FIFO memory, while RDMA write and GPUDirect RDMA remain future work
 - **RDMA build**: `cmake -S . -B build-rdma -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_ENABLE_MPI=ON -DNANO_NCCL_ENABLE_RDMA=ON -DNANO_NCCL_NRANKS=<ranks> -DNANO_NCCL_CUDA_ARCH=<arch>`; requires `libibverbs-dev` and reuses the TCP bootstrap connection for `RdmaPeerInfo` exchange and receive-ready coordination. Default data plane is SEND/RECV; `NANO_NCCL_RDMA_USE_WRITE=1` enables WRITE+CTS (host-pin only; no GDR)

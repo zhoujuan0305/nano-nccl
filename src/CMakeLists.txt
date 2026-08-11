@@ -4,7 +4,6 @@ set(nano_nccl_sources
     transport/p2p/p2p_fifo.cu
     transport/p2p/p2p_step_counters.cu
     transport/p2p/p2p_topology.cu
-    transport/shm/shm_fifo.cu
     transport/socket/socket_endpoint.cc
     transport/socket/socket_proxy.cc
     collective/all_reduce/topology.cc
@@ -27,7 +26,7 @@ function(add_nano_nccl_library target)
         ${CMAKE_SOURCE_DIR}/src
     )
     target_compile_options(${target} PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:-arch=sm_${NANO_NCCL_CUDA_ARCH} -O3>
+        $<$<COMPILE_LANGUAGE:CUDA>:-O3>
         $<$<COMPILE_LANGUAGE:CXX>:-O3>
     )
     target_link_libraries(${target} PUBLIC ${NUMA_LIB} CUDA::cudart ${NVML_LIB} Threads::Threads)

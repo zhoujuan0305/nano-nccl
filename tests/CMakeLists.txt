@@ -31,6 +31,14 @@ endif()
 
 if(BUILD_TESTING)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(NAME nano_nccl_simple_protocol COMMAND nano_nccl_simple_protocol)
+    set_tests_properties(nano_nccl_simple_protocol PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(
+        NAME nano_nccl_cuda_arch_contract
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/cuda_arch_contract_test.py
+                ${CMAKE_SOURCE_DIR}
+    )
     add_test(
         NAME nano_nccl_communicator_bf16_validation_static
         COMMAND ${Python3_EXECUTABLE}
@@ -44,11 +52,10 @@ if(BUILD_TESTING)
                 ${CMAKE_SOURCE_DIR}/src/kernels/ring_simple_kernel.cuh
     )
     add_test(
-        NAME nano_nccl_rdma_direct_publish_static
+        NAME nano_nccl_simple_protocol_ownership_static
         COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/rdma_direct_publish_static.py
-                ${CMAKE_SOURCE_DIR}/src/kernels/ring_simple_kernel.cuh
-                ${CMAKE_SOURCE_DIR}/src/transport/shm/shm_step.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/simple_protocol_ownership_static.py
+                ${CMAKE_SOURCE_DIR}
     )
     add_test(
         NAME nano_nccl_bench_profiling_static

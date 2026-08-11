@@ -1,8 +1,10 @@
 #pragma once
 
+#include "collective/all_reduce/ring_simple_geometry.h"
 #include "nano_nccl/traits.h"
-#include "transport/shm/shm_fifo.h"
-#include "transport/shm/shm_step.h"
+#include "transport/simple/geometry.h"
+#include "transport/simple/protocol.h"
+#include "transport/simple/step.h"
 #if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
 #include "collective/all_reduce/ring_turnaround.h"
 #endif
@@ -571,29 +573,29 @@ __device__ inline void reduce_local_broadcast_worker(
 // 等待 send 方有可用 slot（credit）。专用 threadIdx==1 轮询，对齐 NCCL connStepCache。
 template <typename T>
 __device__ inline bool wait_send_credit(
-    transport::SimpleChannelArgs<T> args, std::uint64_t step,
+    transport::simple::ChannelArgs<T> args, std::uint64_t step,
     std::uint64_t* head_cache, int* wait_status) {
     std::uint64_t* head = args.send_head;
     if (threadIdx.x == 0) *wait_status = 1;
     __syncthreads();
     if (threadIdx.x == 1) {
-        if (args.abort != nullptr && transport::shm::load_abort(args.abort) != 0) {
+        if (args.abort != nullptr && transport::simple::load_abort(args.abort) != 0) {
             *wait_status = 0;
         }
-        if (*head_cache + transport::shm::kSimpleFifoSteps <
-                step + transport::shm::kSimpleFifoSliceSteps &&
+        if (*head_cache + transport::simple::kFifoSteps <
+                step + transport::simple::kSliceSteps &&
             *wait_status != 0 && args.wait_observer != nullptr) {
             *args.wait_observer = 1;
             __threadfence_system();
         }
-        while (*head_cache + transport::shm::kSimpleFifoSteps <
-                   step + transport::shm::kSimpleFifoSliceSteps &&
+        while (*head_cache + transport::simple::kFifoSteps <
+                   step + transport::simple::kSliceSteps &&
                *wait_status != 0) {
-            if (args.abort != nullptr && transport::shm::load_abort(args.abort) != 0) {
+            if (args.abort != nullptr && transport::simple::load_abort(args.abort) != 0) {
                 *wait_status = 0;
                 break;
             }
-            *head_cache = transport::shm::load_step(head);
+            *head_cache = transport::simple::load_step(head);
         }
         if (*wait_status != 0) *wait_status = 1;
     }
@@ -603,27 +605,27 @@ __device__ inline bool wait_send_credit(
 
 template <typename T>
 __device__ inline bool wait_recv_ready(
-    transport::SimpleChannelArgs<T> args, std::uint64_t step,
+    transport::simple::ChannelArgs<T> args, std::uint64_t step,
     std::uint64_t* tail_cache, int* wait_status) {
     std::uint64_t* tail = args.recv_tail;
     if (threadIdx.x == 0) *wait_status = 1;
     __syncthreads();
     if (threadIdx.x == 0) {
-        if (args.abort != nullptr && transport::shm::load_abort(args.abort) != 0) {
+        if (args.abort != nullptr && transport::simple::load_abort(args.abort) != 0) {
             *wait_status = 0;
         }
-        if (*tail_cache < step + transport::shm::kSimpleFifoSliceSteps &&
+        if (*tail_cache < step + transport::simple::kSliceSteps &&
             *wait_status != 0 && args.wait_observer != nullptr) {
             *args.wait_observer = 1;
             __threadfence_system();
         }
-        while (*tail_cache < step + transport::shm::kSimpleFifoSliceSteps &&
+        while (*tail_cache < step + transport::simple::kSliceSteps &&
                *wait_status != 0) {
-            if (args.abort != nullptr && transport::shm::load_abort(args.abort) != 0) {
+            if (args.abort != nullptr && transport::simple::load_abort(args.abort) != 0) {
                 *wait_status = 0;
                 break;
             }
-            *tail_cache = transport::shm::load_step(tail);
+            *tail_cache = transport::simple::load_step(tail);
         }
         if (*wait_status != 0) *wait_status = 1;
     }
@@ -635,7 +637,7 @@ __device__ inline bool wait_recv_ready(
 // whole block twice, serializing the two independent polls on RECV_BOUND paths.
 template <typename T>
 __device__ inline bool wait_recv_ready_and_send_credit(
-    transport::SimpleChannelArgs<T> args, std::uint64_t recv_step,
+    transport::simple::ChannelArgs<T> args, std::uint64_t recv_step,
     std::uint64_t send_step, std::uint64_t* recv_tail_cache,
     std::uint64_t* send_head_cache, int* wait_status) {
     std::uint64_t* tail = args.recv_tail;
@@ -661,23 +663,23 @@ __device__ inline bool wait_recv_ready_and_send_credit(
             asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_recv0));
         }
 #endif
-        if (args.abort != nullptr && transport::shm::load_abort(args.abort) != 0) {
+        if (args.abort != nullptr && transport::simple::load_abort(args.abort) != 0) {
             *wait_status = 0;
         }
-        if (*recv_tail_cache < recv_step + transport::shm::kSimpleFifoSliceSteps &&
+        if (*recv_tail_cache < recv_step + transport::simple::kSliceSteps &&
             *wait_status != 0 && args.wait_observer != nullptr) {
             *args.wait_observer = 1;
             __threadfence_system();
         }
         while (*recv_tail_cache <
-                   recv_step + transport::shm::kSimpleFifoSliceSteps &&
+                   recv_step + transport::simple::kSliceSteps &&
                *wait_status != 0) {
             if (args.abort != nullptr &&
-                transport::shm::load_abort(args.abort) != 0) {
+                transport::simple::load_abort(args.abort) != 0) {
                 *wait_status = 0;
                 break;
             }
-            *recv_tail_cache = transport::shm::load_step(tail);
+            *recv_tail_cache = transport::simple::load_step(tail);
         }
         if (*wait_status != 0) *wait_status = 1;
 #if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
@@ -694,24 +696,24 @@ __device__ inline bool wait_recv_ready_and_send_credit(
             asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_send0));
         }
 #endif
-        if (args.abort != nullptr && transport::shm::load_abort(args.abort) != 0) {
+        if (args.abort != nullptr && transport::simple::load_abort(args.abort) != 0) {
             *wait_status = 0;
         }
-        if (*send_head_cache + transport::shm::kSimpleFifoSteps <
-                send_step + transport::shm::kSimpleFifoSliceSteps &&
+        if (*send_head_cache + transport::simple::kFifoSteps <
+                send_step + transport::simple::kSliceSteps &&
             *wait_status != 0 && args.wait_observer != nullptr) {
             *args.wait_observer = 1;
             __threadfence_system();
         }
-        while (*send_head_cache + transport::shm::kSimpleFifoSteps <
-                   send_step + transport::shm::kSimpleFifoSliceSteps &&
+        while (*send_head_cache + transport::simple::kFifoSteps <
+                   send_step + transport::simple::kSliceSteps &&
                *wait_status != 0) {
             if (args.abort != nullptr &&
-                transport::shm::load_abort(args.abort) != 0) {
+                transport::simple::load_abort(args.abort) != 0) {
                 *wait_status = 0;
                 break;
             }
-            *send_head_cache = transport::shm::load_step(head);
+            *send_head_cache = transport::simple::load_step(head);
         }
         if (*wait_status != 0) *wait_status = 1;
 #if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
@@ -741,7 +743,7 @@ __device__ inline void worker_barrier(int nworkers) {
 
 template <typename T>
 __device__ inline void post_send_ready(
-    transport::SimpleChannelArgs<T> args, std::uint64_t step,
+    transport::simple::ChannelArgs<T> args, std::uint64_t step,
     std::size_t payload_bytes, bool data_stored, int nworkers) {
     std::uint64_t* tail = args.send_tail;
     // Workers wrote FIFO before entry. Full-block sync (publisher is
@@ -759,11 +761,11 @@ __device__ inline void post_send_ready(
         }
 #endif
         if (args.send_payload_bytes != nullptr) {
-            args.send_payload_bytes[step % transport::shm::kSimpleFifoSteps] =
+            args.send_payload_bytes[step % transport::simple::kFifoSteps] =
                 static_cast<std::uint32_t>(payload_bytes);
         }
-        transport::shm::store_step(
-            tail, step + transport::shm::kSimpleFifoSliceSteps);
+        transport::simple::store_step(
+            tail, step + transport::simple::kSliceSteps);
 #if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
         if (args.turnaround != nullptr) {
             unsigned long long t_post1;
@@ -776,10 +778,10 @@ __device__ inline void post_send_ready(
 
 template <typename T>
 __device__ inline void post_recv_credit(
-    transport::SimpleChannelArgs<T> args, std::uint64_t step) {
+    transport::simple::ChannelArgs<T> args, std::uint64_t step) {
     std::uint64_t* head = args.recv_head;
     if (threadIdx.x == blockDim.x - 2) {
-        transport::shm::store_step(head, step + transport::shm::kSimpleFifoSliceSteps);
+        transport::simple::store_step(head, step + transport::simple::kSliceSteps);
     }
 }
 
@@ -787,14 +789,14 @@ __device__ inline void post_recv_credit(
 // Avoids post_send_ready's nested __syncthreads after post_recv_credit.
 template <typename T>
 __device__ inline void post_recv_credit_and_send_ready(
-    transport::SimpleChannelArgs<T> args, std::uint64_t recv_step,
+    transport::simple::ChannelArgs<T> args, std::uint64_t recv_step,
     std::uint64_t send_step, std::size_t payload_bytes, bool data_stored,
     int nworkers) {
     (void)nworkers;
     __syncthreads();
     if (threadIdx.x == blockDim.x - 2) {
-        transport::shm::store_step(args.recv_head,
-                                   recv_step + transport::shm::kSimpleFifoSliceSteps);
+        transport::simple::store_step(args.recv_head,
+                                   recv_step + transport::simple::kSliceSteps);
     }
     if (threadIdx.x == blockDim.x - 1) {
 #if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
@@ -804,13 +806,13 @@ __device__ inline void post_recv_credit_and_send_ready(
         }
 #endif
         if (args.send_payload_bytes != nullptr) {
-            args.send_payload_bytes[send_step % transport::shm::kSimpleFifoSteps] =
+            args.send_payload_bytes[send_step % transport::simple::kFifoSteps] =
                 static_cast<std::uint32_t>(payload_bytes);
         }
         (void)data_stored;
-        transport::shm::store_step(
+        transport::simple::store_step(
             args.send_tail,
-            send_step + transport::shm::kSimpleFifoSliceSteps);
+            send_step + transport::simple::kSliceSteps);
 #if defined(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
         if (args.turnaround != nullptr) {
             unsigned long long t_post1;
@@ -823,18 +825,18 @@ __device__ inline void post_recv_credit_and_send_ready(
 
 template <typename T, RedOp kRedOp>
 __device__ inline bool direct_send(
-    transport::SimpleChannelArgs<T> args, const T* src,
+    transport::simple::ChannelArgs<T> args, const T* src,
     std::size_t nelem, std::uint64_t* send_step,
     std::uint64_t* send_head_cache, int nworkers, int* wait_status) {
     std::size_t slice_size =
-        transport::shm::slice_elems<T>(nelem, args.step_elems);
+        transport::simple::slice_elems<T>(nelem, args.step_elems);
     std::size_t slice_offset = 0;
     for (int slice = 0;
-         slice < transport::shm::kSimpleFifoChunkSteps / transport::shm::kSimpleFifoSliceSteps;
+         slice < transport::simple::kChunkSteps / transport::simple::kSliceSteps;
          ++slice) {
         std::size_t work =
             slice_offset < nelem
-                ? transport::shm::nelem(slice_size, nelem, slice_offset)
+                ? collective::all_reduce::nelem(slice_size, nelem, slice_offset)
                 : 0;
         // Empty Simple trailing slices carry no bytes. Both ring peers compute
         // the same work, so eliding wait/post/step keeps edge watermarks aligned
@@ -847,12 +849,12 @@ __device__ inline bool direct_send(
                                          wait_status)) return false;
         worker_barrier(nworkers);
         T* dst = args.send_fifo +
-                     ((*send_step % transport::shm::kSimpleFifoSteps) *
+                     ((*send_step % transport::simple::kFifoSteps) *
                       args.slot_elems);
         copy_worker(src + slice_offset, dst, work, nworkers);
         __syncthreads();
         post_send_ready<T>(args, *send_step, work * sizeof(T), true, nworkers);
-        *send_step += transport::shm::kSimpleFifoSliceSteps;
+        *send_step += transport::simple::kSliceSteps;
         slice_offset += slice_size;
     }
     return true;
@@ -860,19 +862,19 @@ __device__ inline bool direct_send(
 
 template <typename T, RedOp kRedOp>
 __device__ inline bool recv_reduce_send(
-    transport::SimpleChannelArgs<T> args, const T* local,
+    transport::simple::ChannelArgs<T> args, const T* local,
     std::size_t nelem, std::uint64_t* recv_step, std::uint64_t* send_step,
     std::uint64_t* recv_tail_cache, std::uint64_t* send_head_cache,
     int nworkers, int* wait_status) {
     std::size_t slice_size =
-        transport::shm::slice_elems<T>(nelem, args.step_elems);
+        transport::simple::slice_elems<T>(nelem, args.step_elems);
     std::size_t slice_offset = 0;
     for (int slice = 0;
-         slice < transport::shm::kSimpleFifoChunkSteps / transport::shm::kSimpleFifoSliceSteps;
+         slice < transport::simple::kChunkSteps / transport::simple::kSliceSteps;
          ++slice) {
         std::size_t work =
             slice_offset < nelem
-                ? transport::shm::nelem(slice_size, nelem, slice_offset)
+                ? collective::all_reduce::nelem(slice_size, nelem, slice_offset)
                 : 0;
         if (work == 0) {
             slice_offset += slice_size;
@@ -890,10 +892,10 @@ __device__ inline bool recv_reduce_send(
 #endif
         worker_barrier(nworkers);
         const T* recv = args.recv_fifo +
-                            ((*recv_step % transport::shm::kSimpleFifoSteps) *
+                            ((*recv_step % transport::simple::kFifoSteps) *
                              args.slot_elems);
         T* dst = args.send_fifo +
-                     ((*send_step % transport::shm::kSimpleFifoSteps) *
+                     ((*send_step % transport::simple::kFifoSteps) *
                       args.slot_elems);
         if (work * sizeof(T) <= kEarlyRecvCreditMaxBytes) {
             // Small: consume recv FIFO, credit peer early, then local reduce.
@@ -919,8 +921,8 @@ __device__ inline bool recv_reduce_send(
             atomicAdd(&args.turnaround->count, 1ULL);
         }
 #endif
-        *recv_step += transport::shm::kSimpleFifoSliceSteps;
-        *send_step += transport::shm::kSimpleFifoSliceSteps;
+        *recv_step += transport::simple::kSliceSteps;
+        *send_step += transport::simple::kSliceSteps;
         slice_offset += slice_size;
     }
     return true;
@@ -928,19 +930,19 @@ __device__ inline bool recv_reduce_send(
 
 template <typename T, RedOp kRedOp>
 __device__ inline bool recv_reduce_copy_send(
-    transport::SimpleChannelArgs<T> args, const T* local,
+    transport::simple::ChannelArgs<T> args, const T* local,
     T* out, std::size_t nelem, std::uint64_t* recv_step,
     std::uint64_t* send_step, std::uint64_t* recv_tail_cache,
     std::uint64_t* send_head_cache, float inverse_nranks, int nworkers, int* wait_status) {
     std::size_t slice_size =
-        transport::shm::slice_elems<T>(nelem, args.step_elems);
+        transport::simple::slice_elems<T>(nelem, args.step_elems);
     std::size_t slice_offset = 0;
     for (int slice = 0;
-         slice < transport::shm::kSimpleFifoChunkSteps / transport::shm::kSimpleFifoSliceSteps;
+         slice < transport::simple::kChunkSteps / transport::simple::kSliceSteps;
          ++slice) {
         std::size_t work =
             slice_offset < nelem
-                ? transport::shm::nelem(slice_size, nelem, slice_offset)
+                ? collective::all_reduce::nelem(slice_size, nelem, slice_offset)
                 : 0;
         if (work == 0) {
             slice_offset += slice_size;
@@ -958,10 +960,10 @@ __device__ inline bool recv_reduce_copy_send(
 #endif
         worker_barrier(nworkers);
         const T* recv = args.recv_fifo +
-                            ((*recv_step % transport::shm::kSimpleFifoSteps) *
+                            ((*recv_step % transport::simple::kFifoSteps) *
                              args.slot_elems);
         T* dst = args.send_fifo +
-                     ((*send_step % transport::shm::kSimpleFifoSteps) *
+                     ((*send_step % transport::simple::kFifoSteps) *
                       args.slot_elems);
         if (work * sizeof(T) <= kEarlyRecvCreditMaxBytes) {
             // Small: consume recv, credit early, then reduce+broadcast (Avg).
@@ -989,8 +991,8 @@ __device__ inline bool recv_reduce_copy_send(
             atomicAdd(&args.turnaround->count, 1ULL);
         }
 #endif
-        *recv_step += transport::shm::kSimpleFifoSliceSteps;
-        *send_step += transport::shm::kSimpleFifoSliceSteps;
+        *recv_step += transport::simple::kSliceSteps;
+        *send_step += transport::simple::kSliceSteps;
         slice_offset += slice_size;
     }
     return true;
@@ -998,19 +1000,19 @@ __device__ inline bool recv_reduce_copy_send(
 
 template <typename T, RedOp kRedOp>
 __device__ inline bool recv_copy_send(
-    transport::SimpleChannelArgs<T> args, T* out,
+    transport::simple::ChannelArgs<T> args, T* out,
     std::size_t nelem, std::uint64_t* recv_step, std::uint64_t* send_step,
     std::uint64_t* recv_tail_cache, std::uint64_t* send_head_cache,
     int nworkers, int* wait_status) {
     std::size_t slice_size =
-        transport::shm::slice_elems<T>(nelem, args.step_elems);
+        transport::simple::slice_elems<T>(nelem, args.step_elems);
     std::size_t slice_offset = 0;
     for (int slice = 0;
-         slice < transport::shm::kSimpleFifoChunkSteps / transport::shm::kSimpleFifoSliceSteps;
+         slice < transport::simple::kChunkSteps / transport::simple::kSliceSteps;
          ++slice) {
         std::size_t work =
             slice_offset < nelem
-                ? transport::shm::nelem(slice_size, nelem, slice_offset)
+                ? collective::all_reduce::nelem(slice_size, nelem, slice_offset)
                 : 0;
         if (work == 0) {
             slice_offset += slice_size;
@@ -1028,10 +1030,10 @@ __device__ inline bool recv_copy_send(
 #endif
         worker_barrier(nworkers);
         const T* recv = args.recv_fifo +
-                            ((*recv_step % transport::shm::kSimpleFifoSteps) *
+                            ((*recv_step % transport::simple::kFifoSteps) *
                              args.slot_elems);
         T* dst = args.send_fifo +
-                     ((*send_step % transport::shm::kSimpleFifoSteps) *
+                     ((*send_step % transport::simple::kFifoSteps) *
                       args.slot_elems);
         if (work * sizeof(T) <= kEarlyRecvCreditMaxBytes) {
             // Small: broadcast copy then early credit + send publish.
@@ -1056,8 +1058,8 @@ __device__ inline bool recv_copy_send(
             atomicAdd(&args.turnaround->count, 1ULL);
         }
 #endif
-        *recv_step += transport::shm::kSimpleFifoSliceSteps;
-        *send_step += transport::shm::kSimpleFifoSliceSteps;
+        *recv_step += transport::simple::kSliceSteps;
+        *send_step += transport::simple::kSliceSteps;
         slice_offset += slice_size;
     }
     return true;
@@ -1065,18 +1067,18 @@ __device__ inline bool recv_copy_send(
 
 template <typename T, RedOp kRedOp>
 __device__ inline bool direct_recv(
-    transport::SimpleChannelArgs<T> args, T* out,
+    transport::simple::ChannelArgs<T> args, T* out,
     std::size_t nelem, std::uint64_t* recv_step,
     std::uint64_t* recv_tail_cache, int nworkers, int* wait_status) {
     std::size_t slice_size =
-        transport::shm::slice_elems<T>(nelem, args.step_elems);
+        transport::simple::slice_elems<T>(nelem, args.step_elems);
     std::size_t slice_offset = 0;
     for (int slice = 0;
-         slice < transport::shm::kSimpleFifoChunkSteps / transport::shm::kSimpleFifoSliceSteps;
+         slice < transport::simple::kChunkSteps / transport::simple::kSliceSteps;
          ++slice) {
         std::size_t work =
             slice_offset < nelem
-                ? transport::shm::nelem(slice_size, nelem, slice_offset)
+                ? collective::all_reduce::nelem(slice_size, nelem, slice_offset)
                 : 0;
         if (work == 0) {
             slice_offset += slice_size;
@@ -1086,12 +1088,12 @@ __device__ inline bool direct_recv(
                                         wait_status)) return false;
         worker_barrier(nworkers);
         const T* recv = args.recv_fifo +
-                            ((*recv_step % transport::shm::kSimpleFifoSteps) *
+                            ((*recv_step % transport::simple::kFifoSteps) *
                              args.slot_elems);
         copy_volatile_worker(recv, out + slice_offset, work, nworkers);
         __syncthreads();
         post_recv_credit<T>(args, *recv_step);
-        *recv_step += transport::shm::kSimpleFifoSliceSteps;
+        *recv_step += transport::simple::kSliceSteps;
         slice_offset += slice_size;
     }
     return true;
@@ -1103,12 +1105,12 @@ __device__ inline bool direct_recv(
 //   nworkers = blockDim - 32：留 3 个专用线程做 wait/post，其余做数据搬运。
 template <typename T, RedOp kRedOp>
 __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel(
-    transport::SimpleFifoArgs<T> args, int nranks) {
+    transport::simple::FifoArgs<T> args, int nranks) {
     int channel = blockIdx.x;
     if (channel >= kChannels) {
         return;
     }
-    transport::SimpleChannelArgs<T> channel_args{
+    transport::simple::ChannelArgs<T> channel_args{
         args.slot_elems,
         args.step_elems,
         args.send_fifo[channel],
@@ -1129,8 +1131,8 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
     std::size_t part_offset = 0;
     std::size_t part_count = 0;
     std::size_t chunk_count = 0;
-    transport::shm::cbd_part<T>(args.count, channel, &part_offset, &part_count,
-                                &chunk_count);
+    collective::all_reduce::cbd_part<T>(args.count, channel, &part_offset,
+                                        &part_count, &chunk_count);
     if (part_count == 0 || chunk_count == 0) {
         return;
     }
@@ -1154,19 +1156,20 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
 
     for (std::size_t elem_offset = 0; elem_offset < part_count;) {
         std::size_t rem_count = part_count - elem_offset;
-        std::size_t loop_chunk = transport::shm::simple_fifo_loop_chunk_elems<T>(
+        std::size_t loop_chunk = collective::all_reduce::loop_chunk_elems<T>(
             chunk_count, args.slot_elems);
         if (rem_count < nranks * loop_chunk) {
-            loop_chunk = transport::shm::align_up(
-                transport::shm::div_up(rem_count, nranks),
-                transport::shm::kSimpleFifoVectorBytes / sizeof(T));
+            loop_chunk = transport::simple::align_up(
+                transport::simple::div_up(rem_count, nranks),
+                transport::simple::kVectorBytes / sizeof(T));
         }
         std::size_t loop_count = nranks * loop_chunk;
 
         int chunk = (ring_ix + nranks - 1) % nranks;
         std::size_t chunk_offset = static_cast<std::size_t>(chunk) * loop_chunk;
         std::size_t offset = part_offset + elem_offset + chunk_offset;
-        std::size_t work = transport::shm::nelem(loop_chunk, rem_count, chunk_offset);
+        std::size_t work = collective::all_reduce::nelem(
+            loop_chunk, rem_count, chunk_offset);
         if (!direct_send<T, kRedOp>(channel_args, args.input + offset, work,
                                             &send_step, &send_head_cache, nworkers,
                                             &s_wait_status)) return;
@@ -1175,7 +1178,7 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
             chunk = (ring_ix + nranks - j) % nranks;
             chunk_offset = static_cast<std::size_t>(chunk) * loop_chunk;
             offset = part_offset + elem_offset + chunk_offset;
-            work = transport::shm::nelem(loop_chunk, rem_count, chunk_offset);
+            work = collective::all_reduce::nelem(loop_chunk, rem_count, chunk_offset);
             if (!recv_reduce_send<T, kRedOp>(
                 channel_args, args.input + offset, work, &recv_step,
                 &send_step, &recv_tail_cache, &send_head_cache, nworkers,
@@ -1185,7 +1188,7 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
         chunk = ring_ix;
         chunk_offset = static_cast<std::size_t>(chunk) * loop_chunk;
         offset = part_offset + elem_offset + chunk_offset;
-        work = transport::shm::nelem(loop_chunk, rem_count, chunk_offset);
+        work = collective::all_reduce::nelem(loop_chunk, rem_count, chunk_offset);
         if (!recv_reduce_copy_send<T, kRedOp>(
             channel_args, args.input + offset, args.output + offset, work,
             &recv_step, &send_step, &recv_tail_cache, &send_head_cache, inverse_nranks,
@@ -1195,7 +1198,7 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
             chunk = (ring_ix + nranks - j) % nranks;
             chunk_offset = static_cast<std::size_t>(chunk) * loop_chunk;
             offset = part_offset + elem_offset + chunk_offset;
-            work = transport::shm::nelem(loop_chunk, rem_count, chunk_offset);
+            work = collective::all_reduce::nelem(loop_chunk, rem_count, chunk_offset);
             if (!recv_copy_send<T, kRedOp>(
                 channel_args, args.output + offset, work, &recv_step,
                 &send_step, &recv_tail_cache, &send_head_cache, nworkers,
@@ -1205,7 +1208,7 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
         chunk = (ring_ix + 1) % nranks;
         chunk_offset = static_cast<std::size_t>(chunk) * loop_chunk;
         offset = part_offset + elem_offset + chunk_offset;
-        work = transport::shm::nelem(loop_chunk, rem_count, chunk_offset);
+        work = collective::all_reduce::nelem(loop_chunk, rem_count, chunk_offset);
         if (!direct_recv<T, kRedOp>(channel_args, args.output + offset, work,
                                             &recv_step, &recv_tail_cache, nworkers,
                                             &s_wait_status)) return;

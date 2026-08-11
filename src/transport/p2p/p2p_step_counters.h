@@ -3,7 +3,7 @@
 #include "collective/all_reduce/topology.h"
 #include "core/buffer.h"
 #include "transport/p2p/p2p_topology.h"
-#include "transport/simple_protocol.h"
+#include "transport/simple/protocol.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -26,7 +26,7 @@ public:
 
     void reset(cudaStream_t streams[kRanks]);
     void reset(const std::vector<cudaStream_t>& streams);
-    SimpleControlArgs control_args(int rank) const;
+    nano_nccl::transport::simple::ControlArgs control_args(int rank) const;
 
 private:
     static constexpr std::size_t kHeadOffset = 0;
