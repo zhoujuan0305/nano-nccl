@@ -381,8 +381,20 @@ after its design is justified by Phase 1 evidence and implemented with registry
 tests.
 
 `float` and FP16 require SM70+ because the current Simple counters use
-system-scope ordering. BF16 requires SM80+. Distributed builds require matching
-Open MPI 4.1.2 C ABI and the same nano-nccl commit on every host.
+system-scope ordering. BF16 requires SM80+. `NANO_NCCL_CUDA_ARCH` defaults to 70;
+CMake rejects values below 70. Distributed builds require matching Open MPI
+4.1.2 C ABI and the same nano-nccl commit on every host.
+
+### Build / ownership contracts
+
+Current module ownership on the Ring + Simple path (docs contract for static
+checks; not a substitute for Phase 1 evidence):
+
+- `src/transport/simple/` owns FIFO layout, step ordering, and slice geometry.
+  Persistent progress uses distinct send and recv base steps per rank/channel.
+- `src/transport/shm/` owns mapped host FIFO storage/control only.
+- `src/collective/all_reduce/ring_simple_geometry.h` owns Ring channel/rank work partitioning.
+- Transport runtime lifecycle and orchestration remain in `Communicator::Impl`.
 
 ## Communication And Resume Claims
 
