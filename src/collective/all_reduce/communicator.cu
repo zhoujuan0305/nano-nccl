@@ -541,11 +541,21 @@ private:
             }
         }
 
-        // 2. Iterate the TCP fds left in socket_fds_ by setup_socket_transport.
-        //    Each fd is a ring edge; Rdma edges swap RdmaPeerInfo (64 bytes),
-        //    then transition RTR/RTS on both sides before the fd closes.
+        // 2. Collect RDMA bootstrap fds, then exchange RdmaPeerInfo with
+        //    all sends followed by all recvs. Per-fd send+recv deadlocks when
+        //    ranks walk connections in different order (local 4-rank loopback).
         auto connections = socket_fds_.release_connections();
-        std::vector<transport::socket::SocketConnection> rdma_ready_connections;
+        struct PendingRdma {
+            transport::socket::SocketConnection connection;
+            transport::socket::SocketHello hello{};
+            bool is_send = false;
+            bool is_recv = false;
+            int fifo_numa_node = -1;
+            RdmaChannelResources* resources = nullptr;
+            transport::rdma::RdmaPeerInfo local_info{};
+            transport::rdma::RdmaPeerInfo remote_info{};
+        };
+        std::vector<PendingRdma> pending;
         for (auto& connection : connections) {
             const auto hello = connection.hello();
             if (hello.channel < 0 || hello.channel >= kChannels ||
@@ -556,14 +566,12 @@ private:
             const int edge = hello.source_global_rank;
             if (transport_plan_.edge_kind(edge) != TransportKind::Rdma) continue;
             const int receiver = (edge + 1) % kRanks;
-            const int fd = connection.fd();
 
-            // Decide local role: sender (edge rank lives here) or receiver.
             const bool is_send =
                 collective::all_reduce::is_local_global_rank(topology_, edge);
             const bool is_recv =
                 collective::all_reduce::is_local_global_rank(topology_, receiver);
-            if (!is_send && !is_recv) continue;  // defensive; should not happen
+            if (!is_send && !is_recv) continue;
 
             const int local = collective::all_reduce::local_rank_for_global_rank(
                 topology_, is_send ? edge : receiver);
@@ -573,8 +581,6 @@ private:
                 ? *rdma_send_resources_[hello.channel][edge]
                 : *rdma_recv_resources_[hello.channel][edge];
 
-            // Build local RdmaPeerInfo: qpn from QP, port LID / gid_index /
-            // gid from the shared endpoint. WriteCts fills owned FIFO/CTS fields.
             transport::rdma::RdmaPeerInfo local_info = r.qp->local_info();
             local_info.port_lid = rdma_endpoint_->port_lid();
             local_info.gid_index = rdma_endpoint_->gid_index();
@@ -596,9 +602,36 @@ private:
                 }
             }
 
-            transport::rdma::RdmaPeerInfo remote_info{};
-            transport::socket::send_all(fd, &local_info, sizeof(local_info));
-            transport::socket::recv_all(fd, &remote_info, sizeof(remote_info));
+            PendingRdma item;
+            item.connection = std::move(connection);
+            item.hello = hello;
+            item.is_send = is_send;
+            item.is_recv = is_recv;
+            item.fifo_numa_node = fifo_numa_node;
+            item.resources = &r;
+            item.local_info = local_info;
+            pending.push_back(std::move(item));
+        }
+
+        for (auto& item : pending) {
+            transport::socket::send_all(item.connection.fd(), &item.local_info,
+                                        sizeof(item.local_info));
+        }
+        for (auto& item : pending) {
+            transport::socket::recv_all(item.connection.fd(), &item.remote_info,
+                                        sizeof(item.remote_info));
+        }
+
+        std::vector<transport::socket::SocketConnection> rdma_ready_connections;
+        for (auto& item : pending) {
+            const auto hello = item.hello;
+            const int edge = hello.source_global_rank;
+            const int receiver = (edge + 1) % kRanks;
+            const bool is_send = item.is_send;
+            const bool is_recv = item.is_recv;
+            const int fifo_numa_node = item.fifo_numa_node;
+            RdmaChannelResources& r = *item.resources;
+            const transport::rdma::RdmaPeerInfo remote_info = item.remote_info;
 
             if (write_cts) {
                 if (is_send &&
@@ -621,13 +654,10 @@ private:
                 }
             }
 
-            // v1 one-shot bootstrap: both PSNs start at 0.
             constexpr std::uint32_t kLocalPsn = 0;
             r.qp->transition_to_rtr(remote_info, rdma_endpoint_->gid_index());
             r.qp->transition_to_rts(kLocalPsn, remote_info.psn);
 
-            // Move QP ownership into the proxy; the proxy RAII handles the
-            // qp/cq destruction. SocketConnection closes fd on scope exit.
             auto qp_taken = std::move(r.qp);
 
             transport::rdma::RdmaProxyFifo fifo{
@@ -691,29 +721,32 @@ private:
                             identity, fifo_numa_node, rdma_errors_));
                 }
             }
-            rdma_ready_connections.push_back(std::move(connection));
-            // qp_taken (moved-from state) destructs here; r.qp holds nullptr.
+            rdma_ready_connections.push_back(std::move(item.connection));
         }
 
         // 3. Recv-side prepare/start first, then a peer-ready byte so the first
-        //    sender WQE cannot hit an empty RQ / missing CTS. Shared mode then
-        //    multiplexes all local proxies on one progress thread (recv-first);
-        //    dedicated mode keeps per-proxy threads (NANO_NCCL_RDMA_SHARED_PROGRESS=0).
+        //    sender WQE cannot hit an empty RQ / missing CTS. Ready bytes use
+        //    the same all-send-then-all-recv order as PeerInfo.
         const std::uint8_t ready = 1;
+        auto exchange_ready_bytes =
+            [&](std::vector<transport::socket::SocketConnection>& fds) {
+                for (const auto& connection : fds) {
+                    transport::socket::send_all(connection.fd(), &ready, sizeof(ready));
+                }
+                for (const auto& connection : fds) {
+                    std::uint8_t peer_ready = 0;
+                    transport::socket::recv_all(connection.fd(), &peer_ready,
+                                                sizeof(peer_ready));
+                    if (peer_ready != ready) {
+                        throw std::runtime_error(
+                            "rdma peer did not confirm recv readiness");
+                    }
+                }
+                fds.clear();
+            };
         if (rdma_shared_progress_) {
             for (const auto& proxy : rdma_recv_proxies_) proxy->prepare();
-            for (const auto& connection : rdma_ready_connections) {
-                std::uint8_t peer_ready = 0;
-                transport::socket::send_all(connection.fd(), &ready, sizeof(ready));
-                transport::socket::recv_all(connection.fd(), &peer_ready,
-                                            sizeof(peer_ready));
-                if (peer_ready != ready) {
-                    throw std::runtime_error(
-                        "rdma peer did not confirm recv readiness");
-                }
-            }
-            rdma_ready_connections.clear();
-
+            exchange_ready_bytes(rdma_ready_connections);
             for (const auto& proxy : rdma_send_proxies_) proxy->prepare();
             for (const auto& proxy : rdma_recv_proxies_) {
                 rdma_progress_.add_recv(proxy.get());
@@ -724,18 +757,7 @@ private:
             rdma_progress_.start();
         } else {
             for (const auto& proxy : rdma_recv_proxies_) proxy->start();
-            for (const auto& connection : rdma_ready_connections) {
-                std::uint8_t peer_ready = 0;
-                transport::socket::send_all(connection.fd(), &ready, sizeof(ready));
-                transport::socket::recv_all(connection.fd(), &peer_ready,
-                                            sizeof(peer_ready));
-                if (peer_ready != ready) {
-                    throw std::runtime_error(
-                        "rdma peer did not confirm recv readiness");
-                }
-            }
-            rdma_ready_connections.clear();
-
+            exchange_ready_bytes(rdma_ready_connections);
             for (const auto& proxy : rdma_send_proxies_) proxy->start();
         }
     }
