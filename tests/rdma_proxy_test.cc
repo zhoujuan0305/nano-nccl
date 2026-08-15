@@ -69,6 +69,7 @@ void build_local_info(const RdmaEndpoint& endpoint, const RdmaQp& qp,
     *out = qp.local_info();
     out->port_lid = endpoint.port_lid();
     out->gid_index = endpoint.gid_index();
+    out->active_mtu = endpoint.active_mtu();
     std::memcpy(out->gid, endpoint.gid(), 16);
 }
 
@@ -139,8 +140,10 @@ ConnectedQps make_connected_qps() {
     recv_all(conn_send.fd(), &remote_recv, sizeof(remote_recv));
 
     constexpr std::uint32_t kLocalPsn = 0;
-    qp_send.transition_to_rtr(remote_recv, endpoint.gid_index());
-    qp_recv.transition_to_rtr(remote_send, endpoint.gid_index());
+    qp_send.transition_to_rtr(remote_recv, endpoint.gid_index(),
+                              endpoint.active_mtu());
+    qp_recv.transition_to_rtr(remote_send, endpoint.gid_index(),
+                              endpoint.active_mtu());
     qp_send.transition_to_rts(kLocalPsn, remote_recv.psn);
     qp_recv.transition_to_rts(kLocalPsn, remote_send.psn);
     conn_send.close();

@@ -50,6 +50,7 @@ void build_local_info(const RdmaEndpoint& endpoint, const RdmaQp& qp,
     *out = qp.local_info();           // only fills qpn
     out->port_lid = endpoint.port_lid();
     out->gid_index = endpoint.gid_index();
+    out->active_mtu = endpoint.active_mtu();
     std::memcpy(out->gid, endpoint.gid(), 16);
 }
 
@@ -163,8 +164,10 @@ int main() {
         // random-PSN dance — the variables are initialized so the wire
         // format remains valid if a future patch randomizes.
         constexpr std::uint32_t kLocalPsn = 0;
-        qp_a.transition_to_rtr(remote_b, endpoint.gid_index());
-        qp_b.transition_to_rtr(remote_a, endpoint.gid_index());
+        qp_a.transition_to_rtr(remote_b, endpoint.gid_index(),
+                               endpoint.active_mtu());
+        qp_b.transition_to_rtr(remote_a, endpoint.gid_index(),
+                               endpoint.active_mtu());
         qp_a.transition_to_rts(kLocalPsn, remote_b.psn);
         qp_b.transition_to_rts(kLocalPsn, remote_a.psn);
 

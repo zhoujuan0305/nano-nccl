@@ -27,13 +27,16 @@ public:
     ibv_pd* pd() const noexcept { return pd_; }
     std::uint16_t port_lid() const noexcept { return port_lid_; }
     std::uint16_t gid_index() const noexcept { return gid_index_; }
+    // ibv_mtu enum from ibv_query_port (1=256 .. 5=4096).
+    std::uint32_t active_mtu() const noexcept { return active_mtu_; }
     const std::uint8_t (&gid() const noexcept)[16];
 
     std::unique_ptr<struct ibv_cq, void(*)(struct ibv_cq*)> allocate_cq(int wr_depth);
 
 private:
     RdmaEndpoint(ibv_context* ctx, ibv_pd* pd, std::uint16_t port_lid,
-                 std::uint16_t gid_index, const std::uint8_t gid[16]) noexcept;
+                 std::uint16_t gid_index, std::uint32_t active_mtu,
+                 const std::uint8_t gid[16]) noexcept;
 
     void close() noexcept;
 
@@ -41,6 +44,7 @@ private:
     ibv_pd* pd_ = nullptr;
     std::uint16_t port_lid_ = 0;
     std::uint16_t gid_index_ = 0;
+    std::uint32_t active_mtu_ = 0;
     std::uint8_t gid_[16]{};
 };
 

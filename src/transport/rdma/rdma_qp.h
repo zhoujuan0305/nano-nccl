@@ -37,8 +37,10 @@ public:
     static RdmaQp create_init(RdmaEndpoint& endpoint, int send_wr, int recv_wr);
 
     // RTR：用对端 qpn/psn/port_lid/gid 成心到 RTR。
+    // path_mtu is min(local_active_mtu, remote.active_mtu) (ibv_mtu 1..5).
     void transition_to_rtr(const RdmaPeerInfo& remote,
-                           std::uint16_t local_gid_index);
+                           std::uint16_t local_gid_index,
+                           std::uint32_t local_active_mtu);
 
     // RTS：sq_psn 用 local_psn；remote_psn 已在 RTR 的 rq_psn 消费，此处忽略。
     void transition_to_rts(std::uint32_t local_psn, std::uint32_t remote_psn);

@@ -107,8 +107,10 @@ void destroy_cq(ibv_cq* cq) {
 }  // namespace
 
 RdmaEndpoint::RdmaEndpoint(ibv_context* ctx, ibv_pd* pd, std::uint16_t port_lid,
-                           std::uint16_t gid_index, const std::uint8_t gid[16]) noexcept
-    : context_(ctx), pd_(pd), port_lid_(port_lid), gid_index_(gid_index) {
+                           std::uint16_t gid_index, std::uint32_t active_mtu,
+                           const std::uint8_t gid[16]) noexcept
+    : context_(ctx), pd_(pd), port_lid_(port_lid), gid_index_(gid_index),
+      active_mtu_(active_mtu) {
     std::memcpy(gid_, gid, 16);
 }
 
@@ -116,12 +118,14 @@ RdmaEndpoint::~RdmaEndpoint() { close(); }
 
 RdmaEndpoint::RdmaEndpoint(RdmaEndpoint&& other) noexcept
     : context_(other.context_), pd_(other.pd_),
-      port_lid_(other.port_lid_), gid_index_(other.gid_index_) {
+      port_lid_(other.port_lid_), gid_index_(other.gid_index_),
+      active_mtu_(other.active_mtu_) {
     std::memcpy(gid_, other.gid_, 16);
     other.context_ = nullptr;
     other.pd_ = nullptr;
     other.port_lid_ = 0;
     other.gid_index_ = 0;
+    other.active_mtu_ = 0;
     std::memset(other.gid_, 0, 16);
 }
 
@@ -132,11 +136,13 @@ RdmaEndpoint& RdmaEndpoint::operator=(RdmaEndpoint&& other) noexcept {
     pd_ = other.pd_;
     port_lid_ = other.port_lid_;
     gid_index_ = other.gid_index_;
+    active_mtu_ = other.active_mtu_;
     std::memcpy(gid_, other.gid_, 16);
     other.context_ = nullptr;
     other.pd_ = nullptr;
     other.port_lid_ = 0;
     other.gid_index_ = 0;
+    other.active_mtu_ = 0;
     std::memset(other.gid_, 0, 16);
     return *this;
 }
@@ -215,7 +221,9 @@ RdmaEndpoint RdmaEndpoint::create_from_environment() {
 
         // 全部就绪，把所有权转交构造出来的 RdmaEndpoint。
         return RdmaEndpoint(ctx_guard.release(), pd_guard.release(),
-                           port_attr.lid, gid_index, gid.raw);
+                           port_attr.lid, gid_index,
+                           static_cast<std::uint32_t>(port_attr.active_mtu),
+                           gid.raw);
     }
 
     // 走完一圈没匹配上。

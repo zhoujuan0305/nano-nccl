@@ -134,14 +134,17 @@ RdmaQp RdmaQp::create_init(RdmaEndpoint& endpoint, int send_wr, int recv_wr) {
 }
 
 void RdmaQp::transition_to_rtr(const RdmaPeerInfo& remote,
-                               std::uint16_t local_gid_index) {
+                               std::uint16_t local_gid_index,
+                               std::uint32_t local_active_mtu) {
     if (local_gid_index > 0xff) {
         throw std::runtime_error("local RDMA GID index exceeds verbs range");
     }
 
     ibv_qp_attr attr{};
     attr.qp_state = IBV_QPS_RTR;
-    attr.path_mtu = IBV_MTU_1024;
+    // NCCL uses min(remote advertised mtu, local port.active_mtu).
+    attr.path_mtu = static_cast<ibv_mtu>(
+        negotiate_path_mtu(local_active_mtu, remote.active_mtu));
     attr.dest_qp_num = remote.qpn;
     attr.rq_psn = remote.psn;
     attr.max_dest_rd_atomic = 1;

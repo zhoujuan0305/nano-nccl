@@ -43,6 +43,8 @@ def main() -> int:
         require(text, "std::uint16_t port_lid", "rdma_protocol.h port_lid field")
         require(text, "std::uint16_t gid_index", "rdma_protocol.h gid_index field")
         require(text, "std::uint8_t  gid[16]", "rdma_protocol.h gid field")
+        require(text, "std::uint32_t active_mtu", "rdma_protocol.h active_mtu field")
+        require(text, "negotiate_path_mtu", "rdma_protocol.h negotiate_path_mtu")
         require(text, "recv_fifo_addr", "rdma_protocol.h recv_fifo_addr field")
         require(text, "cts_fifo_addr", "rdma_protocol.h cts_fifo_addr field")
         require(text, "static_assert(sizeof(RdmaCtsSlot) == 32)",

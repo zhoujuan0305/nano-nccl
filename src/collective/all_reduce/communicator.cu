@@ -584,6 +584,7 @@ private:
             transport::rdma::RdmaPeerInfo local_info = r.qp->local_info();
             local_info.port_lid = rdma_endpoint_->port_lid();
             local_info.gid_index = rdma_endpoint_->gid_index();
+            local_info.active_mtu = rdma_endpoint_->active_mtu();
             std::memcpy(local_info.gid, rdma_endpoint_->gid(), 16);
             if (write_cts) {
                 if (is_recv) {
@@ -655,7 +656,8 @@ private:
             }
 
             constexpr std::uint32_t kLocalPsn = 0;
-            r.qp->transition_to_rtr(remote_info, rdma_endpoint_->gid_index());
+            r.qp->transition_to_rtr(remote_info, rdma_endpoint_->gid_index(),
+                                    rdma_endpoint_->active_mtu());
             r.qp->transition_to_rts(kLocalPsn, remote_info.psn);
 
             auto qp_taken = std::move(r.qp);
