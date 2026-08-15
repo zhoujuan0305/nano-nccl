@@ -8,7 +8,7 @@ A GPU collective communication library for single-host multi-GPU All Reduce, tar
 
 ## Performance
 
-[Detailed single-host and two-host performance results](performance.md) record the tested topology, environment, all dtype/reduction combinations (`float` / FP16 / BF16 × `sum` / `avg` / `max` / `min`), and point-by-point NCCL comparisons.
+[Detailed single-host performance results](performance.md) record the tested topology, environment, and point-by-point NCCL comparisons for three 4-rank classes: in-process auto (P2P/SHM), TCP socket, and host-pinned RDMA / NET-IB (`float` / FP16 / BF16 × `sum` / `avg` / `max` / `min`).
 
 ---
 
@@ -91,9 +91,10 @@ slot ring); unset/`0` keeps SEND/RECV. Both planes stay host-pin only — no
   WriteCts always post SGE from the registered mapped FIFO (`fifo_mr_`).
   After worker FIFO stores and a full-block sync, the publisher advances
   `send_tail` with `st.release.sys`; proxies load it with acquire (no host
-  bounce path). Dual-host WRITE matrix (float/fp16/bf16 × sum/avg/max/min,
-  256 KiB–64 MiB) is refreshed in [performance.md](performance.md) with
-  `#wrong=0` (dedicated progress default). The MPI binding uses the MPI C API,
+  bounce path). Single-host 4-rank WRITE+CTS vs NCCL GDR=0 NET/IB
+  (float/fp16/bf16 × sum/avg/max/min, 256 KiB–64 MiB) is in
+  [performance.md](performance.md) with `#wrong=0` (dedicated progress
+  default). The MPI binding uses the MPI C API,
   so an Open MPI installation need not ship the retired C++ binding library.
 
 ```bash
@@ -267,9 +268,8 @@ built with MPI/RDMA support.
   (host acquire loads; no host bounce). Small Simple slices may post recv
   credit immediately after consuming the recv FIFO. Cross-process RDMA edges
   default to dedicated per-proxy host threads; set
-  `NANO_NCCL_RDMA_SHARED_PROGRESS=1` for one shared progress thread. Dual-host
-  WRITE matrix (float/fp16/bf16 × sum/avg/max/min, 256 KiB–64 MiB) refreshed in
-  [performance.md](performance.md) with `#wrong=0`.
+  `NANO_NCCL_RDMA_SHARED_PROGRESS=1` for one shared progress thread. Single-host
+  4-rank WRITE+CTS vs NCCL GDR=0 NET/IB is in [performance.md](performance.md).
 
 P2P is a single-node transport. It requires CUDA peer access for the complete
 configured ring; it is not a multi-node or network transport. Socket uses a
@@ -296,13 +296,13 @@ protocol changes in `src/transport/simple/` and Ring scheduling changes in
 
 Currently supports only:
 
-- Single-node multi-GPU performance path (tested with `CUDA_VISIBLE_DEVICES=0,1,2,3`); optional MPI/socket and MPI/RDMA multi-host `all_reduce` paths with published point tables in [performance.md](performance.md)
+- Single-node multi-GPU performance path (tested with `CUDA_VISIBLE_DEVICES=0,1,2,3`); published tables in [performance.md](performance.md) cover in-process auto, 4-rank socket, and 4-rank host-pinned RDMA
 - `float` and FP16 (`fp16`) on SM70+, and BF16 (`bf16`) on SM80+
 - `sum`, `avg`, `max`, and `min` reduce ops; `avg` is `sum / nranks`, and `max`/`min` propagate NaN
 - out-of-place
 - SHM FIFO and device P2P FIFO transports, plus optional MPI/socket or MPI/RDMA for cross-process ring edges; P2P is single-node only; RDMA is host-pin RC (no GPUDirect RDMA)
 
-No formal multi-host performance acceptance gate is defined (socket remains latency-bound; RDMA is measured against NCCL `NCCL_NET_GDR_LEVEL=0`). This project is not a general NCCL replacement.
+Published performance tables are single-host only. Socket is loopback-TCP; RDMA is measured against NCCL `NCCL_NET_GDR_LEVEL=0` with P2P/SHM disabled. This project is not a general NCCL replacement.
 
 Future expansion plans:
 

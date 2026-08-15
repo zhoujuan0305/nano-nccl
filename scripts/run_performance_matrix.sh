@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Full performance matrix: single-host / socket / RDMA × dtype × redop.
+# Performance matrix helper. Published performance.md is single-host only
+# (in-process auto + 4-rank socket + 4-rank RDMA). The socket/rdma sections
+# below still launch two-host MPI pairs; do not regenerate performance.md
+# from those sections without rewriting this script.
 # Hosts and interfaces come from the environment only — never hard-code secrets.
 set -euo pipefail
 

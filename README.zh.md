@@ -8,7 +8,7 @@
 
 ## 性能
 
-[详细的单机与双机性能结果](performance.md)记录了测试拓扑、环境、全部 dtype/reduce 组合（`float` / FP16 / BF16 × `sum` / `avg` / `max` / `min`），以及逐点 NCCL 对比。
+[详细的单机性能结果](performance.md)记录了测试拓扑、环境，以及三类 4-rank 路径相对 NCCL 的逐点对比：进程内 auto（P2P/SHM）、TCP socket、host-pinned RDMA / NET-IB（`float` / FP16 / BF16 × `sum` / `avg` / `max` / `min`）。
 
 ---
 
@@ -88,9 +88,10 @@ host-pinned CTS slot ring）；未设置/`0` 保持 SEND/RECV。两种数据面�
   不使用 GPUDirect RDMA；与 NCCL 对比时请设 `NCCL_NET_GDR_LEVEL=0`。SEND 与
   WriteCts 始终从已注册的 mapped FIFO（`fifo_mr_`）直接 post SGE。worker 写完并
   block sync 后，publisher 以 `st.release.sys` 推进 `send_tail`，proxy 侧
-  acquire 加载（无 host bounce 路径）。双机 WRITE 矩阵（float/fp16/bf16 ×
-  sum/avg/max/min，256 KiB–64 MiB）已刷新于 [performance.md](performance.md)，
-  `#wrong=0`（默认 dedicated progress；可用 env 切 shared）。MPI binding 使用
+  acquire 加载（无 host bounce 路径）。单机 4-rank WRITE+CTS 相对 NCCL GDR=0
+  NET/IB（float/fp16/bf16 × sum/avg/max/min，256 KiB–64 MiB）见
+  [performance.md](performance.md)，`#wrong=0`（默认 dedicated progress；可用
+  env 切 shared）。MPI binding 使用
   MPI C API，因此 Open MPI 不需要提供已废弃的 C++ binding library。
 
 ```bash
@@ -255,8 +256,8 @@ unsupported-operation 错误。
   推进 `send_tail`（host acquire；无 host bounce）。小 Simple slice 可在消费完
   recv FIFO 后立刻 `post_recv_credit`。跨进程 RDMA edge 默认每条 proxy 独立
   host 线程；设 `NANO_NCCL_RDMA_SHARED_PROGRESS=1` 可改为单线程 shared
-  progress。双机 WRITE 矩阵（float/fp16/bf16 × sum/avg/max/min，256 KiB–64 MiB）
-  已刷新于 [performance.md](performance.md)，`#wrong=0`。
+  progress。单机 4-rank WRITE+CTS 相对 NCCL GDR=0 NET/IB 见
+  [performance.md](performance.md)。
 
 P2P 是单机通信路径，需要每对完整配置环邻居之间的双向 CUDA peer access；它不是多机或网络通信路径。socket 使用可信、仅 IPv4 的 TCP 网络边界，不提供 TLS 或自动重连。
 
@@ -280,13 +281,13 @@ transport runtime lifecycle 与 orchestration 仍由 `Communicator::Impl` 管理
 
 当前仅支持：
 
-- 单机多 GPU 性能路径（已验证 `CUDA_VISIBLE_DEVICES=0,1,2,3`）；可选 MPI/socket 与 MPI/RDMA 多机 `all_reduce`，最新点表见 [performance.md](performance.md)
+- 单机多 GPU 性能路径（已验证 `CUDA_VISIBLE_DEVICES=0,1,2,3`）；[performance.md](performance.md) 点表覆盖进程内 auto、4-rank socket、4-rank host-pinned RDMA
 - SM70+ 上的 `float` 和 FP16（`fp16`），以及 SM80+ 上的 BF16（`bf16`）
 - `sum`、`avg`、`max`、`min` 规约操作；`avg` 为 `sum / nranks`，`max`/`min` 会传播 NaN
 - out-of-place
 - SHM FIFO、device P2P FIFO，以及跨进程 ring edge 的可选 MPI/socket 或 MPI/RDMA；P2P 仅单机；RDMA 为 host-pin RC（无 GPUDirect RDMA）
 
-未定义正式的多机性能验收 gate（socket 仍偏延迟；RDMA 以 NCCL `NCCL_NET_GDR_LEVEL=0` 为对比基线）。本项目不是通用 NCCL 替代品。
+已发布的性能表仅覆盖单机。socket 为 loopback TCP；RDMA 以 NCCL `NCCL_NET_GDR_LEVEL=0` 且关闭 P2P/SHM 为对比基线。本项目不是通用 NCCL 替代品。
 
 未来计划扩展：
 
