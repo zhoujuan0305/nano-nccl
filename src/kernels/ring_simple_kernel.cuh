@@ -175,6 +175,12 @@ struct Packed16Traits<__half, kRedOp> {
         if constexpr (kRedOp == RedOp::Sum || kRedOp == RedOp::Avg) {
             return half2_to_bits(__hadd2(lhs, rhs));
         }
+        if constexpr (kRedOp == RedOp::Max) {
+            return half2_to_bits(__hmax2(lhs, rhs));
+        }
+        if constexpr (kRedOp == RedOp::Min) {
+            return half2_to_bits(__hmin2(lhs, rhs));
+        }
         return half2_to_bits(__halves2half2(
             RedOpTraits<kRedOp, __half>::apply(__low2half(lhs), __low2half(rhs)),
             RedOpTraits<kRedOp, __half>::apply(__high2half(lhs), __high2half(rhs))));
@@ -189,6 +195,12 @@ struct Packed16Traits<__nv_bfloat16, kRedOp> {
         __nv_bfloat162 rhs = bfloat162_from_bits(b);
         if constexpr (kRedOp == RedOp::Sum || kRedOp == RedOp::Avg) {
             return bfloat162_to_bits(__hadd2(lhs, rhs));
+        }
+        if constexpr (kRedOp == RedOp::Max) {
+            return bfloat162_to_bits(__hmax2(lhs, rhs));
+        }
+        if constexpr (kRedOp == RedOp::Min) {
+            return bfloat162_to_bits(__hmin2(lhs, rhs));
         }
         return bfloat162_to_bits(__halves2bfloat162(
             RedOpTraits<kRedOp, __nv_bfloat16>::apply(
