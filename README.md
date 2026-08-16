@@ -8,7 +8,7 @@ A GPU collective communication library for single-host multi-GPU All Reduce, tar
 
 ## Performance
 
-[Detailed single-host performance results](performance.md) record the tested topology, environment, and point-by-point NCCL comparisons for in-process auto (P2P/SHM) plus two-host TCP socket and host-pinned RDMA (`float` / FP16 / BF16 × `sum` / `avg` / `max` / `min`).
+[Detailed single-host performance results](performance.md) record the tested topology, environment, and point-by-point NCCL comparisons for in-process auto (P2P/SHM) plus two-host TCP socket and host-pinned RDMA plus two-host RDMA GDR (`float` / FP16 / BF16 × `sum` / `avg` / `max` / `min`).
 
 ---
 

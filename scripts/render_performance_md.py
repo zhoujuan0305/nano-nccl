@@ -22,6 +22,7 @@ SECTION_HEAD = {
     "single": "Single Host: 4 Ranks Over Auto (P2P/SHM)",
     "socket": "Two Hosts: 8 Ranks Over TCP Socket",
     "rdma": "Two Hosts: 8 Ranks Over RDMA",
+    "rdma_gdr": "Two Hosts: 8 Ranks Over RDMA (GDR)",
 }
 
 
@@ -74,6 +75,13 @@ def render_section(name: str, body: dict) -> str:
         parts.extend(
             [
                 "2 hosts x 4 GPUs, one MPI process per host. Nano `--transport rdma` with `NANO_NCCL_RDMA_USE_WRITE=1` (WRITE+CTS over registered host-pinned FIFO). Local edges stay P2P/SHM; cross-host edges are RDMA. RTR `path_mtu` is `min(local, remote) port.active_mtu`. NCCL: Ring+Simple, `NCCL_NET_GDR_LEVEL=0`, P2P/SHM allowed intra-node. NCCL 256 KiB OOP that collapsed (~0.8 GB/s) was re-run isolated up to four times; cells that stayed collapsed are not nano wins.",
+                "",
+            ]
+        )
+    elif name == "rdma_gdr":
+        parts.extend(
+            [
+                "Same 2x4 topology as the host-pinned RDMA table. Nano `--transport rdma` with `NANO_NCCL_RDMA_USE_WRITE=1` and `NANO_NCCL_RDMA_GDR=1` (WRITE+CTS from a registered GPU FIFO; host proxy still posts). NCCL: Ring+Simple, `NCCL_NET_GDR_LEVEL=LOC`. Collapsed NCCL 256 KiB OOP cells were re-run isolated. This is host-proxy GDR, not GPU-initiated IBGDA.",
                 "",
             ]
         )
@@ -130,7 +138,8 @@ def render(doc: dict) -> str:
     out.append(
         "On each host, GPU0-GPU1 and GPU2-GPU3 are connected by four NVLinks. The two pairs are "
         "separated by `SYS` paths across NUMA nodes. Tables are separate transport classes: "
-        "in-process auto (P2P/SHM) on one host, two-host TCP socket, and two-host host-pinned RDMA."
+        "in-process auto (P2P/SHM) on one host, two-host TCP socket, two-host host-pinned RDMA, "
+        "and two-host RDMA with GPUDirect (device FIFO)."
     )
     out.append("")
     out.append(
@@ -142,7 +151,7 @@ def render(doc: dict) -> str:
     )
     out.append("")
 
-    for name in ("single", "socket", "rdma"):
+    for name in ("single", "socket", "rdma", "rdma_gdr"):
         if name in sections:
             out.append(render_section(name, sections[name]))
             out.append("")
