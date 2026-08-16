@@ -42,3 +42,4 @@ __pycache__/
 *.ncu-rep
 # Agent/session scratch
 .superpowers/
+.pi/
