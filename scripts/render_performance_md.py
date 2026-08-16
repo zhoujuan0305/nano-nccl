@@ -20,8 +20,8 @@ DTYPE_HEAD = {"float": "Float", "fp16": "FP16", "bf16": "BF16"}
 REDOP_HEAD = {"sum": "Sum", "avg": "Avg", "max": "Max", "min": "Min"}
 SECTION_HEAD = {
     "single": "Single Host: 4 Ranks Over Auto (P2P/SHM)",
-    "socket": "Single Host: 4 Ranks Over TCP Socket",
-    "rdma": "Single Host: 4 Ranks Over RDMA",
+    "socket": "Two Hosts: 8 Ranks Over TCP Socket",
+    "rdma": "Two Hosts: 8 Ranks Over RDMA",
 }
 
 
@@ -66,14 +66,14 @@ def render_section(name: str, body: dict) -> str:
     elif name == "socket":
         parts.extend(
             [
-                "Four MPI ranks, one GPU per rank. Nano `--transport auto` therefore places every ring edge on TCP socket. NCCL comparison forces the same class: `NCCL_P2P_DISABLE=1`, `NCCL_SHM_DISABLE=1`, `NCCL_IB_DISABLE=1`, Ring+Simple, four channels, 32 MiB buffer. This is a loopback-TCP path, not the intra-node P2P/SHM table above.",
+                "2 hosts x 4 GPUs, one MPI process per host. Nano `--transport auto` keeps local ring edges on P2P/SHM and places cross-host edges on TCP socket. NCCL is Ring+Simple with `NCCL_IB_DISABLE=1` (P2P/SHM allowed intra-node). Bootstrap uses the management IPv4 interface, not loopback.",
                 "",
             ]
         )
     elif name == "rdma":
         parts.extend(
             [
-                "Four MPI ranks, one GPU per rank. Nano `--transport rdma` with `NANO_NCCL_RDMA_USE_WRITE=1` (WRITE+CTS over registered host-pinned FIFO; dedicated per-proxy threads). RTR `path_mtu` is `min(local, remote) port.active_mtu`. NCCL comparison: `NCCL_P2P_DISABLE=1`, `NCCL_SHM_DISABLE=1`, `NCCL_NET_GDR_LEVEL=0` (host-pin NET/IB, no GPUDirect). Both engines sit on the NIC loopback band (~3 GB/s here), not the NVLink auto table.",
+                "2 hosts x 4 GPUs, one MPI process per host. Nano `--transport rdma` with `NANO_NCCL_RDMA_USE_WRITE=1` (WRITE+CTS over registered host-pinned FIFO). Local edges stay P2P/SHM; cross-host edges are RDMA. RTR `path_mtu` is `min(local, remote) port.active_mtu`. NCCL: Ring+Simple, `NCCL_NET_GDR_LEVEL=0`, P2P/SHM allowed intra-node. NCCL 256 KiB OOP that collapsed (~0.8 GB/s) was re-run isolated up to four times; cells that stayed collapsed are not nano wins.",
                 "",
             ]
         )
@@ -100,7 +100,7 @@ def render(doc: dict) -> str:
     out.append("# Performance")
     out.append("")
     out.append(
-        "All results below are out-of-place all-reduce measurements on **one host**. "
+        "All results below are out-of-place all-reduce measurements. "
         "Bandwidth is `busbw` in GB/s. Every measured nano-nccl and NCCL result completed "
         "validation with zero wrong values. The `nano/NCCL` column is calculated from the "
         "unrounded measured time (`nccl_time_us / nano_time_us`)."
@@ -109,7 +109,7 @@ def render(doc: dict) -> str:
     out.append("## Test Topology And Environment")
     out.append("")
     out.append(
-        "One host: two-socket Intel Xeon Platinum 8462Y+ (32 cores per socket, two threads per core), "
+        "Two hosts, each two-socket Intel Xeon Platinum 8462Y+ (32 cores per socket, two threads per core), "
         "4x NVIDIA RTX A6000 (SM86), CUDA 12.8.61, NCCL 2.30.7 built from source, nccl-tests 2.19.6, "
         "and Open MPI 4.1.2."
     )
@@ -118,15 +118,19 @@ def render(doc: dict) -> str:
     out.append("| --- | --- | --- | --- |")
     ka = env.get("node_a_kernel", "Linux 5.15.0-136-generic")
     da = env.get("node_a_driver", "580.82.07")
+    kb = env.get("node_b_kernel", ka)
+    db = env.get("node_b_driver", da)
     out.append(
         f"| A | {ka} | {da} | GPU0 `2a:00.0`, GPU1 `3d:00.0`, GPU2 `ab:00.0`, GPU3 `bd:00.0` |"
     )
+    out.append(
+        f"| B | {kb} | {db} | GPU0 `2a:00.0`, GPU1 `3d:00.0`, GPU2 `ab:00.0`, GPU3 `bd:00.0` |"
+    )
     out.append("")
     out.append(
-        "GPU0-GPU1 and GPU2-GPU3 are connected by four NVLinks. The two pairs are separated by "
-        "`SYS` paths across NUMA nodes. Three single-host tables are reported separately because "
-        "they are different transport classes: in-process auto (P2P/SHM), 4-rank TCP socket, and "
-        "4-rank host-pinned RDMA / NET-IB."
+        "On each host, GPU0-GPU1 and GPU2-GPU3 are connected by four NVLinks. The two pairs are "
+        "separated by `SYS` paths across NUMA nodes. Tables are separate transport classes: "
+        "in-process auto (P2P/SHM) on one host, two-host TCP socket, and two-host host-pinned RDMA."
     )
     out.append("")
     out.append(
@@ -185,11 +189,11 @@ def render(doc: dict) -> str:
     )
     out.append("")
     out.append("```bash")
-    out.append("cmake -S . -B build-perf-rdma-n4 -DCMAKE_BUILD_TYPE=Release \\")
+    out.append("cmake -S . -B build-perf-rdma-n8 -DCMAKE_BUILD_TYPE=Release \\")
     out.append("  -DNANO_NCCL_ENABLE_MPI=ON -DNANO_NCCL_ENABLE_RDMA=ON \\")
-    out.append("  -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=86 \\")
+    out.append("  -DNANO_NCCL_NRANKS=8 -DNANO_NCCL_CUDA_ARCH=86 \\")
     out.append("  -DNANO_NCCL_ENABLE_BENCH_PROFILING=OFF")
-    out.append("cmake --build build-perf-rdma-n4 -j<jobs>")
+    out.append("cmake --build build-perf-rdma-n8 -j<jobs>")
     out.append("```")
     out.append("")
     out.append("Or regenerate this file from a completed matrix JSON:")

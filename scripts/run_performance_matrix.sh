@@ -56,7 +56,10 @@ done
 
 [[ -n "${NCCL_BIN}" && -x "${NCCL_BIN}" ]] || die "need --nccl-bin"
 [[ -n "${NCCL_LIB}" && -d "${NCCL_LIB}" ]] || die "need --nccl-lib"
-command -v mpirun >/dev/null || die "mpirun not in PATH"
+MPI_HOME="${MPI_HOME:-${HOME}/opt/openmpi-4.1.2}"
+MPIRUN="${MPI_HOME}/bin/mpirun"
+[[ -x "${MPIRUN}" ]] || die "need ${MPIRUN}"
+export PATH="${MPI_HOME}/bin:${PATH}"
 command -v python3 >/dev/null || die "python3 required"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
@@ -243,7 +246,7 @@ run_mpi_pair() {
     fi
 
     env "${nano_env[@]}" \
-    mpirun "${mca[@]}" \
+    "${MPIRUN}" --prefix "${MPI_HOME}" "${mca[@]}" \
       --host "${host_a}:1" -np 1 "${nano_x[@]}" \
       "${RDMA_BIN}" --algo ring_simple --transport "${transport}" \
       --dtype "${dtype}" --redop "${redop}" \
@@ -270,7 +273,7 @@ run_mpi_pair() {
         nccl_env+=(NCCL_IB_DISABLE=1)
         nccl_x+=(-x NCCL_IB_DISABLE)
         env "${nccl_env[@]}" \
-        mpirun "${nccl_mca[@]}" \
+        "${MPIRUN}" --prefix "${MPI_HOME}" "${nccl_mca[@]}" \
           --host "${host_a}:1" -np 1 "${nccl_x[@]}" \
           "${NCCL_BIN}" -b 262144 -e 67108864 -f 4 -g 4 -w 5 -n 20 -d "${ndt}" -o "${redop}" : \
           --host "${host_b}:1" -np 1 "${nccl_x[@]}" \
@@ -285,7 +288,7 @@ run_mpi_pair() {
             nccl_x+=(-x NCCL_IB_GID_INDEX)
         fi
         env -u NCCL_IB_DISABLE "${nccl_env[@]}" \
-        mpirun "${nccl_mca[@]}" \
+        "${MPIRUN}" --prefix "${MPI_HOME}" "${nccl_mca[@]}" \
           --host "${host_a}:1" -np 1 "${nccl_x[@]}" \
           "${NCCL_BIN}" -b 262144 -e 67108864 -f 4 -g 4 -w 5 -n 20 -d "${ndt}" -o "${redop}" : \
           --host "${host_b}:1" -np 1 "${nccl_x[@]}" \

@@ -8,7 +8,7 @@
 
 ## 性能
 
-[详细的单机性能结果](performance.md)记录了测试拓扑、环境，以及三类 4-rank 路径相对 NCCL 的逐点对比：进程内 auto（P2P/SHM）、TCP socket、host-pinned RDMA / NET-IB（`float` / FP16 / BF16 × `sum` / `avg` / `max` / `min`）。
+[详细的单机性能结果](performance.md)记录了测试拓扑、环境，以及进程内 auto（P2P/SHM），以及两机 TCP socket 与 host-pinned RDMA 相对 NCCL 的逐点对比（`float` / FP16 / BF16 × `sum` / `avg` / `max` / `min`）。
 
 ---
 
