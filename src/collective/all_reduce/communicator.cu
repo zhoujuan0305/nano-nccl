@@ -19,6 +19,7 @@
 #endif
 #if defined(NANO_NCCL_ENABLE_RDMA)
 #include "transport/rdma/rdma_endpoint.h"
+#include "transport/rdma/rdma_gdr.h"
 #include "transport/rdma/rdma_progress.h"
 #include "transport/rdma/rdma_proxy.h"
 #include "transport/rdma/rdma_qp.h"
@@ -410,10 +411,13 @@ private:
 
     struct RdmaChannelResources {
         std::unique_ptr<MappedBuffer<std::uint8_t>> fifo;
+        core::DeviceBuffer<std::uint8_t> device_fifo;
+        std::uint8_t* data_ptr = nullptr;
         MappedU64Array control;
         MappedU32Array payload_bytes;
-        RdmaMrPtr registered;            // dereg's fifo_mr_raw on destruction
-        ibv_mr* fifo_mr_raw = nullptr;  // owned by registered; read-only view
+        transport::rdma::RdmaRegisteredMemory fifo_memory;
+        RdmaMrPtr registered;            // host-pin fallback owner
+        ibv_mr* fifo_mr_raw = nullptr;  // owned by fifo_memory or registered
         // WriteCts: sender owns CTS FIFO; receiver owns local CTS shadow.
         std::unique_ptr<transport::rdma::RdmaCtsSlot[]> cts_slots;
         RdmaMrPtr cts_registered;
@@ -424,12 +428,44 @@ private:
 
     std::unique_ptr<RdmaChannelResources> make_rdma_resources(int device) {
         auto resources = std::make_unique<RdmaChannelResources>();
-        resources->fifo = std::make_unique<MappedBuffer<std::uint8_t>>(
-            transport::simple::kFifoBytes, core::gpu_numa_node(device), devices_);
         resources->control.reset(2, core::gpu_numa_node(device), devices_);
         resources->payload_bytes.reset(transport::simple::kFifoSteps,
                                        core::gpu_numa_node(device), devices_);
         return resources;
+    }
+
+    void allocate_rdma_fifo(RdmaChannelResources& r, int device,
+                            transport::rdma::RdmaMemoryPlacement placement) {
+        if (placement == transport::rdma::RdmaMemoryPlacement::GpuDirect) {
+            r.device_fifo.reset(device, transport::simple::kFifoBytes);
+            r.data_ptr = r.device_fifo.get();
+            try {
+                r.fifo_memory =
+                    transport::rdma::RdmaRegisteredMemory::register_device(
+                        rdma_endpoint_->pd(), r.data_ptr,
+                        transport::simple::kFifoBytes);
+            } catch (const std::exception& ex) {
+                throw std::runtime_error(
+                    std::string("NANO_NCCL_RDMA_GDR=1 requested but device FIFO "
+                                "registration failed (no silent host-pin fallback): ") +
+                    ex.what());
+            }
+            r.fifo_mr_raw = r.fifo_memory.mr();
+            return;
+        }
+        r.fifo = std::make_unique<MappedBuffer<std::uint8_t>>(
+            transport::simple::kFifoBytes, core::gpu_numa_node(device), devices_);
+        r.data_ptr = r.fifo->host_ptr();
+        ibv_mr* mr = ibv_reg_mr(rdma_endpoint_->pd(), r.data_ptr,
+            transport::simple::kFifoBytes,
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+            IBV_ACCESS_REMOTE_READ);
+        if (mr == nullptr) {
+            throw std::runtime_error(std::string("ibv_reg_mr rdma fifo: ") +
+                                     std::strerror(errno));
+        }
+        r.fifo_mr_raw = mr;
+        r.registered = RdmaMrPtr(mr);
     }
 
     void register_rdma_cts_buffer(RdmaChannelResources& r, bool remote_write) {
@@ -465,6 +501,8 @@ private:
         const transport::rdma::RdmaDataPlane plane =
             transport::rdma::parse_rdma_data_plane_env();
         const bool write_cts = plane == transport::rdma::RdmaDataPlane::WriteCts;
+        const transport::rdma::RdmaMemoryPlacement placement =
+            transport::rdma::parse_rdma_memory_placement_env();
         rdma_shared_progress_ = transport::rdma::parse_rdma_shared_progress_env();
 
         rdma_endpoint_ = std::make_shared<transport::rdma::RdmaEndpoint>(
@@ -496,16 +534,7 @@ private:
                     r.qp = std::make_unique<transport::rdma::RdmaQp>(
                         transport::rdma::RdmaQp::create_init(
                             *rdma_endpoint_, kRdmaProxyWr, kRdmaProxyWr));
-                    ibv_mr* mr = ibv_reg_mr(rdma_endpoint_->pd(), r.fifo->host_ptr(),
-                        transport::simple::kFifoBytes,
-                        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
-                        IBV_ACCESS_REMOTE_READ);
-                    if (mr == nullptr) {
-                        throw std::runtime_error(std::string("ibv_reg_mr rdma send fifo: ") +
-                                                 std::strerror(errno));
-                    }
-                    r.fifo_mr_raw = mr;
-                    r.registered = RdmaMrPtr(mr);
+                    allocate_rdma_fifo(r, devices_[local], placement);
                     if (write_cts) {
                         // Sender owns CTS FIFO; peer receiver RDMA_WRITEs into it.
                         register_rdma_cts_buffer(r, /*remote_write=*/true);
@@ -523,16 +552,7 @@ private:
                     r.qp = std::make_unique<transport::rdma::RdmaQp>(
                         transport::rdma::RdmaQp::create_init(
                             *rdma_endpoint_, kRdmaProxyWr, kRdmaProxyWr));
-                    ibv_mr* mr = ibv_reg_mr(rdma_endpoint_->pd(), r.fifo->host_ptr(),
-                        transport::simple::kFifoBytes,
-                        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
-                        IBV_ACCESS_REMOTE_READ);
-                    if (mr == nullptr) {
-                        throw std::runtime_error(std::string("ibv_reg_mr rdma recv fifo: ") +
-                                                 std::strerror(errno));
-                    }
-                    r.fifo_mr_raw = mr;
-                    r.registered = RdmaMrPtr(mr);
+                    allocate_rdma_fifo(r, devices_[local], placement);
                     if (write_cts) {
                         // Receiver owns CTS shadow SGE source (local write only).
                         register_rdma_cts_buffer(r, /*remote_write=*/false);
@@ -589,7 +609,7 @@ private:
             if (write_cts) {
                 if (is_recv) {
                     local_info.recv_fifo_addr =
-                        reinterpret_cast<std::uint64_t>(r.fifo->host_ptr());
+                        reinterpret_cast<std::uint64_t>(r.data_ptr);
                     local_info.recv_fifo_rkey = r.fifo_mr_raw->rkey;
                     local_info.recv_fifo_bytes =
                         static_cast<std::uint32_t>(transport::simple::kFifoBytes);
@@ -663,7 +683,7 @@ private:
             auto qp_taken = std::move(r.qp);
 
             transport::rdma::RdmaProxyFifo fifo{
-                r.fifo->host_ptr(),
+                r.data_ptr,
                 transport::simple::kFifoBytes / transport::simple::kFifoSteps,
                 transport::simple::kFifoSteps,
                 r.payload_bytes.host_ptr(),
@@ -705,7 +725,7 @@ private:
                     cts_remote.local_shadow = r.cts_slots.get();
                     cts_remote.local_shadow_mr = r.cts_mr_raw;
                     cts_remote.local_recv_fifo_addr =
-                        reinterpret_cast<std::uint64_t>(r.fifo->host_ptr());
+                        reinterpret_cast<std::uint64_t>(r.data_ptr);
                     cts_remote.local_recv_fifo_rkey = r.fifo_mr_raw->rkey;
                     rdma_recv_proxies_.push_back(
                         std::make_unique<transport::rdma::RdmaRecvProxy>(
@@ -993,7 +1013,9 @@ private:
                 } else if (send_rdma) {
                     auto& rdma = *rdma_send_resources_[channel][send_edge];
                     kernel_args.send_fifo[channel] = reinterpret_cast<T*>(
-                        rdma.fifo->device_ptr(devices_[rank]));
+                        rdma.data_ptr != nullptr
+                            ? rdma.data_ptr
+                            : rdma.fifo->device_ptr(devices_[rank]));
                     kernel_args.control.send_head[channel] = rdma.control.device_ptr(devices_[rank]);
                     kernel_args.control.send_tail[channel] = rdma.control.device_ptr(devices_[rank]) + 1;
                     kernel_args.send_payload_bytes[channel] =
@@ -1020,7 +1042,9 @@ private:
                 } else if (recv_rdma) {
                     auto& rdma = *rdma_recv_resources_[channel][recv_edge];
                     kernel_args.recv_fifo[channel] = reinterpret_cast<const T*>(
-                        rdma.fifo->device_ptr(devices_[rank]));
+                        rdma.data_ptr != nullptr
+                            ? rdma.data_ptr
+                            : rdma.fifo->device_ptr(devices_[rank]));
                     kernel_args.control.recv_head[channel] = rdma.control.device_ptr(devices_[rank]);
                     kernel_args.control.recv_tail[channel] = rdma.control.device_ptr(devices_[rank]) + 1;
                     kernel_args.recv_payload_bytes[channel] =

@@ -113,6 +113,21 @@ if(NANO_NCCL_ENABLE_MPI)
     target_link_libraries(nano_nccl_socket_protocol PRIVATE nano_nccl_mpi)
 
     if(NANO_NCCL_ENABLE_RDMA)
+        add_test(NAME nano_nccl_rdma_gdr_static
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/rdma_gdr_static.py
+                         ${CMAKE_SOURCE_DIR}/src/transport/rdma/rdma_gdr.h
+                         ${CMAKE_SOURCE_DIR}/src/transport/rdma/rdma_gdr.cc
+                         ${CMAKE_SOURCE_DIR}/src/CMakeLists.txt
+                         ${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
+                         ${CMAKE_SOURCE_DIR}/src/collective/all_reduce/communicator.cu)
+
+        add_executable(nano_nccl_rdma_gdr rdma_gdr.cu)
+        target_link_libraries(nano_nccl_rdma_gdr PRIVATE nano_nccl ${IBVERBS_LIBRARY} CUDA::cuda_driver)
+        target_compile_definitions(nano_nccl_rdma_gdr PRIVATE NANO_NCCL_ENABLE_RDMA=1)
+        add_test(NAME nano_nccl_rdma_gdr COMMAND nano_nccl_rdma_gdr)
+        set_tests_properties(nano_nccl_rdma_gdr PROPERTIES SKIP_RETURN_CODE 77)
+
         add_executable(nano_nccl_rdma_protocol rdma_protocol.cc)
         target_link_libraries(nano_nccl_rdma_protocol PRIVATE nano_nccl ${IBVERBS_LIBRARY})
         target_compile_definitions(nano_nccl_rdma_protocol PRIVATE NANO_NCCL_ENABLE_RDMA=1)
