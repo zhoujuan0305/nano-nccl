@@ -33,6 +33,7 @@ struct SimpleControlArgs {
 template <typename T>
 struct SimpleFifoArgs {
     int rank;
+    int ring_index[kChannels];
     std::size_t count;
     std::size_t slot_elems;
     std::size_t step_elems;

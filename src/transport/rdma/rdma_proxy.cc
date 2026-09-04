@@ -197,6 +197,8 @@ void RdmaSendProxy::run() noexcept {
                 break;
             }
             check_wc(wc, identity_, step, errors_.get());
+            completed_bytes_.fetch_add(payload_bytes, std::memory_order_relaxed);
+            completed_messages_.fetch_add(1, std::memory_order_release);
             store_counter(control_.send_head, step + fifo_.step_increment);
             step_.store(step + fifo_.step_increment, std::memory_order_release);
         }

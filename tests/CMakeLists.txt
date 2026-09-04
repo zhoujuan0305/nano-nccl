@@ -14,6 +14,12 @@ target_link_libraries(nano_nccl_p2p_topology PRIVATE nano_nccl)
 add_executable(nano_nccl_simple_protocol simple_protocol.cu)
 target_link_libraries(nano_nccl_simple_protocol PRIVATE nano_nccl)
 
+add_executable(nano_nccl_ring_schedule ring_schedule.cc)
+target_include_directories(nano_nccl_ring_schedule PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME nano_nccl_ring_schedule COMMAND nano_nccl_ring_schedule)
+
 if(BUILD_TESTING)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     add_test(

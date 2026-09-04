@@ -80,6 +80,13 @@ public:
     void shutdown() noexcept;
     void drain() const;
     void join() noexcept;
+    RdmaProxyIdentity identity() const noexcept { return identity_; }
+    std::uint64_t completed_messages() const noexcept {
+        return completed_messages_.load(std::memory_order_acquire);
+    }
+    std::uint64_t completed_bytes() const noexcept {
+        return completed_bytes_.load(std::memory_order_acquire);
+    }
 
 private:
     void run() noexcept;
@@ -94,6 +101,8 @@ private:
     std::atomic<bool> stop_requested_{false};
     std::thread thread_;
     std::atomic<std::uint64_t> step_{0};
+    std::atomic<std::uint64_t> completed_messages_{0};
+    std::atomic<std::uint64_t> completed_bytes_{0};
 };
 
 class RdmaRecvProxy {

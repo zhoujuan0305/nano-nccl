@@ -1,6 +1,7 @@
 #include "nano_nccl/mpi.h"
 
 #include "collective/all_reduce/communicator_internal.h"
+#include "collective/all_reduce/ring_schedule.h"
 #include "collective/all_reduce/topology.h"
 #include "transport/p2p/p2p_topology.h"
 #include "transport/socket/socket_endpoint.h"
@@ -21,6 +22,11 @@ namespace nano_nccl {
 namespace {
 
 using collective::all_reduce::ProcessTopology;
+using collective::all_reduce::ring_destination_for_edge;
+using collective::all_reduce::ring_direction;
+using collective::all_reduce::ring_edge_index;
+using collective::all_reduce::ring_next;
+using collective::all_reduce::ring_source_for_edge;
 using transport::socket::SocketAddress;
 using transport::socket::SocketConnection;
 using transport::socket::SocketEndpoint;
@@ -90,16 +96,24 @@ std::uint64_t hello_key(const SocketHello& hello) {
 }
 
 bool is_expected_hello(const SocketHello& hello, const ProcessTopology& topology,
-                       const std::vector<int>& process_counts, int mpi_rank) {
-    if (hello.source_global_rank < 0 || hello.source_global_rank >= kRanks ||
-        hello.destination_global_rank != (hello.source_global_rank + 1) % kRanks ||
-        hello.channel < 0 || hello.channel >= kChannels) {
+                       const std::vector<int>& process_counts, int mpi_rank,
+                       ChannelPolicy channel_policy) {
+    if (hello.channel < 0 || hello.channel >= kChannels ||
+        hello.source_global_rank < 0 || hello.source_global_rank >= kRanks) {
         return false;
     }
+    auto direction = ring_direction(channel_policy, hello.channel);
+    if (hello.destination_global_rank !=
+        ring_next(hello.source_global_rank, direction, kRanks)) {
+        return false;
+    }
+    int edge = ring_edge_index(
+        hello.source_global_rank, hello.destination_global_rank, kRanks);
+    if (edge < 0) return false;
     int source_process = process_for_global_rank(process_counts, hello.source_global_rank);
     int destination_process = process_for_global_rank(
         process_counts, hello.destination_global_rank);
-    TransportKind edge_kind = topology.edge_kinds[hello.source_global_rank];
+    TransportKind edge_kind = topology.edge_kinds[edge];
     return source_process != destination_process &&
            (source_process == mpi_rank || destination_process == mpi_rank) &&
            mpi_rank == std::max(source_process, destination_process) &&
@@ -213,13 +227,16 @@ std::unique_ptr<Communicator> create_communicator_from_mpi(
             topology.edge_kinds[edge] != TransportKind::Rdma) {
             continue;
         }
-        int receiver = (edge + 1) % global_count;
-        int source_process = process_for_global_rank(process_counts, edge);
-        int destination_process = process_for_global_rank(process_counts, receiver);
-        int remote_process = source_process == mpi_rank ? destination_process : source_process;
-        if (source_process != mpi_rank && destination_process != mpi_rank) continue;
         for (int channel = 0; channel < kChannels; ++channel) {
-            SocketHello hello{edge, receiver, channel};
+            auto direction = ring_direction(config.channel_policy, channel);
+            int source = ring_source_for_edge(edge, direction, global_count);
+            int receiver = ring_destination_for_edge(edge, direction, global_count);
+            int source_process = process_for_global_rank(process_counts, source);
+            int destination_process = process_for_global_rank(process_counts, receiver);
+            int remote_process = source_process == mpi_rank
+                ? destination_process : source_process;
+            if (source_process != mpi_rank && destination_process != mpi_rank) continue;
+            SocketHello hello{source, receiver, channel};
             if (mpi_rank < remote_process) {
                 connections.push_back(listener.connect(endpoints[remote_process], hello));
             } else {
@@ -232,7 +249,8 @@ std::unique_ptr<Communicator> create_communicator_from_mpi(
     for (int index = 0; index < expected_accepts; ++index) {
         SocketConnection connection = listener.accept();
         SocketHello hello = listener.read_hello(connection);
-        if (!is_expected_hello(hello, topology, process_counts, mpi_rank)) {
+        if (!is_expected_hello(hello, topology, process_counts, mpi_rank,
+                               config.channel_policy)) {
             throw std::runtime_error("socket HELLO describes an unexpected ring edge");
         }
         if (!accepted_hellos.insert(hello_key(hello)).second) {

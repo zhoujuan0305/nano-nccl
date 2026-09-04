@@ -3,6 +3,7 @@
 #include "core/buffer.h"
 #include "core/numa.h"
 #include "collective/all_reduce/communicator_internal.h"
+#include "collective/all_reduce/ring_schedule.h"
 #include "collective/all_reduce/topology.h"
 #include "kernels/ring_simple_kernel.cuh"
 #include "transport/socket/socket_proxy.h"
@@ -23,6 +24,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -50,6 +52,13 @@ void require_single_process_devices(const std::vector<int>& devices) {
     if (devices.size() != kRanks) {
         throw std::runtime_error("communicator requires exactly " +
                                  std::to_string(kRanks) + " local devices");
+    }
+}
+
+void require_channel_policy(ChannelPolicy policy) {
+    if (policy == ChannelPolicy::CounterRotating && kRanks < 3) {
+        throw std::runtime_error(
+            "counter_rotating requires at least three ranks");
     }
 }
 
@@ -141,7 +150,9 @@ collective::all_reduce::SocketFdOwner::release_connections() noexcept {
 
 class Communicator::Impl {
 public:
-    explicit Impl(const CommunicatorConfig& config) : devices_(config.devices) {
+    explicit Impl(const CommunicatorConfig& config)
+        : devices_(config.devices), channel_policy_(config.channel_policy) {
+        require_channel_policy(channel_policy_);
         require_single_process_devices(devices_);
         require_local_devices(devices_);
         topology_ = collective::all_reduce::make_single_process_topology(
@@ -165,8 +176,9 @@ public:
     Impl(const CommunicatorConfig& config,
          collective::all_reduce::ProcessTopology topology,
          collective::all_reduce::SocketFdOwner socket_fds)
-        : devices_(config.devices), topology_(std::move(topology)),
-          socket_fds_(std::move(socket_fds)) {
+        : devices_(config.devices), channel_policy_(config.channel_policy),
+          topology_(std::move(topology)), socket_fds_(std::move(socket_fds)) {
+        require_channel_policy(channel_policy_);
         require_local_devices(devices_);
         if (topology_.devices != devices_) {
             throw std::runtime_error("communicator topology devices do not match configuration");
@@ -208,6 +220,7 @@ public:
 #if defined(NANO_NCCL_ENABLE_RDMA)
         for (const auto& proxy : rdma_send_proxies_) proxy->drain();
         for (const auto& proxy : rdma_recv_proxies_) proxy->drain();
+        trace_rdma_completions();
         for (const auto& proxy : rdma_send_proxies_) proxy->shutdown();
         for (const auto& proxy : rdma_recv_proxies_) proxy->shutdown();
         for (const auto& proxy : rdma_send_proxies_) proxy->join();
@@ -283,19 +296,24 @@ private:
         socket_abort_.reset(1, -1, devices_);
         socket_errors_ = std::make_shared<transport::socket::SocketAsyncErrorState>(
             socket_abort_.host_ptr());
-        for (int edge = 0; edge < kRanks; ++edge) {
-            if (transport_plan_.edge_kind(edge) != TransportKind::Socket) continue;
-            int receiver = (edge + 1) % kRanks;
-            if (collective::all_reduce::is_local_global_rank(topology_, edge)) {
-                int local = collective::all_reduce::local_rank_for_global_rank(topology_, edge);
-                for (int channel = 0; channel < kChannels; ++channel) {
+        for (int channel = 0; channel < kChannels; ++channel) {
+            auto direction = collective::all_reduce::ring_direction(
+                channel_policy_, channel);
+            for (int edge = 0; edge < kRanks; ++edge) {
+                if (transport_plan_.edge_kind(edge) != TransportKind::Socket) continue;
+                int source = collective::all_reduce::ring_source_for_edge(
+                    edge, direction, kRanks);
+                int receiver = collective::all_reduce::ring_destination_for_edge(
+                    edge, direction, kRanks);
+                if (collective::all_reduce::is_local_global_rank(topology_, source)) {
+                    int local = collective::all_reduce::local_rank_for_global_rank(
+                        topology_, source);
                     socket_send_resources_[channel][edge] =
                         make_socket_resources(devices_[local]);
                 }
-            }
-            if (collective::all_reduce::is_local_global_rank(topology_, receiver)) {
-                int local = collective::all_reduce::local_rank_for_global_rank(topology_, receiver);
-                for (int channel = 0; channel < kChannels; ++channel) {
+                if (collective::all_reduce::is_local_global_rank(topology_, receiver)) {
+                    int local = collective::all_reduce::local_rank_for_global_rank(
+                        topology_, receiver);
                     socket_recv_resources_[channel][edge] =
                         make_socket_resources(devices_[local]);
                 }
@@ -311,22 +329,29 @@ private:
 #endif
         for (auto& connection : connections) {
             const auto hello = connection.hello();
-            if (hello.channel < 0 || hello.channel >= kChannels ||
-                hello.source_global_rank < 0 || hello.source_global_rank >= kRanks ||
-                hello.destination_global_rank != (hello.source_global_rank + 1) % kRanks) {
+            if (hello.channel < 0 || hello.channel >= kChannels) {
                 throw std::runtime_error("socket connection has invalid ring identity");
             }
-            const int edge = hello.source_global_rank;
-            const int receiver = (edge + 1) % kRanks;
+            auto direction = collective::all_reduce::ring_direction(
+                channel_policy_, hello.channel);
+            if (hello.source_global_rank < 0 || hello.source_global_rank >= kRanks ||
+                hello.destination_global_rank != collective::all_reduce::ring_next(
+                    hello.source_global_rank, direction, kRanks)) {
+                throw std::runtime_error("socket connection has invalid ring identity");
+            }
+            const int source = hello.source_global_rank;
+            const int receiver = hello.destination_global_rank;
+            const int edge = collective::all_reduce::ring_edge_index(
+                source, receiver, kRanks);
 #if defined(NANO_NCCL_ENABLE_RDMA)
             if (transport_plan_.edge_kind(edge) == TransportKind::Rdma) {
                 rdma_residual.push_back(std::move(connection));
                 continue;
             }
 #endif
-            if (collective::all_reduce::is_local_global_rank(topology_, edge)) {
+            if (collective::all_reduce::is_local_global_rank(topology_, source)) {
                 const int local = collective::all_reduce::local_rank_for_global_rank(
-                    topology_, edge);
+                    topology_, source);
                 const int fifo_numa_node = core::gpu_numa_node(devices_[local]);
                 auto& resources = *socket_send_resources_[hello.channel][edge];
                 transport::socket::SocketProxyFifo fifo{
@@ -341,7 +366,7 @@ private:
                     transport::socket::SocketSendControl{
                         resources.control.host_ptr(), resources.control.host_ptr() + 1},
                     transport::socket::SocketProxyIdentity{
-                        edge, (edge + 1) % kRanks, hello.channel}, fifo_numa_node,
+                        source, receiver, hello.channel}, fifo_numa_node,
                     socket_errors_));
             } else {
                 const int local = collective::all_reduce::local_rank_for_global_rank(
@@ -360,7 +385,7 @@ private:
                     transport::socket::SocketRecvControl{
                         resources.control.host_ptr(), resources.control.host_ptr() + 1},
                     transport::socket::SocketProxyIdentity{
-                        edge, (edge + 1) % kRanks, hello.channel}, fifo_numa_node,
+                        source, receiver, hello.channel}, fifo_numa_node,
                     socket_errors_));
             }
         }
@@ -376,6 +401,26 @@ private:
     }
 
 #if defined(NANO_NCCL_ENABLE_RDMA)
+    void trace_rdma_completions() const noexcept {
+        const char* enabled = std::getenv("NANO_NCCL_TRACE_RDMA_COMPLETIONS");
+        if (enabled == nullptr || enabled[0] == '\0' ||
+            std::strcmp(enabled, "0") == 0) {
+            return;
+        }
+        for (const auto& proxy : rdma_send_proxies_) {
+            auto identity = proxy->identity();
+            std::fprintf(
+                stderr,
+                "NANO_NCCL_RDMA_COMPLETION source=%d destination=%d channel=%d "
+                "messages=%llu bytes=%llu policy=%s\n",
+                identity.source_rank, identity.destination_rank, identity.channel,
+                static_cast<unsigned long long>(proxy->completed_messages()),
+                static_cast<unsigned long long>(proxy->completed_bytes()),
+                channel_policy_name(channel_policy_));
+        }
+        std::fflush(stderr);
+    }
+
     // 1:1 mirror of SocketChannelResources plus the RC QP, the FIFO MR and
     // the peer info cached for the proxy construction. The MR is owned by
     // the unique_ptr below (RdmaMrDeleter); QP ownership transfers into the
@@ -434,13 +479,18 @@ private:
 
         // 1. For each Rdma edge: allocate send/recv FIFO + control, create RC
         //    QP, register the FIFO MR with bidirectional access flags.
-        for (int edge = 0; edge < kRanks; ++edge) {
-            if (transport_plan_.edge_kind(edge) != TransportKind::Rdma) continue;
-            int receiver = (edge + 1) % kRanks;
-            if (collective::all_reduce::is_local_global_rank(topology_, edge)) {
-                int local = collective::all_reduce::local_rank_for_global_rank(
-                    topology_, edge);
-                for (int channel = 0; channel < kChannels; ++channel) {
+        for (int channel = 0; channel < kChannels; ++channel) {
+            auto direction = collective::all_reduce::ring_direction(
+                channel_policy_, channel);
+            for (int edge = 0; edge < kRanks; ++edge) {
+                if (transport_plan_.edge_kind(edge) != TransportKind::Rdma) continue;
+                int source = collective::all_reduce::ring_source_for_edge(
+                    edge, direction, kRanks);
+                int receiver = collective::all_reduce::ring_destination_for_edge(
+                    edge, direction, kRanks);
+                if (collective::all_reduce::is_local_global_rank(topology_, source)) {
+                    int local = collective::all_reduce::local_rank_for_global_rank(
+                        topology_, source);
                     rdma_send_resources_[channel][edge] =
                         make_rdma_resources(devices_[local]);
                     auto& r = *rdma_send_resources_[channel][edge];
@@ -457,11 +507,9 @@ private:
                     r.fifo_mr_raw = mr;
                     r.registered = RdmaMrPtr(mr);
                 }
-            }
-            if (collective::all_reduce::is_local_global_rank(topology_, receiver)) {
-                int local = collective::all_reduce::local_rank_for_global_rank(
-                    topology_, receiver);
-                for (int channel = 0; channel < kChannels; ++channel) {
+                if (collective::all_reduce::is_local_global_rank(topology_, receiver)) {
+                    int local = collective::all_reduce::local_rank_for_global_rank(
+                        topology_, receiver);
                     rdma_recv_resources_[channel][edge] =
                         make_rdma_resources(devices_[local]);
                     auto& r = *rdma_recv_resources_[channel][edge];
@@ -488,25 +536,33 @@ private:
         std::vector<transport::socket::SocketConnection> rdma_ready_connections;
         for (auto& connection : connections) {
             const auto hello = connection.hello();
-            if (hello.channel < 0 || hello.channel >= kChannels ||
-                hello.source_global_rank < 0 || hello.source_global_rank >= kRanks ||
-                hello.destination_global_rank != (hello.source_global_rank + 1) % kRanks) {
+            if (hello.channel < 0 || hello.channel >= kChannels) {
                 throw std::runtime_error("rdma connection has invalid ring identity");
             }
-            const int edge = hello.source_global_rank;
+            auto direction = collective::all_reduce::ring_direction(
+                channel_policy_, hello.channel);
+            if (
+                hello.source_global_rank < 0 || hello.source_global_rank >= kRanks ||
+                hello.destination_global_rank != collective::all_reduce::ring_next(
+                    hello.source_global_rank, direction, kRanks)) {
+                throw std::runtime_error("rdma connection has invalid ring identity");
+            }
+            const int source = hello.source_global_rank;
+            const int receiver = hello.destination_global_rank;
+            const int edge = collective::all_reduce::ring_edge_index(
+                source, receiver, kRanks);
             if (transport_plan_.edge_kind(edge) != TransportKind::Rdma) continue;
-            const int receiver = (edge + 1) % kRanks;
             const int fd = connection.fd();
 
             // Decide local role: sender (edge rank lives here) or receiver.
             const bool is_send =
-                collective::all_reduce::is_local_global_rank(topology_, edge);
+                collective::all_reduce::is_local_global_rank(topology_, source);
             const bool is_recv =
                 collective::all_reduce::is_local_global_rank(topology_, receiver);
             if (!is_send && !is_recv) continue;  // defensive; should not happen
 
             const int local = collective::all_reduce::local_rank_for_global_rank(
-                topology_, is_send ? edge : receiver);
+                topology_, is_send ? source : receiver);
             const int fifo_numa_node = core::gpu_numa_node(devices_[local]);
 
             RdmaChannelResources& r = is_send
@@ -541,7 +597,7 @@ private:
                 transport::shm::kSimpleFifoSliceSteps,
             };
             transport::rdma::RdmaProxyIdentity identity{
-                edge, receiver, hello.channel};
+                source, receiver, hello.channel};
             if (is_send) {
                 rdma_send_proxies_.push_back(
                     std::make_unique<transport::rdma::RdmaSendProxy>(
@@ -709,10 +765,15 @@ private:
         FifoResources<T> replacement;
         replacement.slot_elems = required_slot_elems;
         for (int channel = 0; channel < kChannels; ++channel) {
+            auto direction = collective::all_reduce::ring_direction(
+                channel_policy_, channel);
             for (int edge = 0; edge < topology_.global_rank_count; ++edge) {
                 if (transport_plan_.edge_kind(edge) != TransportKind::Shm) continue;
-                int receiver = (edge + 1) % kRanks;
-                if (!collective::all_reduce::is_local_global_rank(topology_, edge) ||
+                int source = collective::all_reduce::ring_source_for_edge(
+                    edge, direction, kRanks);
+                int receiver = collective::all_reduce::ring_destination_for_edge(
+                    edge, direction, kRanks);
+                if (!collective::all_reduce::is_local_global_rank(topology_, source) ||
                     !collective::all_reduce::is_local_global_rank(topology_, receiver)) {
                     continue;
                 }
@@ -731,7 +792,7 @@ private:
         }
         if (transport_plan_.uses_p2p()) {
             replacement.p2p_fifo = std::make_unique<transport::p2p::P2pFifo<T>>(
-                replacement.slot_elems, transport_plan_, topology_);
+                replacement.slot_elems, transport_plan_, topology_, channel_policy_);
         }
         *resources = std::move(replacement);
     }
@@ -773,20 +834,30 @@ private:
 
             SimpleControlArgs shm_control = transport::shm::make_simple_control_args(
                 simple_fifo_steps_.device_ptr(devices_[rank]),
-                simple_fifo_base_step_.device_ptr(devices_[rank]), global_rank);
+                simple_fifo_base_step_.device_ptr(devices_[rank]), global_rank,
+                channel_policy_);
             SimpleControlArgs p2p_control{};
             if (p2p_steps_ != nullptr) {
                 p2p_control = p2p_steps_->control_args(global_rank);
             }
 
-            int next = (global_rank + 1) % kRanks;
-            int previous = (global_rank + kRanks - 1) % kRanks;
-            int send_edge = transport::shm::ring_edge_index(global_rank, next, kRanks);
-            int recv_edge = transport::shm::ring_edge_index(previous, global_rank, kRanks);
-            if (send_edge < 0 || recv_edge < 0) {
-                throw std::runtime_error("ring_simple saw an unexpected ring edge");
-            }
             for (int channel = 0; channel < kChannels; ++channel) {
+                auto direction = collective::all_reduce::ring_direction(
+                    channel_policy_, channel);
+                int next = collective::all_reduce::ring_next(
+                    global_rank, direction, kRanks);
+                int previous = collective::all_reduce::ring_previous(
+                    global_rank, direction, kRanks);
+                int send_edge = collective::all_reduce::ring_edge_index(
+                    global_rank, next, kRanks);
+                int recv_edge = collective::all_reduce::ring_edge_index(
+                    previous, global_rank, kRanks);
+                if (send_edge < 0 || recv_edge < 0) {
+                    throw std::runtime_error("ring_simple saw an unexpected ring edge");
+                }
+                kernel_args.ring_index[channel] =
+                    collective::all_reduce::logical_ring_index(
+                        global_rank, direction, kRanks);
                 bool send_p2p = transport_plan_.edge_kind(send_edge) == TransportKind::P2p;
                 bool recv_p2p = transport_plan_.edge_kind(recv_edge) == TransportKind::P2p;
                 bool send_socket = transport_plan_.edge_kind(send_edge) == TransportKind::Socket;
@@ -968,7 +1039,7 @@ private:
                 if (transport_plan_.uses_p2p()) {
                     p2p_steps_ =
                         std::make_unique<transport::p2p::P2pStepCounters>(
-                            transport_plan_, topology_);
+                            transport_plan_, topology_, channel_policy_);
                 }
                 // Counters are reset once; subsequent launches advance persistent steps.
                 reset_control(args.streams);
@@ -982,6 +1053,7 @@ private:
     }
 
     std::vector<int> devices_;
+    ChannelPolicy channel_policy_ = ChannelPolicy::Forward;
     collective::all_reduce::ProcessTopology topology_{};
     collective::all_reduce::SocketFdOwner socket_fds_;
     std::vector<std::vector<std::unique_ptr<SocketChannelResources>>> socket_send_resources_;

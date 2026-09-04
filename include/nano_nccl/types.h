@@ -32,6 +32,28 @@ enum class DType { Float, Float16, BFloat16 };
 
 enum class TransportKind { Auto, Shm, P2p, Socket, Rdma, Mixed };
 
+enum class ChannelPolicy { Forward, CounterRotating };
+
+inline const char* channel_policy_name(ChannelPolicy policy) {
+    switch (policy) {
+        case ChannelPolicy::Forward: return "forward";
+        case ChannelPolicy::CounterRotating: return "counter_rotating";
+    }
+    return "unknown";
+}
+
+inline bool parse_channel_policy(const char* text, ChannelPolicy* policy) {
+    if (std::strcmp(text, "forward") == 0) {
+        *policy = ChannelPolicy::Forward;
+        return true;
+    }
+    if (std::strcmp(text, "counter_rotating") == 0) {
+        *policy = ChannelPolicy::CounterRotating;
+        return true;
+    }
+    return false;
+}
+
 inline const char* transport_name(TransportKind transport) {
     switch (transport) {
         case TransportKind::Auto: return "auto";
@@ -93,6 +115,7 @@ struct BenchConfig {
     DType dtype = DType::Float;
     RedOp redop = RedOp::Sum;
     TransportKind transport = TransportKind::Auto;
+    ChannelPolicy channel_policy = ChannelPolicy::Forward;
     std::size_t min_bytes = 262144;
     std::size_t max_bytes = 67108864;
     int factor = 4;
@@ -106,6 +129,7 @@ struct BenchResult {
     DType dtype = DType::Float;
     RedOp redop = RedOp::Sum;
     TransportKind transport = TransportKind::Auto;
+    ChannelPolicy channel_policy = ChannelPolicy::Forward;
     std::size_t bytes = 0;
     std::size_t count = 0;
     double time_us = 0.0;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "collective/all_reduce/ring_schedule.h"
 #include "transport/simple_protocol.h"
 #include "transport/shm/shm_step.h"
 
@@ -11,11 +12,16 @@ namespace nano_nccl::transport::shm {
 // SHM 保留 edge-indexed mapped counter backing，kernel 仅接收本 rank 的方向指针。
 inline SimpleControlArgs make_simple_control_args(std::uint64_t* steps,
                                                   std::uint64_t* base_steps,
-                                                  int rank) {
+                                                  int rank,
+                                                  ChannelPolicy policy =
+                                                      ChannelPolicy::Forward) {
     SimpleControlArgs control{};
-    int send_edge = rank;
-    int recv_edge = (rank + kRanks - 1) % kRanks;
     for (int channel = 0; channel < kChannels; ++channel) {
+        auto direction = collective::all_reduce::ring_direction(policy, channel);
+        int next = collective::all_reduce::ring_next(rank, direction, kRanks);
+        int previous = collective::all_reduce::ring_previous(rank, direction, kRanks);
+        int send_edge = collective::all_reduce::ring_edge_index(rank, next, kRanks);
+        int recv_edge = collective::all_reduce::ring_edge_index(previous, rank, kRanks);
         control.send_head[channel] =
             steps + step_idx(0, channel, send_edge);
         control.recv_tail[channel] =
@@ -37,14 +43,6 @@ __host__ __device__ inline std::size_t div_up(std::size_t value,
 __host__ __device__ inline std::size_t align_up(std::size_t value,
                                                 std::size_t alignment) {
     return div_up(value, alignment) * alignment;
-}
-
-// Ring 拓扑：rank i 发给 rank (i+1)%NRanks，edge 编号即 src rank。
-// 非法 src->dst 组合返回 -1。nranks 由调用方传入（kernel 用 NRanks 模板参数，
-// host 用 kRanks），保持本 helper 与具体 rank 数解耦。
-__host__ __device__ inline int ring_edge_index(int src, int dst, int nranks) {
-    if (dst == (src + 1) % nranks) return src;
-    return -1;
 }
 
 // channel-based 分片：把 count 按 channel 等分，再按 NRanks 切 chunk，

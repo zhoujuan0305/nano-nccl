@@ -1,5 +1,6 @@
 #pragma once
 
+#include "collective/all_reduce/ring_schedule.h"
 #include "collective/all_reduce/topology.h"
 #include "core/buffer.h"
 #include "transport/p2p/p2p_topology.h"
@@ -18,7 +19,8 @@ public:
     explicit P2pStepCounters(int nranks);
     explicit P2pStepCounters(const RingTransportPlan& plan);
     P2pStepCounters(const RingTransportPlan& plan,
-                    const collective::all_reduce::ProcessTopology& topology);
+                    const collective::all_reduce::ProcessTopology& topology,
+                    ChannelPolicy channel_policy = ChannelPolicy::Forward);
     ~P2pStepCounters();
 
     P2pStepCounters(const P2pStepCounters&) = delete;
@@ -37,6 +39,7 @@ private:
 
     RingTransportPlan plan_;
     collective::all_reduce::ProcessTopology topology_;
+    ChannelPolicy channel_policy_ = ChannelPolicy::Forward;
     core::DeviceBuffer<std::uint64_t>* counters_[kRanks]{};
 };
 

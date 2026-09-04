@@ -17,6 +17,7 @@ class CommunicatorFactory;
 struct CommunicatorConfig {
     std::vector<int> devices;
     TransportKind transport = TransportKind::Auto;
+    ChannelPolicy channel_policy = ChannelPolicy::Forward;
 };
 
 struct CollectiveArgs {

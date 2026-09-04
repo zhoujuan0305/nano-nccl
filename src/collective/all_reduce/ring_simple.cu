@@ -110,10 +110,12 @@ void sync_streams(Stream* streams[kRanks]) {
 template <typename T, DType kDType, RedOp kRedOp>
 class AllReduceBenchRunner {
 public:
-    explicit AllReduceBenchRunner(std::size_t max_count, TransportKind transport) {
+    explicit AllReduceBenchRunner(std::size_t max_count, TransportKind transport,
+                                  ChannelPolicy channel_policy) {
         CommunicatorConfig config;
         for (int rank = 0; rank < kRanks; ++rank) config.devices.push_back(rank);
         config.transport = transport;
+        config.channel_policy = channel_policy;
         communicator_ = create_communicator(config);
         resolved_transport_ = transport::p2p::resolve_ring_transport(transport).resolved_kind();
         for (int rank = 0; rank < kRanks; ++rank) {
@@ -232,7 +234,7 @@ int run_ring_simple_bench_typed(const BenchConfig& config,
         }
 
         AllReduceBenchRunner<T, kDType, kRedOp> runner(
-            sizes.back() / sizeof(T), config.transport);
+            sizes.back() / sizeof(T), config.transport, config.channel_policy);
         for (std::size_t bytes : sizes) {
             std::size_t count = bytes / sizeof(T);
             std::vector<T> host_inputs[kRanks];
@@ -274,6 +276,7 @@ int run_ring_simple_bench_typed(const BenchConfig& config,
             result.dtype = kDType;
             result.redop = kRedOp;
             result.transport = runner.transport();
+            result.channel_policy = config.channel_policy;
             result.bytes = bytes;
             result.count = count;
             result.time_us = time_us;

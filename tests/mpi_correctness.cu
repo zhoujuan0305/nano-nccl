@@ -45,6 +45,7 @@ bool visible_devices(std::vector<int>* devices) {
 struct Options {
     nano_nccl::DType dtype = nano_nccl::DType::Float;
     nano_nccl::TransportKind transport = nano_nccl::TransportKind::Auto;
+    nano_nccl::ChannelPolicy channel_policy = nano_nccl::ChannelPolicy::Forward;
     bool fault_injection = false;
 };
 
@@ -64,6 +65,12 @@ bool parse_options(int argc, char** argv, Options* options) {
             }
         } else if (std::strcmp(argv[index], "--fault-injection") == 0) {
             options->fault_injection = true;
+        } else if (std::strcmp(argv[index], "--channel-policy") == 0) {
+            if (index + 1 == argc ||
+                !nano_nccl::parse_channel_policy(argv[++index],
+                                                  &options->channel_policy)) {
+                return false;
+            }
         } else {
             return false;
         }
@@ -227,7 +234,9 @@ int main(int argc, char** argv) {
     if (!parse_options(argc, argv, &options)) {
         std::fprintf(stderr,
                      "Usage: %s [--dtype float|fp16|bf16] "
-                     "[--transport auto|rdma] [--fault-injection]\n", argv[0]);
+                     "[--transport auto|rdma] "
+                     "[--channel-policy forward|counter_rotating] "
+                     "[--fault-injection]\n", argv[0]);
         return EXIT_FAILURE;
     }
     if (!mpi_ok(MPI_Init(&argc, &argv), "MPI_Init")) return EXIT_FAILURE;
@@ -256,6 +265,7 @@ int main(int argc, char** argv) {
             nano_nccl::CommunicatorConfig config;
             config.devices = devices;
             config.transport = options.transport;
+            config.channel_policy = options.channel_policy;
             communicator = nano_nccl::create_communicator_from_mpi(MPI_COMM_WORLD, config);
             if (options.transport == nano_nccl::TransportKind::Rdma) {
                 ok = communicator->transport() == nano_nccl::TransportKind::Rdma ||

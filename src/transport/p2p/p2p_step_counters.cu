@@ -52,16 +52,33 @@ P2pStepCounters::P2pStepCounters(const RingTransportPlan& plan)
 
 P2pStepCounters::P2pStepCounters(
     const RingTransportPlan& plan,
-    const collective::all_reduce::ProcessTopology& topology)
-    : plan_(plan), topology_(topology) {
+    const collective::all_reduce::ProcessTopology& topology,
+    ChannelPolicy channel_policy)
+    : plan_(plan), topology_(topology), channel_policy_(channel_policy) {
     collective::all_reduce::validate_process_topology(topology_);
     try {
         for (int local_rank = 0; local_rank <
                                   static_cast<int>(topology_.devices.size()); ++local_rank) {
             int global_rank = topology_.local_rank_offset + local_rank;
-            int prev = (global_rank + kRanks - 1) % kRanks;
-            if (plan_.edge_kind(global_rank) != TransportKind::P2p &&
-                plan_.edge_kind(prev) != TransportKind::P2p) {
+            bool needs_counters = false;
+            for (int channel = 0; channel < kChannels; ++channel) {
+                auto direction = collective::all_reduce::ring_direction(
+                    channel_policy_, channel);
+                int next = collective::all_reduce::ring_next(
+                    global_rank, direction, kRanks);
+                int previous = collective::all_reduce::ring_previous(
+                    global_rank, direction, kRanks);
+                int send_edge = collective::all_reduce::ring_edge_index(
+                    global_rank, next, kRanks);
+                int recv_edge = collective::all_reduce::ring_edge_index(
+                    previous, global_rank, kRanks);
+                if (plan_.edge_kind(send_edge) == TransportKind::P2p ||
+                    plan_.edge_kind(recv_edge) == TransportKind::P2p) {
+                    needs_counters = true;
+                    break;
+                }
+            }
+            if (!needs_counters) {
                 continue;
             }
             counters_[global_rank] = new core::DeviceBuffer<std::uint64_t>(
@@ -98,19 +115,27 @@ void P2pStepCounters::reset(const std::vector<cudaStream_t>& streams) {
 
 SimpleControlArgs P2pStepCounters::control_args(int rank) const {
     SimpleControlArgs control{};
-    int prev = (rank + kRanks - 1) % kRanks;
     for (int channel = 0; channel < kChannels; ++channel) {
-        if (plan_.edge_kind(rank) == TransportKind::P2p) {
+        auto direction = collective::all_reduce::ring_direction(
+            channel_policy_, channel);
+        int next = collective::all_reduce::ring_next(rank, direction, kRanks);
+        int previous = collective::all_reduce::ring_previous(
+            rank, direction, kRanks);
+        int send_edge = collective::all_reduce::ring_edge_index(
+            rank, next, kRanks);
+        int recv_edge = collective::all_reduce::ring_edge_index(
+            previous, rank, kRanks);
+        if (plan_.edge_kind(send_edge) == TransportKind::P2p) {
             control.send_head[channel] =
                 counters_[rank]->get() + kHeadOffset + channel;
             control.send_tail[channel] =
-                counters_[(rank + 1) % kRanks]->get() + kTailOffset + channel;
+                counters_[next]->get() + kTailOffset + channel;
         }
-        if (plan_.edge_kind(prev) == TransportKind::P2p) {
+        if (plan_.edge_kind(recv_edge) == TransportKind::P2p) {
             control.recv_tail[channel] =
                 counters_[rank]->get() + kTailOffset + channel;
             control.recv_head[channel] =
-                counters_[prev]->get() + kHeadOffset + channel;
+                counters_[previous]->get() + kHeadOffset + channel;
         }
     }
     if (counters_[rank] != nullptr) {

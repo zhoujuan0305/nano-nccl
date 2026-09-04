@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/buffer.h"
+#include "collective/all_reduce/ring_schedule.h"
 #include "nano_nccl/types.h"
 #include "transport/p2p/p2p_topology.h"
 
@@ -15,7 +16,8 @@ public:
     P2pFifo(std::size_t slot_elems, const RingTransportPlan& plan);
     P2pFifo(
         std::size_t slot_elems, const RingTransportPlan& plan,
-        const collective::all_reduce::ProcessTopology& topology);
+        const collective::all_reduce::ProcessTopology& topology,
+        ChannelPolicy channel_policy = ChannelPolicy::Forward);
     ~P2pFifo();
 
     P2pFifo(const P2pFifo&) = delete;

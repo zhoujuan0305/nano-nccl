@@ -98,12 +98,14 @@ P2pFifo<T>::P2pFifo(std::size_t slot_elems, int nranks)
 
 template <typename T>
 P2pFifo<T>::P2pFifo(std::size_t slot_elems, const RingTransportPlan& plan)
-    : P2pFifo(slot_elems, plan, make_single_process_topology(plan)) {}
+    : P2pFifo(slot_elems, plan, make_single_process_topology(plan),
+              ChannelPolicy::Forward) {}
 
 template <typename T>
 P2pFifo<T>::P2pFifo(
     std::size_t slot_elems, const RingTransportPlan& plan,
-    const collective::all_reduce::ProcessTopology& topology) {
+    const collective::all_reduce::ProcessTopology& topology,
+    ChannelPolicy channel_policy) {
     collective::all_reduce::validate_process_topology(topology);
     try {
         for (int channel = 0; channel < kChannels; ++channel) {
@@ -111,8 +113,15 @@ P2pFifo<T>::P2pFifo(
                 if (plan.edge_kind(edge) != TransportKind::P2p) {
                     continue;
                 }
-                int receiver_global_rank = (edge + 1) % kRanks;
-                if (!collective::all_reduce::is_local_global_rank(topology, edge) ||
+                auto direction = collective::all_reduce::ring_direction(
+                    channel_policy, channel);
+                int source_global_rank = collective::all_reduce::ring_source_for_edge(
+                    edge, direction, kRanks);
+                int receiver_global_rank =
+                    collective::all_reduce::ring_destination_for_edge(
+                        edge, direction, kRanks);
+                if (!collective::all_reduce::is_local_global_rank(
+                        topology, source_global_rank) ||
                     !collective::all_reduce::is_local_global_rank(
                         topology, receiver_global_rank)) {
                     throw std::runtime_error("P2pFifo requires local p2p edges");

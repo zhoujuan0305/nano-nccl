@@ -790,7 +790,7 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
     std::uint64_t recv_step = base_step;
     std::uint64_t send_head_cache = base_step;
     std::uint64_t recv_tail_cache = base_step;
-    int ring_ix = args.rank;
+    int ring_ix = args.ring_index[channel];
     float inverse_nranks = 1.0f;
     if constexpr (kRedOp == RedOp::Avg) {
         inverse_nranks = 1.0f / static_cast<float>(nranks);

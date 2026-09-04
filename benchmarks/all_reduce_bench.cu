@@ -52,7 +52,8 @@ void usage(const char* argv0) {
                   "Usage: %s [--algo auto|ring_simple] "
                   "[--dtype float|fp16|bf16] "
                   "[--redop sum|avg|max|min] "
-                   "[--transport auto|shm|p2p|rdma] "
+                  "[--transport auto|shm|p2p|rdma] "
+                  "[--channel-policy forward|counter_rotating] "
                  "[-b bytes] [-e bytes] [-f factor] [-w warmup] [-n iters]\n",
                  argv0);
 }
@@ -104,6 +105,7 @@ int run_mpi_bench_typed(const nano_nccl::BenchConfig& config,
         nano_nccl::CommunicatorConfig communicator_config;
         communicator_config.devices = devices;
         communicator_config.transport = config.transport;
+        communicator_config.channel_policy = config.channel_policy;
         std::unique_ptr<nano_nccl::Communicator> communicator =
             nano_nccl::create_communicator_from_mpi(MPI_COMM_WORLD,
                                                     communicator_config);
@@ -230,6 +232,7 @@ int run_mpi_bench_typed(const nano_nccl::BenchConfig& config,
                 result.dtype = kDType;
                 result.redop = config.redop;
                 result.transport = transport;
+                result.channel_policy = config.channel_policy;
                 result.bytes = bytes;
                 result.count = count;
                 result.time_us = max_time_us;
@@ -346,6 +349,13 @@ int main(int argc, char** argv) {
                 usage(argv[0]);
                 return 2;
             }
+        } else if (std::strcmp(argv[i], "--channel-policy") == 0) {
+            if (i + 1 >= argc ||
+                !nano_nccl::parse_channel_policy(argv[++i],
+                                                  &config.channel_policy)) {
+                usage(argv[0]);
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "-b") == 0) {
             if (!read_size_arg(argc, argv, &i, &config.min_bytes)) {
                 usage(argv[0]);
@@ -393,10 +403,11 @@ int main(int argc, char** argv) {
 
     if (mpi_rank == 0) {
         std::printf("# nano-nccl all_reduce_bench\n");
-        std::printf("# algo %s dtype %s redop %s transport %s nGpus %d warmup iters: %d iters: %d validation: 1\n",
+        std::printf("# algo %s dtype %s redop %s transport %s channel_policy %s nGpus %d warmup iters: %d iters: %d validation: 1\n",
                     config.algo.c_str(), nano_nccl::dtype_name(config.dtype),
                     nano_nccl::redop_name(config.redop),
                     nano_nccl::transport_name(config.transport),
+                    nano_nccl::channel_policy_name(config.channel_policy),
                     nano_nccl::kRanks, config.warmup_iters, config.iters);
         std::printf("# %14s %8s %8s %10s %12s %12s %10s %10s %10s %8s %12s\n", "algo",
                     "dtype", "redop", "transport", "size(B)", "count", "time(us)", "algbw",
