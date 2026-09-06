@@ -120,7 +120,8 @@ if(NANO_NCCL_ENABLE_MPI)
                          ${CMAKE_SOURCE_DIR}/src/transport/rdma/rdma_gdr.cc
                          ${CMAKE_SOURCE_DIR}/src/CMakeLists.txt
                          ${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
-                         ${CMAKE_SOURCE_DIR}/src/collective/all_reduce/communicator.cu)
+                         ${CMAKE_SOURCE_DIR}/src/collective/all_reduce/communicator.cu
+                         ${CMAKE_CURRENT_SOURCE_DIR}/rdma_gdr.cu)
 
         add_executable(nano_nccl_rdma_gdr rdma_gdr.cu)
         target_link_libraries(nano_nccl_rdma_gdr PRIVATE nano_nccl ${IBVERBS_LIBRARY} CUDA::cuda_driver)
@@ -155,6 +156,14 @@ if(NANO_NCCL_ENABLE_MPI)
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/rdma_proxy_send_visibility_static.py
                          ${CMAKE_SOURCE_DIR}/src/transport/rdma/rdma_proxy.cc)
+
+        add_test(NAME nano_nccl_rdma_proxy_gdr_receive_flush_static
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/rdma_proxy_gdr_receive_flush_static.py
+                         ${CMAKE_SOURCE_DIR}/src/transport/rdma/rdma_proxy.h
+                         ${CMAKE_SOURCE_DIR}/src/transport/rdma/rdma_proxy.cc
+                         ${CMAKE_SOURCE_DIR}/src/collective/all_reduce/communicator.cu
+                         ${CMAKE_SOURCE_DIR}/src/transport/rdma/rdma_gdr.cc)
 
         add_test(NAME nano_nccl_rdma_proxy_zero_byte_static
                  COMMAND ${Python3_EXECUTABLE}

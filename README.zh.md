@@ -2,13 +2,13 @@
 
 [English](README.md)
 
-面向单机多 GPU 的 All Reduce 通信库，目标是达到 NCCL `Ring` + `Simple` + 4 channels 的性能；可选 MPI/socket 与 MPI/RDMA 多机 `all_reduce` 路径。RDMA 仅 host-pin（无 GPUDirect RDMA）；默认 SEND/RECV，可用 `NANO_NCCL_RDMA_USE_WRITE=1` 启用 WRITE+CTS。
+面向单机多 GPU 的 All Reduce 通信库，目标是达到 NCCL `Ring` + `Simple` + 4 channels 的性能；可选 MPI/socket 与 MPI/RDMA 多机 `all_reduce` 路径。RDMA 默认使用 host-pinned FIFO，可用 `NANO_NCCL_RDMA_GDR=1` 显式启用 host-proxy GPUDirect RDMA；数据面默认 SEND/RECV，可用 `NANO_NCCL_RDMA_USE_WRITE=1` 启用 WRITE+CTS。
 
 ---
 
 ## 性能
 
-[详细的单机性能结果](performance.md)记录了测试拓扑、环境，以及进程内 auto（P2P/SHM），以及两机 TCP socket 与 host-pinned RDMA 相对 NCCL 的逐点对比；另含两机 RDMA GDR（`float` / FP16 / BF16 × `sum` / `avg` / `max` / `min`）。
+[详细性能结果](performance.md)记录了测试拓扑、环境，以及进程内 auto（P2P/SHM）、两机 TCP socket、host-pinned RDMA 和两机 RDMA GDR 相对 NCCL 的逐点对比（`float` / FP16 / BF16 × `sum` / `avg` / `max` / `min`）。
 
 ---
 
@@ -44,9 +44,10 @@ cmake .. -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=8
 - `build-mpi/tests/nano_nccl_socket_protocol` — socket framing 与 proxy 测试（MPI 构建）
 - `build-rdma/tests/nano_nccl_rdma_protocol` — RDMA 协议布局测试（MPI/RDMA 构建）
 - `build-rdma/tests/nano_nccl_rdma_bootstrap` — 本地 RC QP bootstrap 冒烟测试（MPI/RDMA 构建）
+- `build-rdma/tests/nano_nccl_rdma_gdr` — GDR device registration 与 receive-flush capability 测试（MPI/RDMA 构建）
 
 启用 `BUILD_TESTING`（默认开启）时，`ctest --test-dir build
---output-on-failure` 还会运行 BF16 capability-validation 和 benchmark profiling 的静态回归检查。
+--output-on-failure` 还会运行 BF16 capability-validation 和 benchmark profiling 的静态回归检查，包括 CQE -> GDR flush -> `recv_tail` 发布顺序检查。
 
 ### CMake 选项
 
@@ -84,12 +85,17 @@ cmake --build build-mpi -j$(nproc)
 send/receive；host proxy 按 Simple FIFO slice 深度 multi-flight 提交 SEND/RECV，
 并对 CQ 做 selective signaling。Simple 协议末尾空 slice 不再走网络往返。设置
 `NANO_NCCL_RDMA_USE_WRITE=1` 可选用 WRITE+CTS 数据面（RC `WRITE_WITH_IMM` +
-host-pinned CTS slot ring）；未设置/`0` 保持 SEND/RECV。两种数据面均为 host-pin，
-  不使用 GPUDirect RDMA；与 NCCL 对比时请设 `NCCL_NET_GDR_LEVEL=0`。SEND 与
-  WriteCts 始终从已注册的 mapped FIFO（`fifo_mr_`）直接 post SGE。worker 写完并
-  block sync 后，publisher 以 `st.release.sys` 推进 `send_tail`，proxy 侧
-  acquire 加载（无 host bounce 路径）。单机 4-rank WRITE+CTS 相对 NCCL GDR=0
-  NET/IB（float/fp16/bf16 × sum/avg/max/min，256 KiB–64 MiB）见
+host-pinned CTS slot ring）；未设置/`0` 保持 SEND/RECV。设置
+`NANO_NCCL_RDMA_GDR=1` 可将数据 FIFO 放在已注册 GPU 内存中，host proxy
+仍负责 post。GDR 是显式请求：注册或 receive visibility 能力不可用时会在
+setup 阶段失败，不回退到 host-pinned 内存。host-pinned 路径与 NCCL GDR=0 对比，
+GDR 路径则在两边都启用 GDR。SEND 与 WriteCts 从已注册 FIFO（`fifo_mr_`）直接
+post SGE。worker 写完并 block sync 后，publisher 以 `st.release.sys` 推进
+`send_tail`，proxy 侧 acquire 加载（无 host bounce 路径）。GDR receive
+完成后，若设备不提供原生 GPU/RDMA write ordering，proxy 会先调用 CUDA
+GPUDirect ordering API flush，再发布 `recv_tail`。system-scope counter ordering 不能
+取代这个 receive-data flush。host-pinned 与 GDR WRITE+CTS 矩阵
+  （float/fp16/bf16 × sum/avg/max/min，256 KiB–64 MiB）见
   [performance.md](performance.md)，`#wrong=0`（默认 dedicated progress；可用
   env 切 shared）。MPI binding 使用
   MPI C API，因此 Open MPI 不需要提供已废弃的 C++ binding library。
@@ -105,8 +111,8 @@ cmake --build build-rdma -j$(nproc)
 `NANO_NCCL_RDMA_IFNAME=<rdma-interface>`。默认 GID 不可路由时，设置
 `NANO_NCCL_RDMA_GID_INDEX=<gid-index>`。使用 `--transport rdma`；跨进程 ring edge
 使用 RDMA，本机 edge 按 `auto` 解析（双向 NVLink peer access 时用 P2P，否则
-SHM），因此聚合 transport 通常显示为 `mixed`。与 NCCL 公平对比时使用
-`NCCL_NET_GDR_LEVEL=0`（同属 host-pin）。请将 Open MPI 的 TCP/OOB 绑定到
+SHM），因此聚合 transport 通常显示为 `mixed`。host-pinned 对比使用
+`NCCL_NET_GDR_LEVEL=0`；GDR 对比需在两边都启用 GDR。请将 Open MPI 的 TCP/OOB 绑定到
 bootstrap 网卡（`btl_tcp_if_include` / `oob_tcp_if_include`），避免选到不可路由
 网卡。
 
@@ -250,13 +256,15 @@ unsupported-operation 错误。
   ring edge 使用 multi-flight RC RDMA（深度不超过 Simple FIFO slice，selective CQ
   signal，空 slice 跳过网络），本机 edge 按 `auto` 解析（双向 NVLink peer access
   时用 P2P，否则 SHM）。默认数据面为 SEND/RECV；`NANO_NCCL_RDMA_USE_WRITE=1`
-  选用 WRITE+CTS（仍为 host-pin；与 NCCL 公平对比请用 `NCCL_NET_GDR_LEVEL=0`）。
+  选用 WRITE+CTS。`NANO_NCCL_RDMA_GDR=1` 将数据 FIFO 移到已注册 GPU 内存，
+  但仍由 host proxy progress；不支持的 GDR setup 会显式失败。
   双机须同一 commit（64 字节 `RdmaPeerInfo`）。SEND/WriteCts 从已注册 mapped
   FIFO 直接 post；worker 写完并 block sync 后 publisher 以 `st.release.sys`
   推进 `send_tail`（host acquire；无 host bounce）。小 Simple slice 可在消费完
   recv FIFO 后立刻 `post_recv_credit`。跨进程 RDMA edge 默认每条 proxy 独立
   host 线程；设 `NANO_NCCL_RDMA_SHARED_PROGRESS=1` 可改为单线程 shared
-  progress。单机 4-rank WRITE+CTS 相对 NCCL GDR=0 NET/IB 见
+  progress。GDR receive 在原生 GPU/RDMA write ordering 不足时，会在发布
+  `recv_tail` 前 flush。host-pinned 与 GDR WRITE+CTS 对比见
   [performance.md](performance.md)。
 
 P2P 是单机通信路径，需要每对完整配置环邻居之间的双向 CUDA peer access；它不是多机或网络通信路径。socket 使用可信、仅 IPv4 的 TCP 网络边界，不提供 TLS 或自动重连。
@@ -281,13 +289,13 @@ transport runtime lifecycle 与 orchestration 仍由 `Communicator::Impl` 管理
 
 当前仅支持：
 
-- 单机多 GPU 性能路径（已验证 `CUDA_VISIBLE_DEVICES=0,1,2,3`）；[performance.md](performance.md) 点表覆盖进程内 auto、4-rank socket、4-rank host-pinned RDMA
+- 单机与 scoped 两机多 GPU 性能路径；已验证矩阵与精确拓扑见 [performance.md](performance.md)
 - SM70+ 上的 `float` 和 FP16（`fp16`），以及 SM80+ 上的 BF16（`bf16`）
-- `sum`、`avg`、`max`、`min` 规约操作；`avg` 为 `sum / nranks`，`max`/`min` 会传播 NaN
+- `sum`、`avg`、`max`、`min` 规约操作；`avg` 为 `sum / nranks`。Float `max`/`min` 会传播 NaN，packed FP16/BF16 `max`/`min` 当前存在已知的单 NaN 传播问题
 - out-of-place
-- SHM FIFO、device P2P FIFO，以及跨进程 ring edge 的可选 MPI/socket 或 MPI/RDMA；P2P 仅单机；RDMA 为 host-pin RC（无 GPUDirect RDMA）
+- SHM FIFO、device P2P FIFO，以及跨进程 ring edge 的可选 MPI/socket 或 MPI/RDMA；P2P 仅单机；RDMA 支持 host-pinned FIFO 与显式启用的 host-proxy GDR
 
-已发布的性能表仅覆盖单机。socket 为 loopback TCP；RDMA 以 NCCL `NCCL_NET_GDR_LEVEL=0` 且关闭 P2P/SHM 为对比基线。本项目不是通用 NCCL 替代品。
+性能表会标明 transport class 及匹配的 NCCL GDR 设置。本项目不是通用 NCCL 替代品。
 
 未来计划扩展：
 

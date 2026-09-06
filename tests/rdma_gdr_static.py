@@ -39,6 +39,14 @@ def main() -> int:
         require(text, "RdmaMemoryPlacement::GpuDirect", "communicator GpuDirect branch")
         require(text, "register_device", "communicator register_device")
         require(text, "DeviceBuffer", "communicator device FIFO")
+    for path in sys.argv[3:]:
+        if Path(path).name != "rdma_gdr.cu":
+            continue
+        text = Path(path).read_text()
+        if text.count("CUDA_CHECK_THROW(cudaFree(device))") != 2:
+            raise AssertionError(
+                "GDR test must free device memory only after MR teardown or stack unwind"
+            )
     return 0
 
 

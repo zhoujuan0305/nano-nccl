@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 
@@ -79,12 +80,28 @@ def render_section(name: str, body: dict) -> str:
             ]
         )
     elif name == "rdma_gdr":
+        ratios = [
+            row["ratio"]
+            for dtype in ("float", "fp16", "bf16")
+            for redop in ("sum", "avg", "max", "min")
+            for row in body.get(dtype, {}).get(redop, [])
+        ]
         parts.extend(
             [
-                "Same 2x4 topology as the host-pinned RDMA table. Nano `--transport rdma` with `NANO_NCCL_RDMA_USE_WRITE=1` and `NANO_NCCL_RDMA_GDR=1` (WRITE+CTS from a registered GPU FIFO; host proxy still posts). NCCL: Ring+Simple, `NCCL_NET_GDR_LEVEL=LOC`. Collapsed NCCL 256 KiB OOP cells were re-run isolated. This is host-proxy GDR, not GPU-initiated IBGDA.",
+                "Same 2x4 topology as the host-pinned RDMA table. Nano `--transport rdma` with `NANO_NCCL_RDMA_USE_WRITE=1` and `NANO_NCCL_RDMA_GDR=1` (WRITE+CTS from a registered GPU FIFO; host proxy still posts). After a receive CQE, nano flushes third-party GDR writes before publishing `recv_tail` when the device lacks native GPU/RDMA write ordering. NCCL: Ring+Simple with `NCCL_NET_GDR_LEVEL=SYS`; debug logs confirmed `/GDRDMA` on the cross-host edges. Each cell is the median of five complete, alternating-order repetitions; no isolated retries replace matrix samples. This is host-proxy GDR, not GPU-initiated IBGDA.",
                 "",
             ]
         )
+        if ratios:
+            geomean = math.exp(sum(math.log(ratio) for ratio in ratios) / len(ratios))
+            parts.extend(
+                [
+                    f"Across {len(ratios)} dtype/op/size cells, nano/NCCL busbw geomean is {geomean:.3f}; the minimum cell is {min(ratios):.3f}, with {sum(ratio < 0.90 for ratio in ratios)} cells below 0.90.",
+                    "",
+                    "No accepted GDR nano baseline exists, so the formal 3% baseline-regression gate is not adjudicated. Cells below NCCL remain `Unknown` performance gaps until controlled causal experiments explain them. The existing packed FP16/BF16 `max`/`min` single-NaN propagation failure is unchanged in GDR=0 and GDR=1; these tables validate their ordinary benchmark inputs but do not establish complete dtype/redop contract correctness.",
+                    "",
+                ]
+            )
     for dtype in ("float", "fp16", "bf16"):
         if dtype not in body:
             continue
@@ -147,7 +164,8 @@ def render(doc: dict) -> str:
         "message sizes 256 KiB through 64 MiB, `-w 5`, and `-n 20`. "
         "NCCL uses `Ring`, `Simple`, four channels, and a 32 MiB buffer. "
         "RDMA WRITE+CTS posts from the registered mapped FIFO (no host bounce; "
-        "visibility via publisher `st.release.sys(send_tail)` after block sync and host acquire loads)."
+        "publication via publisher `st.release.sys(send_tail)` after block sync and host acquire loads). "
+        "The GDR table reports the median of five full-matrix repetitions for each implementation."
     )
     out.append("")
 
@@ -161,8 +179,8 @@ def render(doc: dict) -> str:
     out.append(
         "Build nano-nccl with CUDA 12.8, SM86, Release mode, and profiling disabled. "
         "The in-process auto binary uses four ranks in one process. "
-        "Socket and RDMA tables use four MPI ranks (`NANO_NCCL_NRANKS=4`, one GPU per rank) "
-        "from the same Open MPI 4.1.2 prefix."
+        "The two-host Socket and RDMA tables use one MPI process with four GPUs per host "
+        "and a global `NANO_NCCL_NRANKS=8`, from the same Open MPI 4.1.2 prefix."
     )
     out.append("")
     out.append("```bash")
@@ -183,18 +201,27 @@ def render(doc: dict) -> str:
     out.append("```")
     out.append("")
     out.append(
-        "For single-host socket, launch four MPI ranks with one GPU each "
-        "(`CUDA_VISIBLE_DEVICES=$OMPI_COMM_WORLD_LOCAL_RANK`). Nano uses `--transport auto` "
+        "For the socket runs, launch one MPI process with four visible GPUs per host. "
+        "Nano uses `--transport auto` "
         "(cross-process edges are socket). NCCL sets `NCCL_P2P_DISABLE=1`, `NCCL_SHM_DISABLE=1`, "
         "and `NCCL_IB_DISABLE=1`."
     )
     out.append("")
     out.append(
-        "For single-host RDMA, the same 4-rank launch uses nano `--transport rdma` and "
+        "For host-pinned RDMA, use nano `--transport rdma` with "
         "`NANO_NCCL_RDMA_USE_WRITE=1`. Set `NANO_NCCL_SOCKET_IFNAME=<interface>` for bootstrap "
         "and `NANO_NCCL_RDMA_IFNAME=<rdma-interface>` (and `NANO_NCCL_RDMA_GID_INDEX` when required). "
         "NCCL sets `NCCL_P2P_DISABLE=1`, `NCCL_SHM_DISABLE=1`, `NCCL_NET_GDR_LEVEL=0`, "
         "`NCCL_IB_HCA=<rdma-hca>`, and `NCCL_IB_GID_INDEX` when required."
+    )
+    out.append("")
+    out.append(
+        "For the two-host GDR matrix, build both hosts for eight ranks and launch one MPI process "
+        "per host with four visible GPUs. Add `NANO_NCCL_RDMA_GDR=1` for nano and use "
+        "`NCCL_NET_GDR_LEVEL=SYS` for NCCL. Run `nano_nccl_rdma_gdr` before the matrix; nano's "
+        "explicit GDR request fails instead of falling back, but its benchmark currently reports only "
+        "the aggregate `mixed` transport rather than the required per-edge placement. Verify "
+        "`/GDRDMA` in NCCL debug output."
     )
     out.append("")
     out.append("```bash")

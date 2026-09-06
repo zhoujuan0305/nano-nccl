@@ -1,6 +1,7 @@
 #pragma once
 
 #include "transport/rdma/rdma_endpoint.h"
+#include "transport/rdma/rdma_gdr.h"
 #include "transport/rdma/rdma_protocol.h"
 #include "transport/rdma/rdma_qp.h"
 
@@ -202,13 +203,15 @@ public:
                   RdmaRecvControl control, RdmaProxyIdentity identity,
                   int fifo_numa_node,
                   std::shared_ptr<RdmaAsyncErrorState> errors,
-                  bool elide_zero_payload = false);
+                  bool elide_zero_payload = false,
+                  RdmaGdrReceiveFlush gdr_receive_flush = {});
     RdmaRecvProxy(RdmaQp qp, ibv_mr* fifo_mr, RdmaProxyFifo fifo,
                   RdmaRecvControl control, RdmaProxyIdentity identity,
                   int fifo_numa_node,
                   std::shared_ptr<RdmaAsyncErrorState> errors,
                   RdmaDataPlane plane, RdmaCtsRemote cts_remote,
-                  bool elide_zero_payload = false);
+                  bool elide_zero_payload = false,
+                  RdmaGdrReceiveFlush gdr_receive_flush = {});
     ~RdmaRecvProxy();
     RdmaRecvProxy(const RdmaRecvProxy&) = delete;
     RdmaRecvProxy& operator=(const RdmaRecvProxy&) = delete;
@@ -253,6 +256,7 @@ private:
     RdmaProxyIdentity identity_;
     int fifo_numa_node_;
     std::shared_ptr<RdmaAsyncErrorState> errors_;
+    RdmaGdrReceiveFlush gdr_receive_flush_;
     RdmaDataPlane plane_ = RdmaDataPlane::SendRecv;
     RdmaCtsRemote cts_remote_{};
     bool elide_zero_payload_ = false;

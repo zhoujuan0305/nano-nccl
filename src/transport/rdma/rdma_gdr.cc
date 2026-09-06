@@ -1,4 +1,5 @@
 #include "transport/rdma/rdma_gdr.h"
+#include "core/buffer.h"
 
 #include <cerrno>
 #include <cstdlib>
@@ -58,6 +59,47 @@ RdmaMemoryPlacement parse_rdma_memory_placement_env() {
         return RdmaMemoryPlacement::GpuDirect;
     }
     throw std::runtime_error("NANO_NCCL_RDMA_GDR must be 0 or 1");
+}
+
+RdmaGdrReceiveFlush RdmaGdrReceiveFlush::for_device(int device) {
+    int native_ordering = 0;
+    CUDA_CHECK_THROW(cudaDeviceGetAttribute(
+        &native_ordering, cudaDevAttrGPUDirectRDMAWritesOrdering, device));
+    const bool required =
+        native_ordering < cudaGPUDirectRDMAWritesOrderingOwner;
+    if (!required) {
+        return RdmaGdrReceiveFlush(device, false);
+    }
+
+    int flush_options = 0;
+    CUDA_CHECK_THROW(cudaDeviceGetAttribute(
+        &flush_options, cudaDevAttrGPUDirectRDMAFlushWritesOptions, device));
+    if ((flush_options & cudaFlushGPUDirectRDMAWritesOptionHost) == 0) {
+        throw std::runtime_error(
+            "GPUDirect RDMA receive requires a host write flush, but the CUDA "
+            "device does not support cudaDeviceFlushGPUDirectRDMAWrites");
+    }
+
+    RdmaGdrReceiveFlush result(device, true);
+    result.flush();
+    return result;
+}
+
+void RdmaGdrReceiveFlush::flush() const {
+    if (!required_) return;
+    try {
+        int current_device = -1;
+        CUDA_CHECK_THROW(cudaGetDevice(&current_device));
+        if (current_device != device_) {
+            CUDA_CHECK_THROW(cudaSetDevice(device_));
+        }
+        CUDA_CHECK_THROW(cudaDeviceFlushGPUDirectRDMAWrites(
+            cudaFlushGPUDirectRDMAWritesTargetCurrentDevice,
+            cudaFlushGPUDirectRDMAWritesToOwner));
+    } catch (const std::exception& ex) {
+        throw std::runtime_error(
+            std::string("backend=rdma/gdr receive flush failed: ") + ex.what());
+    }
 }
 
 RdmaRegisteredMemory::RdmaRegisteredMemory(ibv_mr* mr, void* addr,

@@ -570,6 +570,7 @@ private:
             transport::socket::SocketHello hello{};
             bool is_send = false;
             bool is_recv = false;
+            int device = -1;
             int fifo_numa_node = -1;
             RdmaChannelResources* resources = nullptr;
             transport::rdma::RdmaPeerInfo local_info{};
@@ -628,6 +629,7 @@ private:
             item.hello = hello;
             item.is_send = is_send;
             item.is_recv = is_recv;
+            item.device = devices_[local];
             item.fifo_numa_node = fifo_numa_node;
             item.resources = &r;
             item.local_info = local_info;
@@ -717,6 +719,19 @@ private:
                             identity, fifo_numa_node, rdma_errors_));
                 }
             } else {
+                transport::rdma::RdmaGdrReceiveFlush gdr_receive_flush;
+                if (placement == transport::rdma::RdmaMemoryPlacement::GpuDirect) {
+                    try {
+                        gdr_receive_flush =
+                            transport::rdma::RdmaGdrReceiveFlush::for_device(
+                                item.device);
+                    } catch (const std::exception& ex) {
+                        throw std::runtime_error(
+                            "rdma GDR receive flush setup failed for edge " +
+                            std::to_string(edge) + " backend=rdma/gdr: " +
+                            ex.what());
+                    }
+                }
                 if (write_cts) {
                     transport::rdma::RdmaCtsRemote cts_remote{};
                     cts_remote.remote_cts_addr = remote_info.cts_fifo_addr;
@@ -733,14 +748,16 @@ private:
                             transport::rdma::RdmaRecvControl{
                                 r.control.host_ptr(), r.control.host_ptr() + 1},
                             identity, fifo_numa_node, rdma_errors_,
-                            transport::rdma::RdmaDataPlane::WriteCts, cts_remote));
+                            transport::rdma::RdmaDataPlane::WriteCts, cts_remote,
+                            false, gdr_receive_flush));
                 } else {
                     rdma_recv_proxies_.push_back(
                         std::make_unique<transport::rdma::RdmaRecvProxy>(
                             std::move(*qp_taken), r.fifo_mr_raw, fifo,
                             transport::rdma::RdmaRecvControl{
                                 r.control.host_ptr(), r.control.host_ptr() + 1},
-                            identity, fifo_numa_node, rdma_errors_));
+                            identity, fifo_numa_node, rdma_errors_, false,
+                            gdr_receive_flush));
                 }
             }
             rdma_ready_connections.push_back(std::move(item.connection));

@@ -3,6 +3,7 @@
 // Env: NANO_NCCL_RDMA_IFNAME, optional NANO_NCCL_RDMA_GID_INDEX.
 // Exit: 0 PASS, 1 FAIL, 77 SKIP.
 
+#include "core/buffer.h"
 #include "transport/rdma/rdma_endpoint.h"
 #include "transport/rdma/rdma_gdr.h"
 
@@ -18,18 +19,10 @@
 namespace {
 
 using nano_nccl::transport::rdma::RdmaEndpoint;
+using nano_nccl::transport::rdma::RdmaGdrReceiveFlush;
 using nano_nccl::transport::rdma::RdmaMemoryPlacement;
 using nano_nccl::transport::rdma::RdmaRegisteredMemory;
 using nano_nccl::transport::rdma::parse_rdma_memory_placement_env;
-
-#define CUDA_OR_THROW(expr)                                                    \
-    do {                                                                       \
-        cudaError_t err = (expr);                                              \
-        if (err != cudaSuccess) {                                              \
-            throw std::runtime_error(std::string(#expr) + ": " +               \
-                                     cudaGetErrorString(err));                 \
-        }                                                                      \
-    } while (0)
 
 }  // namespace
 
@@ -55,26 +48,39 @@ int main() {
 
         RdmaEndpoint endpoint = RdmaEndpoint::create_from_environment();
         constexpr std::size_t kBytes = 4096;
+        int device_ordinal = -1;
+        CUDA_CHECK_THROW(cudaGetDevice(&device_ordinal));
         void* device = nullptr;
-        CUDA_OR_THROW(cudaMalloc(&device, kBytes));
-        CUDA_OR_THROW(cudaMemset(device, 0x5a, kBytes));
-        CUDA_OR_THROW(cudaDeviceSynchronize());
+        CUDA_CHECK_THROW(cudaMalloc(&device, kBytes));
+        CUDA_CHECK_THROW(cudaMemset(device, 0x5a, kBytes));
+        CUDA_CHECK_THROW(cudaDeviceSynchronize());
 
         try {
             RdmaRegisteredMemory mem = RdmaRegisteredMemory::register_device(
                 endpoint.pd(), device, kBytes);
             if (mem.mr() == nullptr || mem.rkey() == 0 || !mem.is_device()) {
-                std::fprintf(stderr, "device MR incomplete\n");
-                CUDA_OR_THROW(cudaFree(device));
-                return 1;
+                throw std::runtime_error("device MR incomplete");
             }
             if (mem.addr() != device) {
-                std::fprintf(stderr, "device MR addr mismatch\n");
-                CUDA_OR_THROW(cudaFree(device));
-                return 1;
+                throw std::runtime_error("device MR addr mismatch");
             }
+            RdmaGdrReceiveFlush receive_flush =
+                RdmaGdrReceiveFlush::for_device(device_ordinal);
+            int native_ordering = 0;
+            CUDA_CHECK_THROW(cudaDeviceGetAttribute(
+                &native_ordering, cudaDevAttrGPUDirectRDMAWritesOrdering,
+                device_ordinal));
+            const bool expected_flush =
+                native_ordering < cudaGPUDirectRDMAWritesOrderingOwner;
+            if (receive_flush.required() != expected_flush) {
+                throw std::runtime_error(
+                    "GDR receive flush requirement mismatch: actual=" +
+                    std::to_string(receive_flush.required() ? 1 : 0) +
+                    " expected=" + std::to_string(expected_flush ? 1 : 0));
+            }
+            receive_flush.flush();
         } catch (const std::exception& ex) {
-            CUDA_OR_THROW(cudaFree(device));
+            CUDA_CHECK_THROW(cudaFree(device));
             const char* msg = ex.what();
             if (std::strstr(msg, "unavailable") != nullptr) {
                 std::fprintf(stderr, "SKIP: %s\n", msg);
@@ -83,7 +89,7 @@ int main() {
             std::fprintf(stderr, "register_device: %s\n", msg);
             return 1;
         }
-        CUDA_OR_THROW(cudaFree(device));
+        CUDA_CHECK_THROW(cudaFree(device));
         std::printf("rdma_gdr=PASS\n");
         return 0;
     } catch (const std::exception& ex) {

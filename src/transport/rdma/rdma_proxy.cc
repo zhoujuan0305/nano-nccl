@@ -795,20 +795,23 @@ RdmaRecvProxy::RdmaRecvProxy(RdmaQp qp, ibv_mr* fifo_mr, RdmaProxyFifo fifo,
                              RdmaRecvControl control, RdmaProxyIdentity identity,
                              int fifo_numa_node,
                              std::shared_ptr<RdmaAsyncErrorState> errors,
-                             bool elide_zero_payload)
+                             bool elide_zero_payload,
+                             RdmaGdrReceiveFlush gdr_receive_flush)
     : RdmaRecvProxy(std::move(qp), fifo_mr, fifo, control, identity,
                     fifo_numa_node, std::move(errors), RdmaDataPlane::SendRecv,
-                    RdmaCtsRemote{}, elide_zero_payload) {}
+                    RdmaCtsRemote{}, elide_zero_payload, gdr_receive_flush) {}
 
 RdmaRecvProxy::RdmaRecvProxy(RdmaQp qp, ibv_mr* fifo_mr, RdmaProxyFifo fifo,
                              RdmaRecvControl control, RdmaProxyIdentity identity,
                              int fifo_numa_node,
                              std::shared_ptr<RdmaAsyncErrorState> errors,
                              RdmaDataPlane plane, RdmaCtsRemote cts_remote,
-                             bool elide_zero_payload)
+                             bool elide_zero_payload,
+                             RdmaGdrReceiveFlush gdr_receive_flush)
     : qp_(std::move(qp)), fifo_mr_(fifo_mr), fifo_(fifo), control_(control),
       identity_(identity), fifo_numa_node_(fifo_numa_node),
-      errors_(std::move(errors)), plane_(plane), cts_remote_(cts_remote),
+      errors_(std::move(errors)), gdr_receive_flush_(gdr_receive_flush),
+      plane_(plane), cts_remote_(cts_remote),
       elide_zero_payload_(elide_zero_payload) {
     validate_fifo(fifo_);
     if (qp_.qp() == nullptr || fifo_mr_ == nullptr ||
@@ -1151,6 +1154,12 @@ bool RdmaRecvProxy::progress_send_recv() noexcept {
             if (n < 0) {
                 throw std::runtime_error("ibv_poll_cq failed");
             }
+            if (n > 0) {
+                // A recv CQE does not make RNIC PCIe writes visible to a
+                // concurrently running GPU kernel. Flush before publishing
+                // recv_tail through the CPU-release/GPU-acquire control path.
+                gdr_receive_flush_.flush();
+            }
             for (int i = 0; i < n; ++i) {
                 check_wc(wcs[i], identity_, next_complete_step_, errors_.get());
                 const std::uint64_t slot = RdmaQp::wr_id_to_slot(wcs[i].wr_id);
@@ -1230,6 +1239,20 @@ bool RdmaRecvProxy::progress_write_cts() noexcept {
             const int n = ibv_poll_cq(qp_.cq(), kPollBatch, wcs);
             if (n < 0) {
                 throw std::runtime_error("ibv_poll_cq failed");
+            }
+            bool has_data_completion = false;
+            for (int i = 0; i < n; ++i) {
+                if (wcs[i].status == IBV_WC_SUCCESS &&
+                    !is_cts_wr_id(wcs[i].wr_id) &&
+                    wcs[i].opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+                    has_data_completion = true;
+                    break;
+                }
+            }
+            if (has_data_completion) {
+                // CTS send completions need no flush; only received GPU data
+                // must become visible before recv_tail publication.
+                gdr_receive_flush_.flush();
             }
             for (int i = 0; i < n; ++i) {
                 check_wc(wcs[i], identity_, next_complete_step_, errors_.get());

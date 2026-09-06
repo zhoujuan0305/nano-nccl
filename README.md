@@ -2,13 +2,13 @@
 
 [中文说明](README.zh.md)
 
-A GPU collective communication library for single-host multi-GPU All Reduce, targeting NCCL `Ring` + `Simple` + 4 channels performance. Optional MPI/socket and MPI/RDMA paths support multi-host `all_reduce` runs; RDMA is host-pin only (no GPUDirect RDMA); default SEND/RECV, optional WRITE+CTS via `NANO_NCCL_RDMA_USE_WRITE=1`.
+A GPU collective communication library for single-host multi-GPU All Reduce, targeting NCCL `Ring` + `Simple` + 4 channels performance. Optional MPI/socket and MPI/RDMA paths support multi-host `all_reduce` runs. RDMA defaults to a host-pinned FIFO, with opt-in host-proxy GPUDirect RDMA via `NANO_NCCL_RDMA_GDR=1`; the data plane defaults to SEND/RECV, with optional WRITE+CTS via `NANO_NCCL_RDMA_USE_WRITE=1`.
 
 ---
 
 ## Performance
 
-[Detailed single-host performance results](performance.md) record the tested topology, environment, and point-by-point NCCL comparisons for in-process auto (P2P/SHM) plus two-host TCP socket and host-pinned RDMA plus two-host RDMA GDR (`float` / FP16 / BF16 × `sum` / `avg` / `max` / `min`).
+[Detailed performance results](performance.md) record the tested topology, environment, and point-by-point NCCL comparisons for in-process auto (P2P/SHM), two-host TCP socket, host-pinned RDMA, and two-host RDMA GDR (`float` / FP16 / BF16 × `sum` / `avg` / `max` / `min`).
 
 ---
 
@@ -44,10 +44,12 @@ Build artifacts:
 - `build-mpi/tests/nano_nccl_socket_protocol` — socket framing and proxy test (MPI build)
 - `build-rdma/tests/nano_nccl_rdma_protocol` — RDMA protocol-layout test (MPI/RDMA build)
 - `build-rdma/tests/nano_nccl_rdma_bootstrap` — local RC QP bootstrap smoke test (MPI/RDMA build)
+- `build-rdma/tests/nano_nccl_rdma_gdr` — GDR device-registration and receive-flush capability test (MPI/RDMA build)
 
 When `BUILD_TESTING` is enabled (the default), `ctest --test-dir build
 --output-on-failure` also runs the static BF16 capability-validation regression
-and benchmark profiling static regressions.
+and benchmark profiling static regressions, including the CQE -> GDR flush ->
+`recv_tail` publication-order check.
 
 ### CMake options
 
@@ -86,13 +88,19 @@ over registered host-pinned FIFO memory; the host proxy multi-flights SEND/RECV
 up to Simple FIFO slice depth with selective CQ signaling. Empty Simple trailing
 slices do not take a network round-trip. Set `NANO_NCCL_RDMA_USE_WRITE=1` to
 opt into the WRITE+CTS data plane (RC `WRITE_WITH_IMM` plus a host-pinned CTS
-slot ring); unset/`0` keeps SEND/RECV. Both planes stay host-pin only — no
-  GPUDirect RDMA. Compare against NCCL with `NCCL_NET_GDR_LEVEL=0`. SEND and
-  WriteCts always post SGE from the registered mapped FIFO (`fifo_mr_`).
-  After worker FIFO stores and a full-block sync, the publisher advances
-  `send_tail` with `st.release.sys`; proxies load it with acquire (no host
-  bounce path). Single-host 4-rank WRITE+CTS vs NCCL GDR=0 NET/IB
-  (float/fp16/bf16 × sum/avg/max/min, 256 KiB–64 MiB) is in
+slot ring); unset/`0` keeps SEND/RECV. Set `NANO_NCCL_RDMA_GDR=1` to place the
+data FIFO in registered GPU memory while the host proxy still posts work. GDR
+is explicit: unavailable registration or receive-visibility support fails
+during setup instead of falling back to host-pinned memory. Compare the
+host-pinned path against NCCL with `NCCL_NET_GDR_LEVEL=0`, and the GDR path with
+GDR enabled in NCCL. SEND and WriteCts post SGE from the registered FIFO
+(`fifo_mr_`). After worker FIFO stores and a full-block sync, the publisher
+advances `send_tail` with `st.release.sys`; proxies load it with acquire (no
+host bounce path). On GDR receive, the proxy flushes completed third-party
+writes with the CUDA GPUDirect ordering API before publishing `recv_tail` when
+the device does not provide native ordering. The system-scope counter ordering
+does not replace this receive-data flush. The host-pinned and GDR WRITE+CTS
+  matrices (float/fp16/bf16 × sum/avg/max/min, 256 KiB–64 MiB) are in
   [performance.md](performance.md) with `#wrong=0` (dedicated progress
   default). The MPI binding uses the MPI C API,
   so an Open MPI installation need not ship the retired C++ binding library.
@@ -110,8 +118,8 @@ Set `NANO_NCCL_SOCKET_IFNAME=<interface>` and
 routable. Use `--transport rdma`; cross-process ring edges use RDMA and local
 edges resolve like `auto` (P2P when bidirectional NVLink peer access is
 available, otherwise SHM), so the reported aggregate transport is normally
-`mixed`. For fair NCCL comparisons use `NCCL_NET_GDR_LEVEL=0` (same host-pin
-class). Bind Open MPI TCP/OOB to the bootstrap interface (`btl_tcp_if_include` /
+`mixed`. For a host-pinned comparison use `NCCL_NET_GDR_LEVEL=0`; for a GDR
+comparison enable GDR in both implementations. Bind Open MPI TCP/OOB to the bootstrap interface (`btl_tcp_if_include` /
 `oob_tcp_if_include`) so MPI does not pick a non-routable NIC.
 
 For a two-host, four-GPU-per-host correctness launch:
@@ -261,15 +269,18 @@ built with MPI/RDMA support.
   signal, empty-slice elision) for cross-process ring edges and resolves local
   edges like `auto` (P2P when bidirectional NVLink peer access is available,
   otherwise SHM). Default data plane is SEND/RECV; `NANO_NCCL_RDMA_USE_WRITE=1`
-  selects WRITE+CTS (still host-pin; fair NCCL baseline is
-  `NCCL_NET_GDR_LEVEL=0`). Both hosts must build the same commit (64-byte
+  selects WRITE+CTS. `NANO_NCCL_RDMA_GDR=1` moves the data FIFO to registered
+  GPU memory without changing host-proxy progress; unsupported GDR setup fails
+  explicitly. Both hosts must build the same commit (64-byte
   `RdmaPeerInfo`). SEND/WriteCts post from the registered mapped FIFO; after
   worker stores and block sync, the publisher uses `st.release.sys(send_tail)`
   (host acquire loads; no host bounce). Small Simple slices may post recv
   credit immediately after consuming the recv FIFO. Cross-process RDMA edges
   default to dedicated per-proxy host threads; set
-  `NANO_NCCL_RDMA_SHARED_PROGRESS=1` for one shared progress thread. Single-host
-  4-rank WRITE+CTS vs NCCL GDR=0 NET/IB is in [performance.md](performance.md).
+  `NANO_NCCL_RDMA_SHARED_PROGRESS=1` for one shared progress thread. GDR receive
+  completion is flushed before `recv_tail` publication when native GPU/RDMA
+  write ordering is insufficient. Host-pinned and GDR WRITE+CTS comparisons
+  are in [performance.md](performance.md).
 
 P2P is a single-node transport. It requires CUDA peer access for the complete
 configured ring; it is not a multi-node or network transport. Socket uses a
@@ -296,13 +307,13 @@ protocol changes in `src/transport/simple/` and Ring scheduling changes in
 
 Currently supports only:
 
-- Single-node multi-GPU performance path (tested with `CUDA_VISIBLE_DEVICES=0,1,2,3`); published tables in [performance.md](performance.md) cover in-process auto, 4-rank socket, and 4-rank host-pinned RDMA
+- Single-node and scoped two-host multi-GPU performance paths; the validated matrices and exact topology are recorded in [performance.md](performance.md)
 - `float` and FP16 (`fp16`) on SM70+, and BF16 (`bf16`) on SM80+
-- `sum`, `avg`, `max`, and `min` reduce ops; `avg` is `sum / nranks`, and `max`/`min` propagate NaN
+- `sum`, `avg`, `max`, and `min` reduce ops; `avg` is `sum / nranks`. Float `max`/`min` propagate NaN, while packed FP16/BF16 `max`/`min` currently have a known single-NaN propagation bug
 - out-of-place
-- SHM FIFO and device P2P FIFO transports, plus optional MPI/socket or MPI/RDMA for cross-process ring edges; P2P is single-node only; RDMA is host-pin RC (no GPUDirect RDMA)
+- SHM FIFO and device P2P FIFO transports, plus optional MPI/socket or MPI/RDMA for cross-process ring edges; P2P is single-node only; RDMA supports a host-pinned FIFO and opt-in host-proxy GDR
 
-Published performance tables are single-host only. Socket is loopback-TCP; RDMA is measured against NCCL `NCCL_NET_GDR_LEVEL=0` with P2P/SHM disabled. This project is not a general NCCL replacement.
+The performance tables state their transport class and matching NCCL GDR setting. This project is not a general NCCL replacement.
 
 Future expansion plans:
 

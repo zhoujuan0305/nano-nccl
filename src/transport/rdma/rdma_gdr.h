@@ -14,6 +14,27 @@ enum class RdmaMemoryPlacement { HostPin, GpuDirect };
 // 1/true/on → GpuDirect; otherwise throws.
 RdmaMemoryPlacement parse_rdma_memory_placement_env();
 
+// Host-side completion barrier for NIC writes into a CUDA allocation. A
+// system-scope recv_tail release/acquire orders the control word, but it does
+// not make third-party PCIe writes visible to a concurrently running kernel.
+class RdmaGdrReceiveFlush {
+public:
+    RdmaGdrReceiveFlush() = default;
+
+    static RdmaGdrReceiveFlush for_device(int device);
+
+    void flush() const;
+    bool required() const noexcept { return required_; }
+    int device() const noexcept { return device_; }
+
+private:
+    RdmaGdrReceiveFlush(int device, bool required) noexcept
+        : device_(device), required_(required) {}
+
+    int device_ = -1;
+    bool required_ = false;
+};
+
 // Owns one ibv_mr. Host-pin uses ibv_reg_mr on CPU memory. GpuDirect
 // registers CUDA device memory (peermem and/or DMA-BUF).
 class RdmaRegisteredMemory {
