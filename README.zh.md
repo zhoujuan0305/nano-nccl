@@ -269,8 +269,8 @@ AllGather 尚未完成正确性与性能验收矩阵。
 `nano_nccl/nano_nccl.h` 在现有静态 `nano_nccl` library 中提供 exception-safe
 C ABI，包括 opaque communicator、生命周期和查询函数、固定宽度的
 status/dtype/redop/transport 值、thread-local 错误详情，以及三个 scoped
-collective 各自独立的参数结构。它不兼容 NCCL API 或 ABI；首版也不包含 MPI
-communicator 创建接口或 shared-library/SONAME contract。
+collective 各自独立的参数结构。它不兼容 NCCL API 或 ABI，也不承诺
+shared-library/SONAME contract。
 
 device buffer 与 stream 均由调用者持有。每个 pointer/stream 数组都须按
 communicator device 顺序为每个本地 rank 提供一个元素。collective 调用仅入队，
@@ -319,6 +319,13 @@ nano_nccl_destroy_communicator(communicator);
 有效；ABI/status query 不会清除它。stream 同步之后，可用
 `nano_nccl_check_async_error()` 查询 communicator 已 latch 的 asynchronous
 transport error。
+
+启用 `NANO_NCCL_ENABLE_MPI=ON` 时还会生成 `libnano_nccl_mpi_c.so`。
+`nano_nccl/mpi_c_api.h` 中的 factory 可按 color/key 将 `MPI_COMM_WORLD` 切成
+多个独立 communicator，并返回与上述 collective、查询、错误检查和销毁函数
+相同的 opaque handle。每个单 GPU 进程使用 `cuda:0`；color 决定通信组，key
+决定 Ring rank 顺序。adapter 会在需要时初始化 MPI，并在正常销毁 handle 时
+释放子通信域。
 
 ### 通信路径选择
 

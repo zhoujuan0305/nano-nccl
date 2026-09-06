@@ -30,7 +30,11 @@ constexpr bool non_aligned_channel_geometry_is_bounded() {
     std::size_t count = 0;
     std::size_t chunk = 0;
     ring::cbd_part<float>(1025, 3, &offset, &count, &chunk);
-    return offset == 768 && count == 257 && chunk == 128;
+    const std::size_t expected_chunk = simple::align_up(
+        simple::div_up(count, nano_nccl::kRanks),
+        ring::simple_grain_elems<float>());
+    return offset == 768 && count == 257 && chunk == expected_chunk &&
+           chunk <= count;
 }
 
 }  // namespace

@@ -283,8 +283,7 @@ completed their correctness or performance acceptance matrices.
 `nano_nccl` library. It provides an opaque communicator, lifecycle and query
 functions, stable-width status/dtype/redop/transport values, thread-local error
 details, and distinct argument structures for the three scoped collectives.
-It is not NCCL API or ABI compatible, and this initial ABI does not include MPI
-communicator creation or a shared-library/SONAME contract.
+It is not NCCL API or ABI compatible and has no shared-library/SONAME contract.
 
 The caller owns all device buffers and streams. Each pointer/stream array has
 one entry per local rank in communicator device order. Calls enqueue work and
@@ -333,6 +332,15 @@ nano_nccl_destroy_communicator(communicator);
 on the same thread; ABI/status query functions do not clear it.
 `nano_nccl_check_async_error()` reports a communicator's latched asynchronous
 transport error after stream synchronization.
+
+With `NANO_NCCL_ENABLE_MPI=ON`, the build also produces
+`libnano_nccl_mpi_c.so`. Its C ABI in `nano_nccl/mpi_c_api.h` lets an embedding
+runtime split `MPI_COMM_WORLD` into independent collective groups. The factory
+returns the same opaque handle used by `nano_nccl_all_reduce`, communicator
+queries, asynchronous error checks, and `nano_nccl_destroy_communicator`. Each
+one-GPU process selects `cuda:0`; processes with the same color form a
+communicator, and the key fixes their Ring rank order. The adapter initializes
+MPI when needed and releases its subgroup during normal handle destruction.
 
 ### Transport selection
 

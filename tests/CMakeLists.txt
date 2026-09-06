@@ -131,6 +131,9 @@ if(NANO_NCCL_ENABLE_MPI)
     target_include_directories(nano_nccl_mpi_bootstrap PRIVATE ${MPI_C_INCLUDE_DIRS})
     target_link_libraries(nano_nccl_mpi_bootstrap PRIVATE nano_nccl_mpi MPI::MPI_C)
 
+    add_executable(nano_nccl_mpi_c_api mpi_c_api.cu)
+    target_link_libraries(nano_nccl_mpi_c_api PRIVATE nano_nccl_mpi_c)
+
     add_executable(nano_nccl_socket_protocol socket_protocol_test.cc)
     target_link_libraries(nano_nccl_socket_protocol PRIVATE nano_nccl_mpi)
 

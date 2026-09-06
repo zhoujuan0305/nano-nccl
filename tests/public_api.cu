@@ -18,6 +18,7 @@
 #include <exception>
 #include <limits>
 #include <mutex>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -36,7 +37,7 @@
 
 namespace {
 
-constexpr int kRanks = 4;
+constexpr int kRanks = nano_nccl::kRanks;
 constexpr std::size_t kCount = 1024;
 constexpr std::size_t kGrowCount = kCount * 1024;
 
@@ -637,11 +638,13 @@ int main(int argc, char** argv) {
 
     try {
         nano_nccl::CommunicatorConfig config;
-        config.devices = {0, 1, 2, 3};
+        config.devices.resize(kRanks);
+        std::iota(config.devices.begin(), config.devices.end(), 0);
         auto invalid_length_config = config;
         invalid_length_config.devices.pop_back();
         auto invalid_sequence_config = config;
-        invalid_sequence_config.devices = {0, 1, 3, 2};
+        std::swap(invalid_sequence_config.devices[kRanks - 2],
+                  invalid_sequence_config.devices[kRanks - 1]);
         if (!create_communicator_throws_with_message(invalid_length_config,
                                                      "exactly") ||
             !create_communicator_throws_with_message(invalid_sequence_config,
@@ -661,13 +664,14 @@ int main(int argc, char** argv) {
         auto null_buffer_args = args;
         null_buffer_args.recv_buffers[1] = nullptr;
         auto null_stream_args = args;
-        null_stream_args.streams[2] = nullptr;
+        null_stream_args.streams[kRanks - 1] = nullptr;
         auto zero_count_args = args;
         zero_count_args.count = 0;
         auto invalid_redop_args = args;
         invalid_redop_args.redop = static_cast<nano_nccl::RedOp>(99);
         auto in_place_args = args;
-        in_place_args.recv_buffers[3] = const_cast<void*>(in_place_args.send_buffers[3]);
+        in_place_args.recv_buffers[kRanks - 1] =
+            const_cast<void*>(in_place_args.send_buffers[kRanks - 1]);
         auto overlapping_args = args;
         overlapping_args.recv_buffers[0] = static_cast<void*>(
             static_cast<char*>(const_cast<void*>(overlapping_args.send_buffers[0])) +

@@ -1,51 +1,40 @@
 #include "nano_nccl/nano_nccl.h"
 
-#include "nano_nccl/communicator.h"
+#include "c_api_internal.h"
 
 #include <cstdio>
 #include <cstdint>
 #include <exception>
 #include <limits>
-#include <memory>
 #include <new>
 #include <stdexcept>
 #include <utility>
 #include <vector>
 
-struct NanoNcclCommunicator {
-    std::unique_ptr<nano_nccl::Communicator> communicator;
-};
+namespace nano_nccl::c_api {
 
-namespace {
-
-thread_local char g_last_error[1024]{};
+thread_local char last_error[1024]{};
 
 nano_nccl_status_t fail(nano_nccl_status_t status, const char* message) noexcept {
-    std::snprintf(g_last_error, sizeof(g_last_error), "%s", message);
+    std::snprintf(last_error, sizeof(last_error), "%s", message);
     return status;
 }
 
 nano_nccl_status_t fail(nano_nccl_status_t status,
                         const std::exception& error) noexcept {
-    std::snprintf(g_last_error, sizeof(g_last_error), "%s", error.what());
+    std::snprintf(last_error, sizeof(last_error), "%s", error.what());
     return status;
 }
 
-void begin_call() noexcept { g_last_error[0] = '\0'; }
+void begin_call() noexcept { last_error[0] = '\0'; }
 
-template <typename Function>
-nano_nccl_status_t translate_exceptions(Function&& function) noexcept {
-    try {
-        std::forward<Function>(function)();
-        return NANO_NCCL_STATUS_SUCCESS;
-    } catch (const std::invalid_argument& error) {
-        return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT, error);
-    } catch (const std::exception& error) {
-        return fail(NANO_NCCL_STATUS_ERROR, error);
-    } catch (...) {
-        return fail(NANO_NCCL_STATUS_ERROR, "unknown C++ exception");
-    }
-}
+}  // namespace nano_nccl::c_api
+
+namespace {
+
+using nano_nccl::c_api::begin_call;
+using nano_nccl::c_api::fail;
+using nano_nccl::c_api::translate_exceptions;
 
 bool to_cpp_dtype(nano_nccl_dtype_t value, nano_nccl::DType* dtype) {
     switch (value) {
@@ -236,7 +225,9 @@ const char* nano_nccl_status_string(nano_nccl_status_t status) {
     }
 }
 
-const char* nano_nccl_get_last_error(void) { return g_last_error; }
+const char* nano_nccl_get_last_error(void) {
+    return nano_nccl::c_api::last_error;
+}
 
 nano_nccl_status_t nano_nccl_create_communicator(
     const nano_nccl_communicator_config_t* config,

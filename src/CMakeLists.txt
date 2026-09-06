@@ -22,6 +22,7 @@ find_package(Threads REQUIRED)
 
 function(add_nano_nccl_library target)
     add_library(${target} STATIC ${nano_nccl_sources})
+    set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_include_directories(${target} PUBLIC
         ${CMAKE_SOURCE_DIR}/include
         ${CMAKE_SOURCE_DIR}/src
@@ -74,6 +75,7 @@ if(NANO_NCCL_ENABLE_MPI)
     add_library(nano_nccl_mpi STATIC
         collective/all_reduce/mpi_communicator.cc
     )
+    set_target_properties(nano_nccl_mpi PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_include_directories(nano_nccl_mpi PUBLIC
         ${CMAKE_SOURCE_DIR}/include
         ${CMAKE_SOURCE_DIR}/src
@@ -82,6 +84,16 @@ if(NANO_NCCL_ENABLE_MPI)
     target_compile_options(nano_nccl_mpi PRIVATE -O3)
     target_compile_definitions(nano_nccl_mpi PUBLIC OMPI_SKIP_MPICXX)
     target_link_libraries(nano_nccl_mpi PUBLIC nano_nccl MPI::MPI_C)
+
+    add_library(nano_nccl_mpi_c SHARED
+        collective/all_reduce/mpi_c_api.cc
+    )
+    target_include_directories(nano_nccl_mpi_c PUBLIC
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_compile_options(nano_nccl_mpi_c PRIVATE -O3)
+    target_compile_definitions(nano_nccl_mpi_c PUBLIC OMPI_SKIP_MPICXX)
+    target_link_libraries(nano_nccl_mpi_c PRIVATE nano_nccl_mpi MPI::MPI_C)
 
     if(NANO_NCCL_ENABLE_RDMA)
         # target_sources 由各 rdma 源文件任务渐进追加:
