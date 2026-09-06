@@ -36,6 +36,7 @@ Build artifacts:
 - `build/tests/nano_nccl_correctness` — correctness-only test
 - `build/tests/nano_nccl_smoke` — smoke test
 - `build/tests/nano_nccl_public_api` — public C++ API coverage
+- `build/tests/nano_nccl_c_api` — public C ABI compile/link and behavior coverage
 - `build/tests/nano_nccl_p2p_step_counters` — P2P step-counter coverage
 - `build/tests/nano_nccl_p2p_topology` — P2P topology coverage
 - `build/tests/nano_nccl_simple_protocol` — Simple protocol layout coverage
@@ -250,6 +251,62 @@ communicator. `all_reduce` is out-of-place and supports `float`, FP16, BF16,
 and `sum`, `avg`, `max`, and `min`. `avg` is `sum / nranks`; `max` and `min`
 propagate NaN. `reduce_scatter` and `all_gather` are present in the public interface
 but throw an unsupported-operation error.
+
+## C ABI
+
+`nano_nccl/nano_nccl.h` exposes an exception-safe C ABI in the existing static
+`nano_nccl` library. It provides an opaque communicator, lifecycle and query
+functions, stable-width status/dtype/redop/transport values, thread-local error
+details, and distinct argument structures for the three scoped collectives.
+It is not NCCL API or ABI compatible, and this initial ABI does not include MPI
+communicator creation or a shared-library/SONAME contract.
+
+The caller owns all device buffers and streams. Each pointer/stream array has
+one entry per local rank in communicator device order. Calls enqueue work and
+do not synchronize the supplied streams.
+
+| Function | Count field | Per-rank buffer layout | Current result |
+|---|---|---|---|
+| `nano_nccl_all_reduce` | `count` | input `count`, output `count` | implemented |
+| `nano_nccl_reduce_scatter` | `recv_count` | input `recv_count * global_rank_count`, output `recv_count` | `NANO_NCCL_STATUS_UNSUPPORTED` |
+| `nano_nccl_all_gather` | `send_count` | input `send_count`, output `send_count * global_rank_count` | `NANO_NCCL_STATUS_UNSUPPORTED` |
+
+```c
+#include "nano_nccl/nano_nccl.h"
+
+#include <stdio.h>
+
+int devices[] = {0, 1, 2, 3};
+nano_nccl_communicator_config_t config = {
+    devices, 4, NANO_NCCL_TRANSPORT_AUTO,
+};
+nano_nccl_communicator_t* communicator = NULL;
+nano_nccl_status_t status =
+    nano_nccl_create_communicator(&config, &communicator);
+
+// Allocate and populate one out-of-place buffer pair and stream per device.
+const void* send_buffers[4];
+void* recv_buffers[4];
+cudaStream_t streams[4];
+size_t count = 1 << 20;
+nano_nccl_all_reduce_args_t args = {
+    send_buffers, recv_buffers, streams, count,
+    NANO_NCCL_DTYPE_FLOAT, NANO_NCCL_REDOP_SUM,
+};
+if (status == NANO_NCCL_STATUS_SUCCESS) {
+    status = nano_nccl_all_reduce(communicator, &args);
+}
+if (status != NANO_NCCL_STATUS_SUCCESS) {
+    fprintf(stderr, "%s: %s\n", nano_nccl_status_string(status),
+            nano_nccl_get_last_error());
+}
+nano_nccl_destroy_communicator(communicator);
+```
+
+`nano_nccl_get_last_error()` remains valid until the next stateful C ABI call
+on the same thread; ABI/status query functions do not clear it.
+`nano_nccl_check_async_error()` reports a communicator's latched asynchronous
+transport error after stream synchronization.
 
 ### Transport selection
 

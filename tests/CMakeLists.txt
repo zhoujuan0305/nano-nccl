@@ -5,6 +5,11 @@ target_link_libraries(nano_nccl_correctness PRIVATE nano_nccl)
 add_executable(nano_nccl_public_api public_api.cu)
 target_link_libraries(nano_nccl_public_api PRIVATE nano_nccl)
 
+add_executable(nano_nccl_c_api c_api.c)
+target_compile_features(nano_nccl_c_api PRIVATE c_std_11)
+set_target_properties(nano_nccl_c_api PROPERTIES LINKER_LANGUAGE CXX)
+target_link_libraries(nano_nccl_c_api PRIVATE nano_nccl)
+
 add_executable(nano_nccl_p2p_step_counters p2p_step_counters.cu)
 target_link_libraries(nano_nccl_p2p_step_counters PRIVATE nano_nccl)
 
@@ -35,6 +40,8 @@ if(BUILD_TESTING)
     set_tests_properties(nano_nccl_public_api_nan PROPERTIES
         ENVIRONMENT NANO_NCCL_PUBLIC_API_NAN_ONLY=1
         TIMEOUT 8)
+    add_test(NAME nano_nccl_c_api COMMAND nano_nccl_c_api)
+    set_tests_properties(nano_nccl_c_api PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME nano_nccl_simple_protocol COMMAND nano_nccl_simple_protocol)
     set_tests_properties(nano_nccl_simple_protocol PROPERTIES SKIP_RETURN_CODE 77)
     add_test(

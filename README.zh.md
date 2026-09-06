@@ -36,6 +36,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=8
 - `build/tests/nano_nccl_correctness` — 纯正确性测试
 - `build/tests/nano_nccl_smoke` — 冒烟测试
 - `build/tests/nano_nccl_public_api` — 公共 C++ API 覆盖测试
+- `build/tests/nano_nccl_c_api` — 公共 C ABI 编译、链接与行为覆盖测试
 - `build/tests/nano_nccl_p2p_step_counters` — P2P step-counter 覆盖测试
 - `build/tests/nano_nccl_p2p_topology` — P2P topology 覆盖测试
 - `build/tests/nano_nccl_simple_protocol` — Simple protocol layout 覆盖测试
@@ -242,6 +243,61 @@ communicator->check_async_error();
 `avg` 为 `sum / nranks`；`max` 与 `min` 会传播 NaN。
 `reduce_scatter` 与 `all_gather` 已在公共 interface 中暴露，但当前会抛出
 unsupported-operation 错误。
+
+## C ABI
+
+`nano_nccl/nano_nccl.h` 在现有静态 `nano_nccl` library 中提供 exception-safe
+C ABI，包括 opaque communicator、生命周期和查询函数、固定宽度的
+status/dtype/redop/transport 值、thread-local 错误详情，以及三个 scoped
+collective 各自独立的参数结构。它不兼容 NCCL API 或 ABI；首版也不包含 MPI
+communicator 创建接口或 shared-library/SONAME contract。
+
+device buffer 与 stream 均由调用者持有。每个 pointer/stream 数组都须按
+communicator device 顺序为每个本地 rank 提供一个元素。collective 调用仅入队，
+不会同步传入的 stream。
+
+| 函数 | count 字段 | 每个 rank 的 buffer layout | 当前结果 |
+|---|---|---|---|
+| `nano_nccl_all_reduce` | `count` | 输入 `count`，输出 `count` | 已实现 |
+| `nano_nccl_reduce_scatter` | `recv_count` | 输入 `recv_count * global_rank_count`，输出 `recv_count` | `NANO_NCCL_STATUS_UNSUPPORTED` |
+| `nano_nccl_all_gather` | `send_count` | 输入 `send_count`，输出 `send_count * global_rank_count` | `NANO_NCCL_STATUS_UNSUPPORTED` |
+
+```c
+#include "nano_nccl/nano_nccl.h"
+
+#include <stdio.h>
+
+int devices[] = {0, 1, 2, 3};
+nano_nccl_communicator_config_t config = {
+    devices, 4, NANO_NCCL_TRANSPORT_AUTO,
+};
+nano_nccl_communicator_t* communicator = NULL;
+nano_nccl_status_t status =
+    nano_nccl_create_communicator(&config, &communicator);
+
+// 在每个 device 上分配并填充一对 out-of-place buffer 和一个 stream。
+const void* send_buffers[4];
+void* recv_buffers[4];
+cudaStream_t streams[4];
+size_t count = 1 << 20;
+nano_nccl_all_reduce_args_t args = {
+    send_buffers, recv_buffers, streams, count,
+    NANO_NCCL_DTYPE_FLOAT, NANO_NCCL_REDOP_SUM,
+};
+if (status == NANO_NCCL_STATUS_SUCCESS) {
+    status = nano_nccl_all_reduce(communicator, &args);
+}
+if (status != NANO_NCCL_STATUS_SUCCESS) {
+    fprintf(stderr, "%s: %s\n", nano_nccl_status_string(status),
+            nano_nccl_get_last_error());
+}
+nano_nccl_destroy_communicator(communicator);
+```
+
+`nano_nccl_get_last_error()` 返回的 pointer 在同一线程下一次 stateful C ABI 调用前
+有效；ABI/status query 不会清除它。stream 同步之后，可用
+`nano_nccl_check_async_error()` 查询 communicator 已 latch 的 asynchronous
+transport error。
 
 ### 通信路径选择
 

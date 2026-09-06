@@ -1,4 +1,5 @@
 set(nano_nccl_sources
+    c_api.cc
     core/buffer.cu
     core/numa.cu
     transport/p2p/p2p_fifo.cu
