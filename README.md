@@ -2,7 +2,18 @@
 
 [中文说明](README.zh.md)
 
-A GPU collective communication library for single-host multi-GPU All Reduce, targeting NCCL `Ring` + `Simple` + 4 channels performance. Optional MPI/socket and MPI/RDMA paths support multi-host `all_reduce` runs. RDMA defaults to a host-pinned FIFO, with opt-in host-proxy GPUDirect RDMA via `NANO_NCCL_RDMA_GDR=1`; the data plane defaults to SEND/RECV, with optional WRITE+CTS via `NANO_NCCL_RDMA_USE_WRITE=1`.
+A focused GPU collective communication library implementing out-of-place
+AllReduce, ReduceScatter, and AllGather with `Ring` + `Simple`. The three
+collectives have finite-input correctness coverage on the single-host SHM,
+auto, and available P2P paths. Optional MPI/socket and MPI/RDMA paths currently
+have multi-host correctness and performance evidence for AllReduce only. RDMA
+defaults to a host-pinned FIFO, with opt-in host-proxy GPUDirect RDMA via
+`NANO_NCCL_RDMA_GDR=1`; the data plane defaults to SEND/RECV, with optional
+WRITE+CTS via `NANO_NCCL_RDMA_USE_WRITE=1`.
+
+Current ReduceScatter/AllGather execution coverage is 2 and 4 ranks on one
+4x RTX A6000 (SM86) host with forced SHM, auto, and forced P2P. The 8-rank
+configuration is compile-tested only and is not claimed as validated support.
 
 ---
 
@@ -36,6 +47,8 @@ Build artifacts:
 - `build/tests/nano_nccl_correctness` — correctness-only test
 - `build/tests/nano_nccl_smoke` — smoke test
 - `build/tests/nano_nccl_public_api` — public C++ API coverage
+- `build/tests/nano_nccl_c_api` — public C ABI compile/link and behavior coverage
+- `build/tests/nano_nccl_collectives` — single-host ReduceScatter and AllGather finite-input matrix plus float/FP16/BF16 NaN coverage
 - `build/tests/nano_nccl_p2p_step_counters` — P2P step-counter coverage
 - `build/tests/nano_nccl_p2p_topology` — P2P topology coverage
 - `build/tests/nano_nccl_simple_protocol` — Simple protocol layout coverage
@@ -176,9 +189,13 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_smoke
 ```
 
 `--redop` accepts `sum` (the default), `avg`, `max`, and `min`. `avg` is the
-element-wise `sum / nranks`. `max` and `min` propagate NaN when either operand
-is NaN. The selected reduction operation is compiled into the device kernel;
-the rank count remains a runtime kernel parameter.
+element-wise `sum / nranks`. All four operations propagate NaN; in particular,
+`max` and `min` return NaN when either operand is NaN. This is an intentional
+`Different` (correctness-critical) choice from NCCL commit `5067397c`: NCCL's
+`src/device/reduce_kernel.h`, `Apply_Reduce<FuncMinMax<...>>`, uses ordinary
+floating-point `min`/`max` intrinsics that ignore a single NaN. The selected
+reduction operation is compiled into the device kernel; the rank count remains
+a runtime kernel parameter.
 
 ### Optional NVTX/CUDA profiling
 
@@ -225,7 +242,7 @@ std::vector<cudaStream_t> streams(devices.size());
 // ... cudaSetDevice(devices[i]), cudaMalloc, cudaStreamCreateWithFlags ...
 
 constexpr std::size_t count = 1 << 20;  // Elements per local rank.
-nano_nccl::CollectiveArgs args{
+nano_nccl::AllReduceArgs args{
     send_buffers,
     recv_buffers,
     streams,
@@ -246,10 +263,76 @@ communicator->check_async_error();
 The single-host adapter requires `devices` to be the visible-device sequence
 `{0, ..., NANO_NCCL_NRANKS - 1}`. In an MPI build, `nano_nccl/mpi.h` provides
 `create_communicator_from_mpi(MPI_COMM_WORLD, config)` for a distributed
-communicator. `all_reduce` is out-of-place and supports `float`, FP16, BF16,
-and `sum`, `avg`, `max`, and `min`. `avg` is `sum / nranks`; `max` and `min`
-propagate NaN. `reduce_scatter` and `all_gather` are present in the public interface
-but throw an unsupported-operation error.
+communicator. All three operations are out-of-place and use distinct typed
+descriptors:
+
+| Operation | Descriptor count | Per-rank buffer layout | Reduction |
+|---|---|---|---|
+| `all_reduce` | `AllReduceArgs::count` | input `count`, output `count` | `sum`, `avg`, `max`, `min` |
+| `reduce_scatter` | `ReduceScatterArgs::recv_count` | input `recv_count * global_rank_count`, output `recv_count` | `sum`, `avg`, `max`, `min` |
+| `all_gather` | `AllGatherArgs::send_count` | input `send_count`, output `send_count * global_rank_count` | none |
+
+The single-host implementations support `float`, FP16, and BF16. `avg` is
+`sum / nranks`; every reduction propagates NaN for all three dtypes, including
+packed FP16/BF16 elements. Distributed ReduceScatter and AllGather have not yet
+completed their correctness or performance acceptance matrices.
+
+## C ABI
+
+`nano_nccl/nano_nccl.h` exposes an exception-safe C ABI in the existing static
+`nano_nccl` library. It provides an opaque communicator, lifecycle and query
+functions, stable-width status/dtype/redop/transport values, thread-local error
+details, and distinct argument structures for the three scoped collectives.
+It is not NCCL API or ABI compatible, and this initial ABI does not include MPI
+communicator creation or a shared-library/SONAME contract.
+
+The caller owns all device buffers and streams. Each pointer/stream array has
+one entry per local rank in communicator device order. Calls enqueue work and
+do not synchronize the supplied streams. Input and output byte ranges must not
+overlap, including partial or cross-entry overlap.
+
+| Function | Count field | Per-rank buffer layout | Current result |
+|---|---|---|---|
+| `nano_nccl_all_reduce` | `count` | input `count`, output `count` | implemented |
+| `nano_nccl_reduce_scatter` | `recv_count` | input `recv_count * global_rank_count`, output `recv_count` | implemented; single-host validated |
+| `nano_nccl_all_gather` | `send_count` | input `send_count`, output `send_count * global_rank_count` | implemented; single-host validated |
+
+```c
+#include "nano_nccl/nano_nccl.h"
+
+#include <stdio.h>
+
+int devices[] = {0, 1, 2, 3};
+nano_nccl_communicator_config_t config = {
+    devices, 4, NANO_NCCL_TRANSPORT_AUTO,
+};
+nano_nccl_communicator_t* communicator = NULL;
+nano_nccl_status_t status =
+    nano_nccl_create_communicator(&config, &communicator);
+
+// Allocate and populate one out-of-place buffer pair and stream per device.
+const void* send_buffers[4];
+void* recv_buffers[4];
+cudaStream_t streams[4];
+size_t count = 1 << 20;
+nano_nccl_all_reduce_args_t args = {
+    send_buffers, recv_buffers, streams, count,
+    NANO_NCCL_DTYPE_FLOAT, NANO_NCCL_REDOP_SUM,
+};
+if (status == NANO_NCCL_STATUS_SUCCESS) {
+    status = nano_nccl_all_reduce(communicator, &args);
+}
+if (status != NANO_NCCL_STATUS_SUCCESS) {
+    fprintf(stderr, "%s: %s\n", nano_nccl_status_string(status),
+            nano_nccl_get_last_error());
+}
+nano_nccl_destroy_communicator(communicator);
+```
+
+`nano_nccl_get_last_error()` remains valid until the next stateful C ABI call
+on the same thread; ABI/status query functions do not clear it.
+`nano_nccl_check_async_error()` reports a communicator's latched asynchronous
+transport error after stream synchronization.
 
 ### Transport selection
 
@@ -305,22 +388,16 @@ protocol changes in `src/transport/simple/` and Ring scheduling changes in
 
 ## Limitations
 
-Currently supports only:
+Current validated scope:
 
-- Single-node and scoped two-host multi-GPU performance paths; the validated matrices and exact topology are recorded in [performance.md](performance.md)
+- Single-host AllReduce, ReduceScatter, and AllGather; multi-host correctness and performance evidence currently covers AllReduce only
 - `float` and FP16 (`fp16`) on SM70+, and BF16 (`bf16`) on SM80+
-- `sum`, `avg`, `max`, and `min` reduce ops; `avg` is `sum / nranks`. Float `max`/`min` propagate NaN, while packed FP16/BF16 `max`/`min` currently have a known single-NaN propagation bug
+- `sum`, `avg`, `max`, and `min` for AllReduce and ReduceScatter; AllGather has no reduction operation. `avg` is `sum / nranks`; every reduction propagates NaN for float, FP16, and BF16
 - out-of-place
 - SHM FIFO and device P2P FIFO transports, plus optional MPI/socket or MPI/RDMA for cross-process ring edges; P2P is single-node only; RDMA supports a host-pinned FIFO and opt-in host-proxy GDR
+- one build-time rank count; generated 2/4/8 rank specialization dispatch is not implemented yet. ReduceScatter/AllGather are executed at ranks 2 and 4; rank 8 is compile-tested only
 
 The performance tables state their transport class and matching NCCL GDR setting. This project is not a general NCCL replacement.
-
-Future expansion plans:
-
-- dtype: `double` / `int8`
-- reduce op: `prod`
-- rank count: 2 / 8 / 16 (runtime kernel parameter)
-- collective: `all_gather` / `reduce_scatter` / `broadcast`
 
 ---
 

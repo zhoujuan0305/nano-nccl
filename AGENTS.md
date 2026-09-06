@@ -48,15 +48,23 @@ drop-in replacement.
 
 Keep the distinction between current behavior and target architecture clear:
 
-- AllReduce is the only implemented collective. Public ReduceScatter and
-  AllGather methods currently report unsupported operations.
+- AllReduce, ReduceScatter, and AllGather are implemented. Their finite-input
+  matrices are validated on the single-host SHM, auto, and available P2P paths.
+  Reduction NaN propagation for float, FP16, and BF16 is validated for
+  AllReduce on auto and for ReduceScatter on SHM, auto, and available P2P.
+  Current execution coverage is ranks 2 and 4 on one 4x RTX A6000 (SM86) host;
+  rank 8 is compile-tested only. Distributed correctness and performance
+  evidence currently covers AllReduce only.
+- The public C++ API uses distinct typed descriptors for all three collectives;
+  the C ABI mirrors their distinct count and reduction semantics.
 - dtype and reduce op are compile-time kernel dimensions, but `nranks` is still
   a runtime kernel argument and `NANO_NCCL_NRANKS` fixes host-side sizing.
 - Single-host SHM and P2P paths exist. Transport selection is resolved per Ring
   edge and can produce a mixed plan.
-- MPI/socket and MPI/RDMA paths exist for cross-process AllReduce.
-- RDMA currently uses registered host-pinned FIFO memory. SEND/RECV and
-  WRITE+CTS modes exist; GPUDirect RDMA does not.
+- MPI/socket and MPI/RDMA paths are validated for cross-process AllReduce;
+  ReduceScatter and AllGather have not completed distributed acceptance.
+- RDMA supports registered host-pinned FIFO memory and opt-in host-proxy
+  GPUDirect RDMA. SEND/RECV and WRITE+CTS modes exist.
 - `src/collective/collective.h` and `src/transport/transport.h` are empty virtual
   seams, not the target abstraction.
 - The active Simple implementation lives under `src/transport/simple/`; a

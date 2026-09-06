@@ -188,8 +188,8 @@ public:
     TransportKind transport() const { return resolved_transport_; }
 
 private:
-    CollectiveArgs make_args(std::size_t count) const {
-        CollectiveArgs args;
+    AllReduceArgs make_args(std::size_t count) const {
+        AllReduceArgs args;
         args.count = count;
         args.dtype = kDType;
         args.redop = kRedOp;

@@ -32,6 +32,19 @@ __host__ __device__ constexpr void cbd_part(std::size_t count, int channel,
               simple_grain_elems<T>());
 }
 
+__host__ __device__ constexpr void channel_part(
+    std::size_t count, int channel, std::size_t* part_offset,
+    std::size_t* part_count) {
+    // Standalone ReduceScatter and AllGather keep each rank chunk dense while
+    // assigning identical subranges of every chunk to the same channel.
+    const std::size_t begin =
+        count * static_cast<std::size_t>(channel) / kChannels;
+    const std::size_t end =
+        count * static_cast<std::size_t>(channel + 1) / kChannels;
+    *part_offset = begin;
+    *part_count = end - begin;
+}
+
 template <typename T>
 __host__ __device__ constexpr std::size_t loop_chunk_elems(
     std::size_t chunk_elems, std::size_t slot_elems) {
