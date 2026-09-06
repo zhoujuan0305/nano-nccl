@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -68,24 +69,24 @@ float input_value(int rank, std::size_t index, int round) {
            static_cast<float>(index) * 0.25f;
 }
 
-bool throws_with_message(void (nano_nccl::Communicator::*operation)(
-                             const nano_nccl::CollectiveArgs&),
-                         nano_nccl::Communicator* communicator,
-                         const nano_nccl::CollectiveArgs& args,
-                         const char* message) {
+bool all_reduce_throws_with_message(nano_nccl::Communicator* communicator,
+                                    const nano_nccl::AllReduceArgs& args,
+                                    const char* message) {
     try {
-        (communicator->*operation)(args);
+        communicator->all_reduce(args);
     } catch (const std::runtime_error& error) {
         return std::string(error.what()).find(message) != std::string::npos;
     }
     return false;
 }
 
-bool all_reduce_throws_with_message(nano_nccl::Communicator* communicator,
-                                    const nano_nccl::CollectiveArgs& args,
-                                    const char* message) {
+template <typename Args>
+bool collective_throws_with_message(
+    void (nano_nccl::Communicator::*operation)(const Args&),
+    nano_nccl::Communicator* communicator, const Args& args,
+    const char* message) {
     try {
-        communicator->all_reduce(args);
+        (communicator->*operation)(args);
     } catch (const std::runtime_error& error) {
         return std::string(error.what()).find(message) != std::string::npos;
     }
@@ -425,8 +426,7 @@ __global__ void publish_socket_slice(
     std::uint64_t step = 0;
     std::uint64_t cache = 0;
     __shared__ int wait_status;
-    nano_nccl::kernels::direct_send<float,
-                                    nano_nccl::RedOp::Sum>(
+    nano_nccl::kernels::direct_send<float>(
         args, input, 4, &step, &cache, blockDim.x, &wait_status);
 }
 
@@ -678,7 +678,7 @@ int main(int argc, char** argv) {
         }
 
         auto communicator = nano_nccl::create_communicator(config);
-        nano_nccl::CollectiveArgs args{
+        nano_nccl::AllReduceArgs args{
             send_buffers, recv_buffers, streams, kCount,
             nano_nccl::DType::Float, nano_nccl::RedOp::Sum,
         };
@@ -695,6 +695,15 @@ int main(int argc, char** argv) {
         invalid_redop_args.redop = static_cast<nano_nccl::RedOp>(99);
         auto in_place_args = args;
         in_place_args.recv_buffers[3] = const_cast<void*>(in_place_args.send_buffers[3]);
+        auto overlapping_args = args;
+        overlapping_args.recv_buffers[0] = static_cast<void*>(
+            static_cast<char*>(const_cast<void*>(overlapping_args.send_buffers[0])) +
+            sizeof(float));
+        auto cross_entry_overlapping_args = args;
+        cross_entry_overlapping_args.recv_buffers[1] = static_cast<void*>(
+            static_cast<char*>(const_cast<void*>(
+                cross_entry_overlapping_args.send_buffers[0])) +
+            sizeof(float));
         auto invalid_dtype_args = args;
         invalid_dtype_args.dtype = static_cast<nano_nccl::DType>(99);
         if (!all_reduce_throws_with_message(communicator.get(), wrong_rank_args,
@@ -708,18 +717,97 @@ int main(int argc, char** argv) {
              !all_reduce_throws_with_message(communicator.get(), invalid_redop_args,
                                              "reduction") ||
             !all_reduce_throws_with_message(communicator.get(), in_place_args,
-                                            "in-place") ||
+                                            "overlapping all_reduce") ||
+            !all_reduce_throws_with_message(communicator.get(), overlapping_args,
+                                            "overlapping all_reduce") ||
+            !all_reduce_throws_with_message(
+                communicator.get(), cross_entry_overlapping_args,
+                "overlapping all_reduce") ||
             !all_reduce_throws_with_message(communicator.get(), invalid_dtype_args,
                                             "unsupported dtype")) {
             std::fprintf(stderr, "all_reduce validation did not report a diagnostic message\n");
             return 1;
         }
 
-        if (!throws_with_message(&nano_nccl::Communicator::all_gather,
-                                 communicator.get(), args, "all_gather") ||
-            !throws_with_message(&nano_nccl::Communicator::reduce_scatter,
-                                 communicator.get(), args, "reduce_scatter")) {
-            std::fprintf(stderr, "unsupported collective did not report its name\n");
+        nano_nccl::ReduceScatterArgs reduce_scatter_args{
+            send_buffers, recv_buffers, streams, kCount,
+            nano_nccl::DType::Float, nano_nccl::RedOp::Sum,
+        };
+        auto zero_reduce_scatter = reduce_scatter_args;
+        zero_reduce_scatter.recv_count = 0;
+        auto invalid_reduce_scatter_redop = reduce_scatter_args;
+        invalid_reduce_scatter_redop.redop = static_cast<nano_nccl::RedOp>(99);
+        auto in_place_reduce_scatter = reduce_scatter_args;
+        in_place_reduce_scatter.recv_buffers[0] =
+            const_cast<void*>(in_place_reduce_scatter.send_buffers[0]);
+        auto overlapping_reduce_scatter = reduce_scatter_args;
+        overlapping_reduce_scatter.recv_buffers[0] = static_cast<void*>(
+            static_cast<char*>(const_cast<void*>(
+                overlapping_reduce_scatter.send_buffers[0])) +
+            sizeof(float));
+        auto overflowing_reduce_scatter = reduce_scatter_args;
+        overflowing_reduce_scatter.recv_count =
+            std::numeric_limits<std::size_t>::max() /
+                static_cast<std::size_t>(nano_nccl::kRanks) +
+            1;
+        if (!collective_throws_with_message(
+                &nano_nccl::Communicator::reduce_scatter, communicator.get(),
+                zero_reduce_scatter, "positive") ||
+            !collective_throws_with_message(
+                &nano_nccl::Communicator::reduce_scatter, communicator.get(),
+                invalid_reduce_scatter_redop, "reduction") ||
+            !collective_throws_with_message(
+                &nano_nccl::Communicator::reduce_scatter, communicator.get(),
+                in_place_reduce_scatter, "overlapping reduce_scatter") ||
+            !collective_throws_with_message(
+                &nano_nccl::Communicator::reduce_scatter, communicator.get(),
+                overlapping_reduce_scatter, "overlapping reduce_scatter") ||
+            !collective_throws_with_message(
+                &nano_nccl::Communicator::reduce_scatter, communicator.get(),
+                overflowing_reduce_scatter, "overflows")) {
+            std::fprintf(stderr,
+                         "reduce_scatter validation did not report a diagnostic message\n");
+            return 1;
+        }
+
+        nano_nccl::AllGatherArgs all_gather_args{
+            send_buffers, recv_buffers, streams, kCount,
+            nano_nccl::DType::Float,
+        };
+        auto zero_all_gather = all_gather_args;
+        zero_all_gather.send_count = 0;
+        auto invalid_all_gather_dtype = all_gather_args;
+        invalid_all_gather_dtype.dtype = static_cast<nano_nccl::DType>(99);
+        auto in_place_all_gather = all_gather_args;
+        in_place_all_gather.recv_buffers[0] =
+            const_cast<void*>(in_place_all_gather.send_buffers[0]);
+        auto overlapping_all_gather = all_gather_args;
+        overlapping_all_gather.recv_buffers[0] = static_cast<void*>(
+            static_cast<char*>(const_cast<void*>(
+                overlapping_all_gather.send_buffers[0])) +
+            sizeof(float));
+        auto overflowing_all_gather = all_gather_args;
+        overflowing_all_gather.send_count =
+            std::numeric_limits<std::size_t>::max() /
+                static_cast<std::size_t>(nano_nccl::kRanks) +
+            1;
+        if (!collective_throws_with_message(
+                &nano_nccl::Communicator::all_gather, communicator.get(),
+                zero_all_gather, "positive") ||
+            !collective_throws_with_message(
+                &nano_nccl::Communicator::all_gather, communicator.get(),
+                invalid_all_gather_dtype, "unsupported dtype") ||
+            !collective_throws_with_message(
+                &nano_nccl::Communicator::all_gather, communicator.get(),
+                in_place_all_gather, "overlapping all_gather") ||
+            !collective_throws_with_message(
+                &nano_nccl::Communicator::all_gather, communicator.get(),
+                overlapping_all_gather, "overlapping all_gather") ||
+            !collective_throws_with_message(
+                &nano_nccl::Communicator::all_gather, communicator.get(),
+                overflowing_all_gather, "overflows")) {
+            std::fprintf(stderr,
+                         "all_gather validation did not report a diagnostic message\n");
             return 1;
         }
 

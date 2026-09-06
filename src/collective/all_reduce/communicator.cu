@@ -30,9 +30,11 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -50,9 +52,35 @@ namespace {
 using core::MappedBuffer;
 using core::MappedU32Array;
 using core::MappedU64Array;
+using kernels::ring_simple_all_gather_kernel;
 using kernels::ring_simple_kernel;
+using kernels::ring_simple_reduce_scatter_kernel;
 using transport::simple::ControlArgs;
 using transport::simple::FifoArgs;
+
+template <typename T, RedOp kRedOp>
+struct AllReduceKernelLauncher {
+    void operator()(FifoArgs<T> args, cudaStream_t stream) const {
+        ring_simple_kernel<T, kRedOp>
+            <<<kChannels, kBlockThreads, 0, stream>>>(args, kRanks);
+    }
+};
+
+template <typename T, RedOp kRedOp>
+struct ReduceScatterKernelLauncher {
+    void operator()(FifoArgs<T> args, cudaStream_t stream) const {
+        ring_simple_reduce_scatter_kernel<T, kRedOp>
+            <<<kChannels, kBlockThreads, 0, stream>>>(args, kRanks);
+    }
+};
+
+template <typename T>
+struct AllGatherKernelLauncher {
+    void operator()(FifoArgs<T> args, cudaStream_t stream) const {
+        ring_simple_all_gather_kernel<T>
+            <<<kChannels, kBlockThreads, 0, stream>>>(args, kRanks);
+    }
+};
 
 void require_single_process_devices(const std::vector<int>& devices) {
     if (devices.size() != kRanks) {
@@ -235,7 +263,7 @@ public:
         dump_ring_turnaround_if_enabled();
     }
 
-    void all_reduce(const CollectiveArgs& args) {
+    void all_reduce(const AllReduceArgs& args) {
         check_async_error();
         validate_args(args);
         switch (args.dtype) {
@@ -248,6 +276,50 @@ public:
             case DType::BFloat16:
                 ensure_bf16_devices_validated();
                 all_reduce_typed<__nv_bfloat16>(args);
+                return;
+        }
+        throw std::runtime_error("unsupported dtype");
+    }
+
+    void all_gather(const AllGatherArgs& args) {
+        check_async_error();
+        if (topology_.distributed) {
+            throw std::runtime_error(
+                "all_gather currently supports single-host communicators only");
+        }
+        validate_args(args);
+        switch (args.dtype) {
+            case DType::Float:
+                all_gather_typed<float>(args);
+                return;
+            case DType::Float16:
+                all_gather_typed<__half>(args);
+                return;
+            case DType::BFloat16:
+                ensure_bf16_devices_validated();
+                all_gather_typed<__nv_bfloat16>(args);
+                return;
+        }
+        throw std::runtime_error("unsupported dtype");
+    }
+
+    void reduce_scatter(const ReduceScatterArgs& args) {
+        check_async_error();
+        if (topology_.distributed) {
+            throw std::runtime_error(
+                "reduce_scatter currently supports single-host communicators only");
+        }
+        validate_args(args);
+        switch (args.dtype) {
+            case DType::Float:
+                reduce_scatter_typed<float>(args);
+                return;
+            case DType::Float16:
+                reduce_scatter_typed<__half>(args);
+                return;
+            case DType::BFloat16:
+                ensure_bf16_devices_validated();
+                reduce_scatter_typed<__nv_bfloat16>(args);
                 return;
         }
         throw std::runtime_error("unsupported dtype");
@@ -846,16 +918,81 @@ private:
         int rank_count_ = 0;
     };
 
-    void validate_args(const CollectiveArgs& args) const {
+    struct AddressRange {
+        std::uintptr_t begin;
+        std::uintptr_t end;
+    };
+
+    std::size_t dtype_size(DType dtype) const {
+        switch (dtype) {
+            case DType::Float:
+                return sizeof(float);
+            case DType::Float16:
+                return sizeof(__half);
+            case DType::BFloat16:
+                return sizeof(__nv_bfloat16);
+        }
+        throw std::runtime_error("unsupported dtype");
+    }
+
+    std::size_t checked_multiply(std::size_t lhs, std::size_t rhs,
+                                 const char* message) const {
+        if (lhs > std::numeric_limits<std::size_t>::max() / rhs) {
+            throw std::runtime_error(message);
+        }
+        return lhs * rhs;
+    }
+
+    AddressRange address_range(const void* pointer, std::size_t bytes) const {
+        const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(pointer);
+        if (bytes > std::numeric_limits<std::uintptr_t>::max() - begin) {
+            throw std::runtime_error("collective buffer address range overflows");
+        }
+        return {begin, begin + bytes};
+    }
+
+    template <typename Args>
+    void validate_buffer_args(const Args& args, std::size_t send_count,
+                              std::size_t recv_count, DType dtype,
+                              const char* collective_name) const {
         if (args.send_buffers.size() != devices_.size() ||
             args.recv_buffers.size() != devices_.size() ||
             args.streams.size() != devices_.size()) {
             throw std::runtime_error("collective arguments must have one entry per rank");
         }
-        if (args.count == 0) {
+        if (send_count == 0 || recv_count == 0) {
             throw std::runtime_error("collective count must be positive");
         }
-        switch (args.redop) {
+        const std::size_t element_size = dtype_size(dtype);
+        const std::size_t send_bytes = checked_multiply(
+            send_count, element_size, "collective send byte count overflows");
+        const std::size_t recv_bytes = checked_multiply(
+            recv_count, element_size, "collective receive byte count overflows");
+        std::vector<AddressRange> send_ranges;
+        std::vector<AddressRange> recv_ranges;
+        send_ranges.reserve(devices_.size());
+        recv_ranges.reserve(devices_.size());
+        for (int rank = 0; rank < local_rank_count(); ++rank) {
+            if (args.send_buffers[rank] == nullptr || args.recv_buffers[rank] == nullptr ||
+                args.streams[rank] == nullptr) {
+                throw std::runtime_error("collective buffers and streams must be non-null");
+            }
+            send_ranges.push_back(address_range(args.send_buffers[rank], send_bytes));
+            recv_ranges.push_back(address_range(args.recv_buffers[rank], recv_bytes));
+        }
+        for (const AddressRange& send : send_ranges) {
+            for (const AddressRange& recv : recv_ranges) {
+                if (send.begin < recv.end && recv.begin < send.end) {
+                    throw std::runtime_error(
+                        std::string("overlapping ") + collective_name +
+                        " send and receive buffers are unsupported");
+                }
+            }
+        }
+    }
+
+    void validate_redop(RedOp redop) const {
+        switch (redop) {
             case RedOp::Sum:
             case RedOp::Avg:
             case RedOp::Max:
@@ -864,15 +1001,29 @@ private:
             default:
                 throw std::runtime_error("unsupported reduction operation");
         }
-        for (int rank = 0; rank < local_rank_count(); ++rank) {
-            if (args.send_buffers[rank] == nullptr || args.recv_buffers[rank] == nullptr ||
-                args.streams[rank] == nullptr) {
-                throw std::runtime_error("collective buffers and streams must be non-null");
-            }
-            if (args.send_buffers[rank] == args.recv_buffers[rank]) {
-                throw std::runtime_error("in-place all_reduce is unsupported");
-            }
-        }
+    }
+
+    void validate_args(const AllReduceArgs& args) const {
+        validate_buffer_args(args, args.count, args.count, args.dtype,
+                             "all_reduce");
+        validate_redop(args.redop);
+    }
+
+    void validate_args(const ReduceScatterArgs& args) const {
+        const std::size_t send_count = checked_multiply(
+            args.recv_count, static_cast<std::size_t>(kRanks),
+            "reduce_scatter element count overflows");
+        validate_buffer_args(args, send_count, args.recv_count, args.dtype,
+                             "reduce_scatter");
+        validate_redop(args.redop);
+    }
+
+    void validate_args(const AllGatherArgs& args) const {
+        const std::size_t recv_count = checked_multiply(
+            args.send_count, static_cast<std::size_t>(kRanks),
+            "all_gather element count overflows");
+        validate_buffer_args(args, args.send_count, recv_count, args.dtype,
+                             "all_gather");
     }
 
     void require_previous_launch_complete() const {
@@ -886,7 +1037,7 @@ private:
             cudaError_t status = cudaEventQuery(completion_events_[rank]);
             if (status == cudaErrorNotReady) {
                 throw std::runtime_error(
-                    "cannot grow communicator FIFO while a prior all_reduce is running");
+                    "cannot grow communicator FIFO while a prior collective is running");
             }
             CUDA_CHECK_THROW(status);
         }
@@ -896,7 +1047,7 @@ private:
         const std::vector<cudaStream_t>& streams) const {
         if (has_untracked_launch_) {
             throw std::runtime_error(
-                "cannot launch all_reduce after completion tracking failed");
+                "cannot launch collective after completion tracking failed");
         }
         if (!has_launch_) return;
         for (int stream_rank = 0; stream_rank < local_rank_count(); ++stream_rank) {
@@ -979,14 +1130,16 @@ private:
         reset_events.destroy();
     }
 
-    template <typename T, RedOp kRedOp>
-    void launch_ring_simple(const CollectiveArgs& args, FifoResources<T>* resources) {
+    template <typename T, typename Args, typename KernelLauncher>
+    void launch_ring_simple(const Args& args, std::size_t count,
+                            FifoResources<T>* resources,
+                            const KernelLauncher& launch_kernel) {
         ensure_completion_events();
         for (int rank = 0; rank < local_rank_count(); ++rank) {
             FifoArgs<T> kernel_args{};
             int global_rank = topology_.local_rank_offset + rank;
             kernel_args.rank = global_rank;
-            kernel_args.count = args.count;
+            kernel_args.count = count;
             kernel_args.slot_elems = resources->slot_elems;
             kernel_args.step_elems = transport::simple::step_elems<T>();
             kernel_args.input = static_cast<const T*>(args.send_buffers[rank]);
@@ -1108,8 +1261,7 @@ private:
 #endif
 
             CUDA_CHECK_THROW(cudaSetDevice(devices_[rank]));
-            ring_simple_kernel<T, kRedOp>
-                <<<kChannels, kBlockThreads, 0, args.streams[rank]>>>(kernel_args, kRanks);
+            launch_kernel(kernel_args, args.streams[rank]);
             CUDA_CHECK_THROW(cudaGetLastError());
             record_completion(rank, args.streams[rank]);
         }
@@ -1204,7 +1356,7 @@ private:
     }
 
     template <typename T>
-    void all_reduce_typed(const CollectiveArgs& args) {
+    void all_reduce_typed(const AllReduceArgs& args) {
         switch (args.redop) {
             case RedOp::Sum:
                 all_reduce_typed<T, RedOp::Sum>(args);
@@ -1223,7 +1375,48 @@ private:
     }
 
     template <typename T, RedOp kRedOp>
-    void all_reduce_typed(const CollectiveArgs& args) {
+    void all_reduce_typed(const AllReduceArgs& args) {
+        run_typed<T>(args, args.count, args.count,
+                     AllReduceKernelLauncher<T, kRedOp>{});
+    }
+
+    template <typename T>
+    void all_gather_typed(const AllGatherArgs& args) {
+        run_typed<T>(args, args.send_count,
+                     args.send_count * static_cast<std::size_t>(kRanks),
+                     AllGatherKernelLauncher<T>{});
+    }
+
+    template <typename T>
+    void reduce_scatter_typed(const ReduceScatterArgs& args) {
+        switch (args.redop) {
+            case RedOp::Sum:
+                reduce_scatter_typed<T, RedOp::Sum>(args);
+                return;
+            case RedOp::Avg:
+                reduce_scatter_typed<T, RedOp::Avg>(args);
+                return;
+            case RedOp::Max:
+                reduce_scatter_typed<T, RedOp::Max>(args);
+                return;
+            case RedOp::Min:
+                reduce_scatter_typed<T, RedOp::Min>(args);
+                return;
+        }
+        throw std::runtime_error("unsupported reduction operation");
+    }
+
+    template <typename T, RedOp kRedOp>
+    void reduce_scatter_typed(const ReduceScatterArgs& args) {
+        run_typed<T>(args, args.recv_count,
+                     args.recv_count * static_cast<std::size_t>(kRanks),
+                     ReduceScatterKernelLauncher<T, kRedOp>{});
+    }
+
+    template <typename T, typename Args, typename KernelLauncher>
+    void run_typed(const Args& args, std::size_t count,
+                   std::size_t fifo_count,
+                   const KernelLauncher& launch_kernel) {
         FifoResources<T>* resources = nullptr;
         if constexpr (std::is_same_v<T, float>) {
             resources = &float_resources_;
@@ -1233,10 +1426,10 @@ private:
             resources = &bfloat16_resources_;
         }
         // Reject an unsafe replacement before adding any caller-stream work.
-        ensure_fifo_buffers(resources, args.count);
+        ensure_fifo_buffers(resources, fifo_count);
         if (has_untracked_launch_) {
             throw std::runtime_error(
-                "cannot launch all_reduce after completion tracking failed");
+                "cannot launch collective after completion tracking failed");
         }
         // Every caller stream has a fallback before reset, waits, or a launch
         // can enqueue work. A successful completion event clears its fallback.
@@ -1253,7 +1446,7 @@ private:
                 reset_control(args.streams);
                 control_initialized_ = true;
             }
-            launch_ring_simple<T, kRedOp>(args, resources);
+            launch_ring_simple<T>(args, count, resources, launch_kernel);
         } catch (...) {
             has_untracked_launch_ = true;
             throw;
@@ -1307,15 +1500,13 @@ Communicator::Communicator(Communicator&&) noexcept = default;
 Communicator& Communicator::operator=(Communicator&&) noexcept = default;
 Communicator::~Communicator() = default;
 
-void Communicator::all_reduce(const CollectiveArgs& args) { impl_->all_reduce(args); }
+void Communicator::all_reduce(const AllReduceArgs& args) { impl_->all_reduce(args); }
 
-void Communicator::reduce_scatter(const CollectiveArgs&) {
-    throw std::runtime_error("reduce_scatter is unsupported");
+void Communicator::reduce_scatter(const ReduceScatterArgs& args) {
+    impl_->reduce_scatter(args);
 }
 
-void Communicator::all_gather(const CollectiveArgs&) {
-    throw std::runtime_error("all_gather is unsupported");
-}
+void Communicator::all_gather(const AllGatherArgs& args) { impl_->all_gather(args); }
 
 void Communicator::check_async_error() const { impl_->check_async_error(); }
 

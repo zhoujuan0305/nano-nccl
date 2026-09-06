@@ -32,7 +32,7 @@ def require_in_order(body: str, fragments: list[str]) -> None:
 
 def main() -> int:
     source = Path(sys.argv[1]).read_text()
-    dispatch = function_body(source, "void all_reduce(const CollectiveArgs& args)")
+    dispatch = function_body(source, "void all_reduce(const AllReduceArgs& args)")
     case_start = dispatch.find("case DType::BFloat16:")
     case_end = dispatch.find("}", case_start)
     if case_start == -1 or case_end == -1:

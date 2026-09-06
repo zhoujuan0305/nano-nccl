@@ -2,7 +2,16 @@
 
 [English](README.md)
 
-面向单机多 GPU 的 All Reduce 通信库，目标是达到 NCCL `Ring` + `Simple` + 4 channels 的性能；可选 MPI/socket 与 MPI/RDMA 多机 `all_reduce` 路径。RDMA 默认使用 host-pinned FIFO，可用 `NANO_NCCL_RDMA_GDR=1` 显式启用 host-proxy GPUDirect RDMA；数据面默认 SEND/RECV，可用 `NANO_NCCL_RDMA_USE_WRITE=1` 启用 WRITE+CTS。
+一个聚焦的 GPU collective 通信库，以 `Ring` + `Simple` 实现 out-of-place
+AllReduce、ReduceScatter 和 AllGather。三个 collective 已在单机 SHM、auto 和可用的
+P2P 路径覆盖有限值正确性。可选 MPI/socket 与 MPI/RDMA 路径目前只有 AllReduce 完成了多机
+正确性与性能验证。RDMA 默认使用 host-pinned FIFO，可用
+`NANO_NCCL_RDMA_GDR=1` 显式启用 host-proxy GPUDirect RDMA；数据面默认
+SEND/RECV，可用 `NANO_NCCL_RDMA_USE_WRITE=1` 启用 WRITE+CTS。
+
+ReduceScatter/AllGather 当前的实机覆盖为：单台 4x RTX A6000（SM86）主机，rank 2
+和 rank 4 配置，分别强制 SHM、使用 auto、强制 P2P。rank 8 仅完成编译验证，不能
+视为已验证支持。
 
 ---
 
@@ -37,6 +46,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=8
 - `build/tests/nano_nccl_smoke` — 冒烟测试
 - `build/tests/nano_nccl_public_api` — 公共 C++ API 覆盖测试
 - `build/tests/nano_nccl_c_api` — 公共 C ABI 编译、链接与行为覆盖测试
+- `build/tests/nano_nccl_collectives` — 单机 ReduceScatter 与 AllGather 有限值矩阵及 float NaN 覆盖
 - `build/tests/nano_nccl_p2p_step_counters` — P2P step-counter 覆盖测试
 - `build/tests/nano_nccl_p2p_topology` — P2P topology 覆盖测试
 - `build/tests/nano_nccl_simple_protocol` — Simple protocol layout 覆盖测试
@@ -218,7 +228,7 @@ std::vector<cudaStream_t> streams(devices.size());
 // ... cudaSetDevice(devices[i]), cudaMalloc, cudaStreamCreateWithFlags ...
 
 constexpr std::size_t count = 1 << 20;  // 每个本地 rank 的元素数。
-nano_nccl::CollectiveArgs args{
+nano_nccl::AllReduceArgs args{
     send_buffers,
     recv_buffers,
     streams,
@@ -239,10 +249,17 @@ communicator->check_async_error();
 单机 adapter 要求 `devices` 正好是可见 device 顺序
 `{0, ..., NANO_NCCL_NRANKS - 1}`。MPI 构建时，`nano_nccl/mpi.h` 提供
 `create_communicator_from_mpi(MPI_COMM_WORLD, config)` 以创建分布式 communicator。
-`all_reduce` 为 out-of-place，支持 `float`、FP16、BF16，以及 `sum`、`avg`、`max`、`min`。
-`avg` 为 `sum / nranks`；`max` 与 `min` 会传播 NaN。
-`reduce_scatter` 与 `all_gather` 已在公共 interface 中暴露，但当前会抛出
-unsupported-operation 错误。
+三个操作均为 out-of-place，并使用各自独立的 typed descriptor：
+
+| 操作 | descriptor count | 每个 rank 的 buffer layout | reduction |
+|---|---|---|---|
+| `all_reduce` | `AllReduceArgs::count` | 输入 `count`，输出 `count` | `sum`、`avg`、`max`、`min` |
+| `reduce_scatter` | `ReduceScatterArgs::recv_count` | 输入 `recv_count * global_rank_count`，输出 `recv_count` | `sum`、`avg`、`max`、`min` |
+| `all_gather` | `AllGatherArgs::send_count` | 输入 `send_count`，输出 `send_count * global_rank_count` | 无 |
+
+单机实现支持 `float`、FP16 和 BF16。`avg` 为 `sum / nranks`；除下文所述 packed
+FP16/BF16 单 NaN 限制外，`max` 与 `min` 会传播 NaN。分布式 ReduceScatter 和
+AllGather 尚未完成正确性与性能验收矩阵。
 
 ## C ABI
 
@@ -254,13 +271,14 @@ communicator 创建接口或 shared-library/SONAME contract。
 
 device buffer 与 stream 均由调用者持有。每个 pointer/stream 数组都须按
 communicator device 顺序为每个本地 rank 提供一个元素。collective 调用仅入队，
-不会同步传入的 stream。
+不会同步传入的 stream。输入与输出的 byte range 不得重叠，包括部分重叠和跨数组
+entry 的重叠。
 
 | 函数 | count 字段 | 每个 rank 的 buffer layout | 当前结果 |
 |---|---|---|---|
 | `nano_nccl_all_reduce` | `count` | 输入 `count`，输出 `count` | 已实现 |
-| `nano_nccl_reduce_scatter` | `recv_count` | 输入 `recv_count * global_rank_count`，输出 `recv_count` | `NANO_NCCL_STATUS_UNSUPPORTED` |
-| `nano_nccl_all_gather` | `send_count` | 输入 `send_count`，输出 `send_count * global_rank_count` | `NANO_NCCL_STATUS_UNSUPPORTED` |
+| `nano_nccl_reduce_scatter` | `recv_count` | 输入 `recv_count * global_rank_count`，输出 `recv_count` | 已实现；已完成单机验证 |
+| `nano_nccl_all_gather` | `send_count` | 输入 `send_count`，输出 `send_count * global_rank_count` | 已实现；已完成单机验证 |
 
 ```c
 #include "nano_nccl/nano_nccl.h"
@@ -343,22 +361,16 @@ transport runtime lifecycle 与 orchestration 仍由 `Communicator::Impl` 管理
 
 ## 当前限制
 
-当前仅支持：
+当前已验证范围：
 
-- 单机与 scoped 两机多 GPU 性能路径；已验证矩阵与精确拓扑见 [performance.md](performance.md)
+- 单机 AllReduce、ReduceScatter 和 AllGather；多机正确性与性能证据目前仅覆盖 AllReduce
 - SM70+ 上的 `float` 和 FP16（`fp16`），以及 SM80+ 上的 BF16（`bf16`）
-- `sum`、`avg`、`max`、`min` 规约操作；`avg` 为 `sum / nranks`。Float `max`/`min` 会传播 NaN，packed FP16/BF16 `max`/`min` 当前存在已知的单 NaN 传播问题
+- AllReduce 与 ReduceScatter 支持 `sum`、`avg`、`max`、`min`；AllGather 无规约操作。`avg` 为 `sum / nranks`。Float `max`/`min` 会传播 NaN，packed FP16/BF16 `max`/`min` 当前存在已知的单 NaN 传播问题
 - out-of-place
 - SHM FIFO、device P2P FIFO，以及跨进程 ring edge 的可选 MPI/socket 或 MPI/RDMA；P2P 仅单机；RDMA 支持 host-pinned FIFO 与显式启用的 host-proxy GDR
+- 一次构建只固定一个 rank 数；生成式 2/4/8 rank specialization dispatch 尚未实现。ReduceScatter/AllGather 已实机执行 rank 2 和 4，rank 8 仅完成编译验证
 
 性能表会标明 transport class 及匹配的 NCCL GDR 设置。本项目不是通用 NCCL 替代品。
-
-未来计划扩展：
-
-- dtype：`double` / `int8`
-- reduce op：`prod`
-- rank 数：2 / 8 / 16（kernel 运行时参数）
-- collective：`all_gather` / `reduce_scatter` / `broadcast`
 
 ---
 

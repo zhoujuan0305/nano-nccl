@@ -10,6 +10,9 @@ target_compile_features(nano_nccl_c_api PRIVATE c_std_11)
 set_target_properties(nano_nccl_c_api PROPERTIES LINKER_LANGUAGE CXX)
 target_link_libraries(nano_nccl_c_api PRIVATE nano_nccl)
 
+add_executable(nano_nccl_collectives collectives.cu)
+target_link_libraries(nano_nccl_collectives PRIVATE nano_nccl)
+
 add_executable(nano_nccl_p2p_step_counters p2p_step_counters.cu)
 target_link_libraries(nano_nccl_p2p_step_counters PRIVATE nano_nccl)
 
@@ -42,6 +45,14 @@ if(BUILD_TESTING)
         TIMEOUT 8)
     add_test(NAME nano_nccl_c_api COMMAND nano_nccl_c_api)
     set_tests_properties(nano_nccl_c_api PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME nano_nccl_collectives_shm COMMAND nano_nccl_collectives shm)
+    add_test(NAME nano_nccl_collectives_auto COMMAND nano_nccl_collectives auto)
+    add_test(NAME nano_nccl_collectives_p2p COMMAND nano_nccl_collectives p2p)
+    set_tests_properties(
+        nano_nccl_collectives_shm
+        nano_nccl_collectives_auto
+        nano_nccl_collectives_p2p
+        PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME nano_nccl_simple_protocol COMMAND nano_nccl_simple_protocol)
     set_tests_properties(nano_nccl_simple_protocol PROPERTIES SKIP_RETURN_CODE 77)
     add_test(
@@ -54,6 +65,12 @@ if(BUILD_TESTING)
         NAME nano_nccl_communicator_bf16_validation_static
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/communicator_bf16_validation_static.py
+                ${CMAKE_SOURCE_DIR}/src/collective/all_reduce/communicator.cu
+    )
+    add_test(
+        NAME nano_nccl_collective_scope_static
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/collective_scope_static.py
                 ${CMAKE_SOURCE_DIR}/src/collective/all_reduce/communicator.cu
     )
     add_test(

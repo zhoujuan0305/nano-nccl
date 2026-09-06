@@ -241,16 +241,21 @@ __device__ inline void copy_volatile_packed16_worker(
     }
 }
 
-template <typename T, RedOp kRedOp>
+template <typename T, RedOp kRedOp, bool kScaleAvg = false>
 __device__ inline void reduce_volatile_packed16_worker(
-    const T* local, const T* recv, T* dst, std::size_t count, int nworkers) {
+    const T* local, const T* recv, T* dst, std::size_t count, int nworkers,
+    float inverse_nranks = 1.0f) {
     if (threadIdx.x >= nworkers) return;
     std::size_t vec_count = count / 8;
     const uint4* local4 = reinterpret_cast<const uint4*>(local);
     uint4* dst4 = reinterpret_cast<uint4*>(dst);
     for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
-        dst4[i] = reduce_packed16<T, kRedOp>(local4[i],
-                                              load_volatile_uint4(recv + 8 * i));
+        uint4 value = reduce_packed16<T, kRedOp>(
+            local4[i], load_volatile_uint4(recv + 8 * i));
+        if constexpr (kScaleAvg && kRedOp == RedOp::Avg) {
+            value = scale_avg_packed16<T>(value, inverse_nranks);
+        }
+        dst4[i] = value;
     }
 }
 
@@ -364,10 +369,11 @@ __device__ inline void copy_volatile_worker(const T* src, T* dst,
 }
 
 // local + recv 规约后写 dst。reduce 通过 RedOpTraits，未来扩展 max/min 直接换 trait。
-template <typename T, RedOp kRedOp>
+template <typename T, RedOp kRedOp, bool kScaleAvg = false>
 __device__ inline void reduce_volatile_worker(const T* local, const T* recv,
                                               T* dst, std::size_t count,
-                                              int nworkers) {
+                                              int nworkers,
+                                              float inverse_nranks = 1.0f) {
     if (threadIdx.x >= nworkers) return;
     if constexpr (std::is_same_v<T, float>) {
         if (aligned_vec4(local, recv, dst, count)) {
@@ -377,28 +383,39 @@ __device__ inline void reduce_volatile_worker(const T* local, const T* recv,
             for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
                 float4 a = local4[i];
                 float4 b = load_volatile_float4(recv + 4 * i);
-                dst4[i] = make_float4(
+                float4 value = make_float4(
                     RedOpTraits<kRedOp, T>::apply(a.x, b.x),
                     RedOpTraits<kRedOp, T>::apply(a.y, b.y),
                     RedOpTraits<kRedOp, T>::apply(a.z, b.z),
                     RedOpTraits<kRedOp, T>::apply(a.w, b.w));
+                if constexpr (kScaleAvg && kRedOp == RedOp::Avg) {
+                    value.x = scale_avg(value.x, inverse_nranks);
+                    value.y = scale_avg(value.y, inverse_nranks);
+                    value.z = scale_avg(value.z, inverse_nranks);
+                    value.w = scale_avg(value.w, inverse_nranks);
+                }
+                dst4[i] = value;
             }
             return;
         }
     } else if constexpr (kIsPacked16<T>) {
         if (aligned_packed16(local, recv, dst, count)) {
-            reduce_volatile_packed16_worker<T, kRedOp>(local, recv, dst, count,
-                                                        nworkers);
+            reduce_volatile_packed16_worker<T, kRedOp, kScaleAvg>(
+                local, recv, dst, count, nworkers, inverse_nranks);
             return;
         }
     }
     volatile const T* recv_v = reinterpret_cast<volatile const T*>(recv);
     for (std::size_t i = threadIdx.x; i < count; i += nworkers) {
-        dst[i] = RedOpTraits<kRedOp, T>::apply(local[i], recv_v[i]);
+        T value = RedOpTraits<kRedOp, T>::apply(local[i], recv_v[i]);
+        if constexpr (kScaleAvg && kRedOp == RedOp::Avg) {
+            value = scale_avg(value, inverse_nranks);
+        }
+        dst[i] = value;
     }
 }
 
-template <typename T, RedOp kRedOp>
+template <typename T>
 __device__ inline void copy_broadcast_volatile_worker(
     const T* src, T* dst0, T* dst1, std::size_t count,
     int nworkers) {
@@ -487,9 +504,10 @@ constexpr std::size_t kEarlyRecvCreditMaxBytes = 4096;
 
 // In-place reduce after recv was copied into dst (non-volatile). Enables early
 // post_recv_credit once the FIFO slot is fully consumed.
-template <typename T, RedOp kRedOp>
+template <typename T, RedOp kRedOp, bool kScaleAvg = false>
 __device__ inline void reduce_local_into_dst(const T* local, T* dst,
-                                             std::size_t count, int nworkers) {
+                                             std::size_t count, int nworkers,
+                                             float inverse_nranks = 1.0f) {
     if (threadIdx.x >= nworkers) return;
     if constexpr (std::is_same_v<T, float>) {
         if (aligned_vec4(local, dst, dst, count)) {
@@ -499,11 +517,18 @@ __device__ inline void reduce_local_into_dst(const T* local, T* dst,
             for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
                 float4 a = local4[i];
                 float4 b = dst4[i];
-                dst4[i] = make_float4(
+                float4 value = make_float4(
                     RedOpTraits<kRedOp, T>::apply(a.x, b.x),
                     RedOpTraits<kRedOp, T>::apply(a.y, b.y),
                     RedOpTraits<kRedOp, T>::apply(a.z, b.z),
                     RedOpTraits<kRedOp, T>::apply(a.w, b.w));
+                if constexpr (kScaleAvg && kRedOp == RedOp::Avg) {
+                    value.x = scale_avg(value.x, inverse_nranks);
+                    value.y = scale_avg(value.y, inverse_nranks);
+                    value.z = scale_avg(value.z, inverse_nranks);
+                    value.w = scale_avg(value.w, inverse_nranks);
+                }
+                dst4[i] = value;
             }
             return;
         }
@@ -513,13 +538,21 @@ __device__ inline void reduce_local_into_dst(const T* local, T* dst,
             const uint4* local4 = reinterpret_cast<const uint4*>(local);
             uint4* dst4 = reinterpret_cast<uint4*>(dst);
             for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
-                dst4[i] = reduce_packed16<T, kRedOp>(local4[i], dst4[i]);
+                uint4 value = reduce_packed16<T, kRedOp>(local4[i], dst4[i]);
+                if constexpr (kScaleAvg && kRedOp == RedOp::Avg) {
+                    value = scale_avg_packed16<T>(value, inverse_nranks);
+                }
+                dst4[i] = value;
             }
             return;
         }
     }
     for (std::size_t i = threadIdx.x; i < count; i += nworkers) {
-        dst[i] = RedOpTraits<kRedOp, T>::apply(local[i], dst[i]);
+        T value = RedOpTraits<kRedOp, T>::apply(local[i], dst[i]);
+        if constexpr (kScaleAvg && kRedOp == RedOp::Avg) {
+            value = scale_avg(value, inverse_nranks);
+        }
+        dst[i] = value;
     }
 }
 
@@ -835,7 +868,7 @@ __device__ inline void post_recv_credit_and_send_ready(
     }
 }
 
-template <typename T, RedOp kRedOp>
+template <typename T>
 __device__ inline bool direct_send(
     transport::simple::ChannelArgs<T> args, const T* src,
     std::size_t nelem, std::uint64_t* send_step,
@@ -1011,6 +1044,54 @@ __device__ inline bool recv_reduce_copy_send(
 }
 
 template <typename T, RedOp kRedOp>
+__device__ inline bool recv_reduce_copy(
+    transport::simple::ChannelArgs<T> args, const T* local, T* out,
+    std::size_t nelem, std::uint64_t* recv_step,
+    std::uint64_t* recv_tail_cache, float inverse_nranks, int nworkers,
+    int* wait_status) {
+    std::size_t slice_size =
+        transport::simple::slice_elems<T>(nelem, args.step_elems);
+    std::size_t slice_offset = 0;
+    for (int slice = 0;
+         slice < transport::simple::kChunkSteps / transport::simple::kSliceSteps;
+         ++slice) {
+        std::size_t work =
+            slice_offset < nelem
+                ? collective::all_reduce::nelem(slice_size, nelem, slice_offset)
+                : 0;
+        if (work == 0) {
+            slice_offset += slice_size;
+            continue;
+        }
+        if (!wait_recv_ready<T>(args, *recv_step, recv_tail_cache,
+                                wait_status)) {
+            return false;
+        }
+        worker_barrier(nworkers);
+        const T* recv = args.recv_fifo +
+                        ((*recv_step % transport::simple::kFifoSteps) *
+                         args.slot_elems);
+        if (work * sizeof(T) <= kEarlyRecvCreditMaxBytes) {
+            copy_volatile_worker(recv, out + slice_offset, work, nworkers);
+            __syncthreads();
+            post_recv_credit<T>(args, *recv_step);
+            reduce_local_into_dst<T, kRedOp, true>(
+                local + slice_offset, out + slice_offset, work, nworkers,
+                inverse_nranks);
+        } else {
+            reduce_volatile_worker<T, kRedOp, true>(
+                local + slice_offset, recv, out + slice_offset, work, nworkers,
+                inverse_nranks);
+            __syncthreads();
+            post_recv_credit<T>(args, *recv_step);
+        }
+        *recv_step += transport::simple::kSliceSteps;
+        slice_offset += slice_size;
+    }
+    return true;
+}
+
+template <typename T>
 __device__ inline bool recv_copy_send(
     transport::simple::ChannelArgs<T> args, T* out,
     std::size_t nelem, std::uint64_t* recv_step, std::uint64_t* send_step,
@@ -1049,7 +1130,7 @@ __device__ inline bool recv_copy_send(
                       args.slot_elems);
         if (work * sizeof(T) <= kEarlyRecvCreditMaxBytes) {
             // Small: broadcast copy then early credit + send publish.
-            copy_broadcast_volatile_worker<T, kRedOp>(
+            copy_broadcast_volatile_worker<T>(
                 recv, out + slice_offset, dst, work, nworkers);
             __syncthreads();
             post_recv_credit<T>(args, *recv_step);
@@ -1057,7 +1138,7 @@ __device__ inline bool recv_copy_send(
                                nworkers);
         } else {
             // Large: single copy + fused credit/send publish.
-            copy_broadcast_volatile_worker<T, kRedOp>(
+            copy_broadcast_volatile_worker<T>(
                 recv, out + slice_offset, dst, work, nworkers);
             post_recv_credit_and_send_ready<T>(args, *recv_step, *send_step,
                                                work * sizeof(T), true, nworkers);
@@ -1077,7 +1158,7 @@ __device__ inline bool recv_copy_send(
     return true;
 }
 
-template <typename T, RedOp kRedOp>
+template <typename T>
 __device__ inline bool direct_recv(
     transport::simple::ChannelArgs<T> args, T* out,
     std::size_t nelem, std::uint64_t* recv_step,
@@ -1111,18 +1192,10 @@ __device__ inline bool direct_recv(
     return true;
 }
 
-// Ring + Simple 协议主 kernel。
-//   T / RedOp 为编译期参数；nranks 为运行时参数，内循环按 ring 位置展开。
-//   send/recv base steps 独立跨迭代持久化，允许空 slice 在两个方向非对称消除。
-//   nworkers = blockDim - 32：留 3 个专用线程做 wait/post，其余做数据搬运。
-template <typename T, RedOp kRedOp>
-__global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel(
-    transport::simple::FifoArgs<T> args, int nranks) {
-    int channel = blockIdx.x;
-    if (channel >= kChannels) {
-        return;
-    }
-    transport::simple::ChannelArgs<T> channel_args{
+template <typename T>
+__device__ inline transport::simple::ChannelArgs<T> simple_channel_args(
+    const transport::simple::FifoArgs<T>& args, int channel) {
+    return {
         args.slot_elems,
         args.step_elems,
         args.send_fifo[channel],
@@ -1139,6 +1212,21 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
         args.turnaround[channel],
 #endif
     };
+}
+
+// Ring + Simple 协议主 kernel。
+//   T / RedOp 为编译期参数；nranks 为运行时参数，内循环按 ring 位置展开。
+//   send/recv base steps 独立跨迭代持久化，允许空 slice 在两个方向非对称消除。
+//   nworkers = blockDim - 32：留 3 个专用线程做 wait/post，其余做数据搬运。
+template <typename T, RedOp kRedOp>
+__global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel(
+    transport::simple::FifoArgs<T> args, int nranks) {
+    int channel = blockIdx.x;
+    if (channel >= kChannels) {
+        return;
+    }
+    transport::simple::ChannelArgs<T> channel_args =
+        simple_channel_args(args, channel);
     int nworkers = blockDim.x >= 3 * 32 ? blockDim.x - 32 : blockDim.x;
     std::size_t part_offset = 0;
     std::size_t part_count = 0;
@@ -1183,7 +1271,7 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
         std::size_t offset = part_offset + elem_offset + chunk_offset;
         std::size_t work = collective::all_reduce::nelem(
             loop_chunk, rem_count, chunk_offset);
-        if (!direct_send<T, kRedOp>(channel_args, args.input + offset, work,
+        if (!direct_send<T>(channel_args, args.input + offset, work,
                                             &send_step, &send_head_cache, nworkers,
                                             &s_wait_status)) return;
 
@@ -1212,7 +1300,7 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
             chunk_offset = static_cast<std::size_t>(chunk) * loop_chunk;
             offset = part_offset + elem_offset + chunk_offset;
             work = collective::all_reduce::nelem(loop_chunk, rem_count, chunk_offset);
-            if (!recv_copy_send<T, kRedOp>(
+            if (!recv_copy_send<T>(
                 channel_args, args.output + offset, work, &recv_step,
                 &send_step, &recv_tail_cache, &send_head_cache, nworkers,
                 &s_wait_status)) return;
@@ -1222,11 +1310,176 @@ __global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1) void ring_simple_kernel
         chunk_offset = static_cast<std::size_t>(chunk) * loop_chunk;
         offset = part_offset + elem_offset + chunk_offset;
         work = collective::all_reduce::nelem(loop_chunk, rem_count, chunk_offset);
-        if (!direct_recv<T, kRedOp>(channel_args, args.output + offset, work,
+        if (!direct_recv<T>(channel_args, args.output + offset, work,
                                             &recv_step, &recv_tail_cache, nworkers,
                                             &s_wait_status)) return;
 
         elem_offset += loop_count;
+    }
+
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        args.control.send_base_steps[channel] = send_step;
+        args.control.recv_base_steps[channel] = recv_step;
+    }
+}
+
+template <typename T>
+__global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1)
+void ring_simple_all_gather_kernel(transport::simple::FifoArgs<T> args,
+                                   int nranks) {
+    int channel = blockIdx.x;
+    if (channel >= kChannels) {
+        return;
+    }
+    transport::simple::ChannelArgs<T> channel_args =
+        simple_channel_args(args, channel);
+    int nworkers = blockDim.x >= 3 * 32 ? blockDim.x - 32 : blockDim.x;
+    std::size_t part_offset = 0;
+    std::size_t part_count = 0;
+    collective::all_reduce::channel_part(args.count, channel, &part_offset,
+                                         &part_count);
+    if (part_count == 0) {
+        return;
+    }
+
+    __shared__ std::uint64_t s_send_base_step;
+    __shared__ std::uint64_t s_recv_base_step;
+    __shared__ int s_wait_status;
+    if (threadIdx.x == 0) {
+        s_send_base_step = args.control.send_base_steps[channel];
+        s_recv_base_step = args.control.recv_base_steps[channel];
+    }
+    __syncthreads();
+    std::uint64_t send_step = s_send_base_step;
+    std::uint64_t recv_step = s_recv_base_step;
+    std::uint64_t send_head_cache = s_send_base_step;
+    std::uint64_t recv_tail_cache = s_recv_base_step;
+
+    for (std::size_t elem_offset = 0; elem_offset < part_count;) {
+        const std::size_t remaining = part_count - elem_offset;
+        const std::size_t work = remaining < args.slot_elems
+            ? remaining : args.slot_elems;
+        const std::size_t input_offset = part_offset + elem_offset;
+        const std::size_t local_output_offset =
+            static_cast<std::size_t>(args.rank) * args.count + input_offset;
+
+        // Output is rank-major. Circulate each rank's dense input once around
+        // the ring while retaining every received chunk at its source offset.
+        copy_worker(args.input + input_offset,
+                    args.output + local_output_offset, work, nworkers);
+        if (!direct_send<T>(
+                channel_args, args.input + input_offset, work, &send_step,
+                &send_head_cache, nworkers, &s_wait_status)) {
+            return;
+        }
+
+        for (int step = 1; step < nranks - 1; ++step) {
+            const int source_rank = (args.rank + nranks - step) % nranks;
+            const std::size_t output_offset =
+                static_cast<std::size_t>(source_rank) * args.count +
+                input_offset;
+            if (!recv_copy_send<T>(
+                    channel_args, args.output + output_offset, work, &recv_step,
+                    &send_step, &recv_tail_cache, &send_head_cache, nworkers,
+                    &s_wait_status)) {
+                return;
+            }
+        }
+
+        const int final_source_rank = (args.rank + 1) % nranks;
+        const std::size_t final_output_offset =
+            static_cast<std::size_t>(final_source_rank) * args.count +
+            input_offset;
+        if (!direct_recv<T>(
+                channel_args, args.output + final_output_offset, work,
+                &recv_step, &recv_tail_cache, nworkers, &s_wait_status)) {
+            return;
+        }
+        elem_offset += work;
+    }
+
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        args.control.send_base_steps[channel] = send_step;
+        args.control.recv_base_steps[channel] = recv_step;
+    }
+}
+
+template <typename T, RedOp kRedOp>
+__global__ __launch_bounds__(NANO_NCCL_BLOCK_THREADS, 1)
+void ring_simple_reduce_scatter_kernel(transport::simple::FifoArgs<T> args,
+                                       int nranks) {
+    int channel = blockIdx.x;
+    if (channel >= kChannels) {
+        return;
+    }
+    transport::simple::ChannelArgs<T> channel_args =
+        simple_channel_args(args, channel);
+    int nworkers = blockDim.x >= 3 * 32 ? blockDim.x - 32 : blockDim.x;
+    std::size_t part_offset = 0;
+    std::size_t part_count = 0;
+    collective::all_reduce::channel_part(args.count, channel, &part_offset,
+                                         &part_count);
+    if (part_count == 0) {
+        return;
+    }
+
+    __shared__ std::uint64_t s_send_base_step;
+    __shared__ std::uint64_t s_recv_base_step;
+    __shared__ int s_wait_status;
+    if (threadIdx.x == 0) {
+        s_send_base_step = args.control.send_base_steps[channel];
+        s_recv_base_step = args.control.recv_base_steps[channel];
+    }
+    __syncthreads();
+    std::uint64_t send_step = s_send_base_step;
+    std::uint64_t recv_step = s_recv_base_step;
+    std::uint64_t send_head_cache = s_send_base_step;
+    std::uint64_t recv_tail_cache = s_recv_base_step;
+    float inverse_nranks = 1.0f;
+    if constexpr (kRedOp == RedOp::Avg) {
+        inverse_nranks = 1.0f / static_cast<float>(nranks);
+    }
+
+    for (std::size_t elem_offset = 0; elem_offset < part_count;) {
+        const std::size_t remaining = part_count - elem_offset;
+        const std::size_t work = remaining < args.slot_elems
+            ? remaining : args.slot_elems;
+        const std::size_t rank_part_offset = part_offset + elem_offset;
+
+        // Start with the predecessor-owned chunk and walk backward so the
+        // final receive reduces directly into this rank's dense output.
+        int chunk = (args.rank + nranks - 1) % nranks;
+        std::size_t input_offset =
+            static_cast<std::size_t>(chunk) * args.count + rank_part_offset;
+        if (!direct_send<T>(
+                channel_args, args.input + input_offset, work, &send_step,
+                &send_head_cache, nworkers, &s_wait_status)) {
+            return;
+        }
+
+        for (int step = 2; step < nranks; ++step) {
+            chunk = (args.rank + nranks - step) % nranks;
+            input_offset =
+                static_cast<std::size_t>(chunk) * args.count + rank_part_offset;
+            if (!recv_reduce_send<T, kRedOp>(
+                    channel_args, args.input + input_offset, work, &recv_step,
+                    &send_step, &recv_tail_cache, &send_head_cache, nworkers,
+                    &s_wait_status)) {
+                return;
+            }
+        }
+
+        input_offset = static_cast<std::size_t>(args.rank) * args.count +
+                       rank_part_offset;
+        if (!recv_reduce_copy<T, kRedOp>(
+                channel_args, args.input + input_offset,
+                args.output + rank_part_offset, work, &recv_step,
+                &recv_tail_cache, inverse_nranks, nworkers, &s_wait_status)) {
+            return;
+        }
+        elem_offset += work;
     }
 
     __syncthreads();

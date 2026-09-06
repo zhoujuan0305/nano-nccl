@@ -3,7 +3,9 @@
 #include "nano_nccl/communicator.h"
 
 #include <cstdio>
+#include <cstdint>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <new>
 #include <stdexcept>
@@ -159,6 +161,60 @@ nano_nccl_status_t validate_buffer_args(
     return NANO_NCCL_STATUS_SUCCESS;
 }
 
+bool checked_multiply(std::size_t lhs, std::size_t rhs,
+                      std::size_t* product) {
+    if (lhs > std::numeric_limits<std::size_t>::max() / rhs) {
+        return false;
+    }
+    *product = lhs * rhs;
+    return true;
+}
+
+std::size_t dtype_size(nano_nccl_dtype_t dtype) {
+    return dtype == NANO_NCCL_DTYPE_FLOAT ? sizeof(float) : sizeof(std::uint16_t);
+}
+
+nano_nccl_status_t validate_buffer_overlap(
+    const nano_nccl_communicator_t* communicator,
+    const void* const* send_buffers, void* const* recv_buffers,
+    std::size_t send_count, std::size_t recv_count,
+    nano_nccl_dtype_t dtype) {
+    std::size_t send_bytes = 0;
+    std::size_t recv_bytes = 0;
+    const std::size_t element_size = dtype_size(dtype);
+    if (!checked_multiply(send_count, element_size, &send_bytes) ||
+        !checked_multiply(recv_count, element_size, &recv_bytes)) {
+        return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
+                    "collective byte count overflows");
+    }
+    const int rank_count = communicator->communicator->local_rank_count();
+    for (int send_rank = 0; send_rank < rank_count; ++send_rank) {
+        const std::uintptr_t send_begin =
+            reinterpret_cast<std::uintptr_t>(send_buffers[send_rank]);
+        if (send_bytes > std::numeric_limits<std::uintptr_t>::max() -
+                             send_begin) {
+            return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
+                        "collective send address range overflows");
+        }
+        const std::uintptr_t send_end = send_begin + send_bytes;
+        for (int recv_rank = 0; recv_rank < rank_count; ++recv_rank) {
+            const std::uintptr_t recv_begin =
+                reinterpret_cast<std::uintptr_t>(recv_buffers[recv_rank]);
+            if (recv_bytes > std::numeric_limits<std::uintptr_t>::max() -
+                                 recv_begin) {
+                return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
+                            "collective receive address range overflows");
+            }
+            const std::uintptr_t recv_end = recv_begin + recv_bytes;
+            if (send_begin < recv_end && recv_begin < send_end) {
+                return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
+                            "overlapping send and receive buffers are unsupported");
+            }
+        }
+    }
+    return NANO_NCCL_STATUS_SUCCESS;
+}
+
 }  // namespace
 
 extern "C" {
@@ -243,6 +299,10 @@ nano_nccl_status_t nano_nccl_all_reduce(
     if (!to_cpp_dtype(args->dtype, &dtype)) {
         return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT, "unsupported dtype value");
     }
+    status = validate_buffer_overlap(
+        communicator, args->send_buffers, args->recv_buffers, args->count,
+        args->count, args->dtype);
+    if (status != NANO_NCCL_STATUS_SUCCESS) return status;
     if (!to_cpp_redop(args->redop, &redop)) {
         return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
                     "unsupported reduction operation value");
@@ -250,7 +310,7 @@ nano_nccl_status_t nano_nccl_all_reduce(
 
     return translate_exceptions([&] {
         const int rank_count = communicator->communicator->local_rank_count();
-        nano_nccl::CollectiveArgs cpp_args{
+        nano_nccl::AllReduceArgs cpp_args{
             std::vector<const void*>(args->send_buffers,
                                      args->send_buffers + rank_count),
             std::vector<void*>(args->recv_buffers,
@@ -283,12 +343,37 @@ nano_nccl_status_t nano_nccl_reduce_scatter(
     if (!to_cpp_dtype(args->dtype, &dtype)) {
         return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT, "unsupported dtype value");
     }
+    std::size_t send_count = 0;
+    if (!checked_multiply(
+            args->recv_count,
+            static_cast<std::size_t>(
+                communicator->communicator->global_rank_count()),
+            &send_count)) {
+        return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
+                    "reduce_scatter element count overflows");
+    }
+    status = validate_buffer_overlap(
+        communicator, args->send_buffers, args->recv_buffers, send_count,
+        args->recv_count, args->dtype);
+    if (status != NANO_NCCL_STATUS_SUCCESS) return status;
     if (!to_cpp_redop(args->redop, &redop)) {
         return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
                     "unsupported reduction operation value");
     }
-    return fail(NANO_NCCL_STATUS_UNSUPPORTED,
-                "reduce_scatter is unsupported by the current implementation");
+    return translate_exceptions([&] {
+        const int rank_count = communicator->communicator->local_rank_count();
+        nano_nccl::ReduceScatterArgs cpp_args{
+            std::vector<const void*>(args->send_buffers,
+                                     args->send_buffers + rank_count),
+            std::vector<void*>(args->recv_buffers,
+                               args->recv_buffers + rank_count),
+            std::vector<cudaStream_t>(args->streams, args->streams + rank_count),
+            args->recv_count,
+            dtype,
+            redop,
+        };
+        communicator->communicator->reduce_scatter(cpp_args);
+    });
 }
 
 nano_nccl_status_t nano_nccl_all_gather(
@@ -309,8 +394,32 @@ nano_nccl_status_t nano_nccl_all_gather(
     if (!to_cpp_dtype(args->dtype, &dtype)) {
         return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT, "unsupported dtype value");
     }
-    return fail(NANO_NCCL_STATUS_UNSUPPORTED,
-                "all_gather is unsupported by the current implementation");
+    std::size_t recv_count = 0;
+    if (!checked_multiply(
+            args->send_count,
+            static_cast<std::size_t>(
+                communicator->communicator->global_rank_count()),
+            &recv_count)) {
+        return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
+                    "all_gather element count overflows");
+    }
+    status = validate_buffer_overlap(
+        communicator, args->send_buffers, args->recv_buffers, args->send_count,
+        recv_count, args->dtype);
+    if (status != NANO_NCCL_STATUS_SUCCESS) return status;
+    return translate_exceptions([&] {
+        const int rank_count = communicator->communicator->local_rank_count();
+        nano_nccl::AllGatherArgs cpp_args{
+            std::vector<const void*>(args->send_buffers,
+                                     args->send_buffers + rank_count),
+            std::vector<void*>(args->recv_buffers,
+                               args->recv_buffers + rank_count),
+            std::vector<cudaStream_t>(args->streams, args->streams + rank_count),
+            args->send_count,
+            dtype,
+        };
+        communicator->communicator->all_gather(cpp_args);
+    });
 }
 
 nano_nccl_status_t nano_nccl_check_async_error(
