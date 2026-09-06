@@ -48,7 +48,7 @@ Build artifacts:
 - `build/tests/nano_nccl_smoke` — smoke test
 - `build/tests/nano_nccl_public_api` — public C++ API coverage
 - `build/tests/nano_nccl_c_api` — public C ABI compile/link and behavior coverage
-- `build/tests/nano_nccl_collectives` — single-host ReduceScatter and AllGather finite-input matrix plus float NaN coverage
+- `build/tests/nano_nccl_collectives` — single-host ReduceScatter and AllGather finite-input matrix plus float/FP16/BF16 NaN coverage
 - `build/tests/nano_nccl_p2p_step_counters` — P2P step-counter coverage
 - `build/tests/nano_nccl_p2p_topology` — P2P topology coverage
 - `build/tests/nano_nccl_simple_protocol` — Simple protocol layout coverage
@@ -189,9 +189,13 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_smoke
 ```
 
 `--redop` accepts `sum` (the default), `avg`, `max`, and `min`. `avg` is the
-element-wise `sum / nranks`. `max` and `min` propagate NaN when either operand
-is NaN. The selected reduction operation is compiled into the device kernel;
-the rank count remains a runtime kernel parameter.
+element-wise `sum / nranks`. All four operations propagate NaN; in particular,
+`max` and `min` return NaN when either operand is NaN. This is an intentional
+`Different` (correctness-critical) choice from NCCL commit `5067397c`: NCCL's
+`src/device/reduce_kernel.h`, `Apply_Reduce<FuncMinMax<...>>`, uses ordinary
+floating-point `min`/`max` intrinsics that ignore a single NaN. The selected
+reduction operation is compiled into the device kernel; the rank count remains
+a runtime kernel parameter.
 
 ### Optional NVTX/CUDA profiling
 
@@ -269,9 +273,9 @@ descriptors:
 | `all_gather` | `AllGatherArgs::send_count` | input `send_count`, output `send_count * global_rank_count` | none |
 
 The single-host implementations support `float`, FP16, and BF16. `avg` is
-`sum / nranks`; `max` and `min` propagate NaN except for the packed FP16/BF16
-single-NaN limitation noted below. Distributed ReduceScatter and AllGather
-have not yet completed their correctness or performance acceptance matrices.
+`sum / nranks`; every reduction propagates NaN for all three dtypes, including
+packed FP16/BF16 elements. Distributed ReduceScatter and AllGather have not yet
+completed their correctness or performance acceptance matrices.
 
 ## C ABI
 
@@ -388,7 +392,7 @@ Current validated scope:
 
 - Single-host AllReduce, ReduceScatter, and AllGather; multi-host correctness and performance evidence currently covers AllReduce only
 - `float` and FP16 (`fp16`) on SM70+, and BF16 (`bf16`) on SM80+
-- `sum`, `avg`, `max`, and `min` for AllReduce and ReduceScatter; AllGather has no reduction operation. `avg` is `sum / nranks`. Float `max`/`min` propagate NaN, while packed FP16/BF16 `max`/`min` currently have a known single-NaN propagation bug
+- `sum`, `avg`, `max`, and `min` for AllReduce and ReduceScatter; AllGather has no reduction operation. `avg` is `sum / nranks`; every reduction propagates NaN for float, FP16, and BF16
 - out-of-place
 - SHM FIFO and device P2P FIFO transports, plus optional MPI/socket or MPI/RDMA for cross-process ring edges; P2P is single-node only; RDMA supports a host-pinned FIFO and opt-in host-proxy GDR
 - one build-time rank count; generated 2/4/8 rank specialization dispatch is not implemented yet. ReduceScatter/AllGather are executed at ranks 2 and 4; rank 8 is compile-tested only

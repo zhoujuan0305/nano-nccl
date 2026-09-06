@@ -166,6 +166,8 @@ __device__ __forceinline__ uint4 scale_avg_packed16(
 template <typename T, RedOp kRedOp>
 struct Packed16Traits;
 
+// Vectorization must not change the public rule that every floating reduction
+// propagates NaN, so packed max/min use the explicit NaN variants.
 template <RedOp kRedOp>
 struct Packed16Traits<__half, kRedOp> {
     static __device__ __forceinline__ std::uint32_t apply(std::uint32_t a,
@@ -176,10 +178,10 @@ struct Packed16Traits<__half, kRedOp> {
             return half2_to_bits(__hadd2(lhs, rhs));
         }
         if constexpr (kRedOp == RedOp::Max) {
-            return half2_to_bits(__hmax2(lhs, rhs));
+            return half2_to_bits(__hmax2_nan(lhs, rhs));
         }
         if constexpr (kRedOp == RedOp::Min) {
-            return half2_to_bits(__hmin2(lhs, rhs));
+            return half2_to_bits(__hmin2_nan(lhs, rhs));
         }
         return half2_to_bits(__halves2half2(
             RedOpTraits<kRedOp, __half>::apply(__low2half(lhs), __low2half(rhs)),
@@ -197,10 +199,10 @@ struct Packed16Traits<__nv_bfloat16, kRedOp> {
             return bfloat162_to_bits(__hadd2(lhs, rhs));
         }
         if constexpr (kRedOp == RedOp::Max) {
-            return bfloat162_to_bits(__hmax2(lhs, rhs));
+            return bfloat162_to_bits(__hmax2_nan(lhs, rhs));
         }
         if constexpr (kRedOp == RedOp::Min) {
-            return bfloat162_to_bits(__hmin2(lhs, rhs));
+            return bfloat162_to_bits(__hmin2_nan(lhs, rhs));
         }
         return bfloat162_to_bits(__halves2bfloat162(
             RedOpTraits<kRedOp, __nv_bfloat16>::apply(

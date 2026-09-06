@@ -49,11 +49,12 @@ drop-in replacement.
 Keep the distinction between current behavior and target architecture clear:
 
 - AllReduce, ReduceScatter, and AllGather are implemented. Their finite-input
-  matrices and float NaN semantics are validated on the single-host SHM, auto,
-  and available P2P paths; packed FP16/BF16 max/min retain the documented
-  single-NaN limitation. Current execution coverage is ranks 2 and 4 on one
-  4x RTX A6000 (SM86) host; rank 8 is compile-tested only. Distributed
-  correctness and performance evidence currently covers AllReduce only.
+  matrices are validated on the single-host SHM, auto, and available P2P paths.
+  Reduction NaN propagation for float, FP16, and BF16 is validated for
+  AllReduce on auto and for ReduceScatter on SHM, auto, and available P2P.
+  Current execution coverage is ranks 2 and 4 on one 4x RTX A6000 (SM86) host;
+  rank 8 is compile-tested only. Distributed correctness and performance
+  evidence currently covers AllReduce only.
 - The public C++ API uses distinct typed descriptors for all three collectives;
   the C ABI mirrors their distinct count and reduction semantics.
 - dtype and reduce op are compile-time kernel dimensions, but `nranks` is still

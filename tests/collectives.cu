@@ -275,49 +275,53 @@ void run_reduce_scatter(nano_nccl::Communicator* communicator) {
     run_case(nano_nccl::RedOp::Sum, kSliceBoundaryCount);
 }
 
-void run_reduce_scatter_float_nan(nano_nccl::Communicator* communicator) {
+template <nano_nccl::DType kDType>
+void run_reduce_scatter_nan(nano_nccl::Communicator* communicator) {
+    using Traits = nano_nccl::DTypeTraits<kDType>;
+    using T = typename Traits::type;
     constexpr std::size_t kRecvCount = 32;
     constexpr std::size_t kNanIndex = 3;
     const std::size_t input_count = kRecvCount * nano_nccl::kRanks;
-    CollectiveBuffers<float> buffers;
-    std::vector<float> input(input_count);
-    std::vector<float> output(kRecvCount);
+    CollectiveBuffers<T> buffers;
+    std::vector<T> input(input_count);
+    std::vector<T> output(kRecvCount);
 
     for (int rank = 0; rank < nano_nccl::kRanks; ++rank) {
         for (std::size_t index = 0; index < input_count; ++index) {
-            input[index] = input_value(rank, index);
+            input[index] = Traits::from_float(input_value(rank, index));
         }
         if (rank == 1) {
             for (int output_rank = 0; output_rank < nano_nccl::kRanks;
                  ++output_rank) {
                 input[static_cast<std::size_t>(output_rank) * kRecvCount +
-                      kNanIndex] = NAN;
+                      kNanIndex] = Traits::from_float(NAN);
             }
         }
         cuda_check(cudaSetDevice(rank), "cudaSetDevice");
         cuda_check(cudaMemcpyAsync(buffers.send(rank), input.data(),
-                                   input_count * sizeof(float),
+                                   input_count * sizeof(T),
                                    cudaMemcpyHostToDevice,
                                    buffers.stream(rank)),
                    "cudaMemcpyAsync");
     }
 
     for (nano_nccl::RedOp redop :
-         {nano_nccl::RedOp::Max, nano_nccl::RedOp::Min}) {
+         {nano_nccl::RedOp::Sum, nano_nccl::RedOp::Avg,
+          nano_nccl::RedOp::Max, nano_nccl::RedOp::Min}) {
         communicator->reduce_scatter({
             buffers.send_buffers(), buffers.recv_buffers(), buffers.streams(),
-            kRecvCount, nano_nccl::DType::Float, redop,
+            kRecvCount, kDType, redop,
         });
         buffers.synchronize();
         for (int rank = 0; rank < nano_nccl::kRanks; ++rank) {
             cuda_check(cudaSetDevice(rank), "cudaSetDevice");
             cuda_check(cudaMemcpy(output.data(), buffers.recv(rank),
-                                  output.size() * sizeof(float),
+                                  output.size() * sizeof(T),
                                   cudaMemcpyDeviceToHost),
                        "cudaMemcpy");
-            if (!std::isnan(output[kNanIndex])) {
+            if (!std::isnan(Traits::to_float(output[kNanIndex]))) {
                 throw std::runtime_error(
-                    "reduce_scatter did not propagate float NaN at rank " +
+                    "reduce_scatter did not propagate NaN at rank " +
                     std::to_string(rank));
             }
         }
@@ -371,11 +375,14 @@ int main(int argc, char** argv) {
         run_all_gather<nano_nccl::DType::Float>(communicator.get());
         run_all_gather<nano_nccl::DType::Float16>(communicator.get());
         run_reduce_scatter<nano_nccl::DType::Float>(communicator.get());
-        run_reduce_scatter_float_nan(communicator.get());
+        run_reduce_scatter_nan<nano_nccl::DType::Float>(communicator.get());
         run_reduce_scatter<nano_nccl::DType::Float16>(communicator.get());
+        run_reduce_scatter_nan<nano_nccl::DType::Float16>(communicator.get());
         if (bf16_supported()) {
             run_all_gather<nano_nccl::DType::BFloat16>(communicator.get());
             run_reduce_scatter<nano_nccl::DType::BFloat16>(communicator.get());
+            run_reduce_scatter_nan<nano_nccl::DType::BFloat16>(
+                communicator.get());
         }
         communicator->check_async_error();
         std::printf("collectives=PASS transport=%s\n",
