@@ -6,10 +6,13 @@
 extern "C" {
 #endif
 
-// Create one communicator from an MPI_COMM_WORLD subgroup. Every process in
-// MPI_COMM_WORLD must call this function with a color; key determines the rank
-// order inside that subgroup. MPI is initialized here when the embedding
-// application has not initialized it already.
+// Create a one-process-per-GPU communicator from an MPI_COMM_WORLD subgroup.
+// Every world process must call this function with a color; key determines the
+// rank order inside that subgroup. Each subgroup must contain the build-time
+// rank count. device selects this process's one GPU rank from the visible
+// CUDA devices; callers may either mask to cuda:0 or pass their local rank.
+// MPI is initialized here when the embedding application has not initialized
+// it already.
 typedef struct NanoNcclMpiSubgroupConfig {
     int color;
     int key;

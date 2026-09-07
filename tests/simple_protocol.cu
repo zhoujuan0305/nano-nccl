@@ -1,6 +1,7 @@
 #include "collective/all_reduce/ring_simple_geometry.h"
 #include "transport/simple/geometry.h"
 #include "transport/simple/protocol.h"
+#include "transport/simple/connection.h"
 #include "transport/simple/step.h"
 
 #include <chrono>
@@ -80,6 +81,12 @@ static_assert(offsetof(simple::FifoArgs<float>, control) ==
               56 + sizeof(void*) * 4 * nano_nccl::kChannels);
 static_assert(offsetof(simple::ChannelArgs<float>, slot_elems) == 0);
 static_assert(offsetof(simple::ChannelArgs<float>, send_fifo) == 16);
+static_assert(simple::kConnectionControlBytes ==
+              2 * nano_nccl::kChannels * sizeof(std::uint64_t));
+static_assert(simple::kConnectionDataOffset % 256 == 0);
+static_assert(simple::kConnectionRegionBytes ==
+              simple::kConnectionDataOffset +
+                  nano_nccl::kChannels * simple::kFifoBytes);
 static_assert(offsetof(simple::ChannelArgs<float>, send_head) == 32);
 static_assert(offsetof(simple::ChannelArgs<float>, send_payload_bytes) == 64);
 static_assert(offsetof(simple::ChannelArgs<float>, abort) == 80);

@@ -7,9 +7,9 @@
 
 namespace nano_nccl {
 
-// GPU 数 / channel 数 / block 线程数为编译期常量，由 CMake 通过
+// 全局 rank 数 / channel 数 / block 线程数为编译期常量，由 CMake 通过
 // NANO_NCCL_NRANKS / NANO_NCCL_NCHANNELS / NANO_NCCL_BLOCK_THREADS 注入；
-// 默认 4/4/512 对应当前单机 4 GPU 基线。宏兜底保证脱离 CMake 也能编译。
+// 默认 4/4/512 对应 4 个单 GPU 进程。宏兜底保证脱离 CMake 也能编译。
 #ifndef NANO_NCCL_NRANKS
 #define NANO_NCCL_NRANKS 4
 #endif
@@ -48,6 +48,7 @@ inline bool parse_transport(const char* text, TransportKind* transport) {
     if (std::strcmp(text, "auto") == 0) { *transport = TransportKind::Auto; return true; }
     if (std::strcmp(text, "shm") == 0) { *transport = TransportKind::Shm; return true; }
     if (std::strcmp(text, "p2p") == 0) { *transport = TransportKind::P2p; return true; }
+    if (std::strcmp(text, "socket") == 0) { *transport = TransportKind::Socket; return true; }
     if (std::strcmp(text, "rdma") == 0) { *transport = TransportKind::Rdma; return true; }
     return false;
 }
@@ -93,6 +94,7 @@ struct BenchConfig {
     DType dtype = DType::Float;
     RedOp redop = RedOp::Sum;
     TransportKind transport = TransportKind::Auto;
+    int device = -1;
     std::size_t min_bytes = 262144;
     std::size_t max_bytes = 67108864;
     int factor = 4;

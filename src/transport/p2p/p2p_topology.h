@@ -34,5 +34,7 @@ void enable_p2p_ring_peer_access_or_throw(const RingTransportPlan& plan);
 void enable_p2p_ring_peer_access_or_throw(
     const RingTransportPlan& plan,
     const collective::all_reduce::ProcessTopology& topology);
+bool has_bidirectional_direct_nvlink(const char* first_pci_bus_id,
+                                     const char* second_pci_bus_id);
 
 }  // namespace nano_nccl::transport::p2p

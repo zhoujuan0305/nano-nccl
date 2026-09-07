@@ -1,322 +1,228 @@
 # nano-nccl
 
-[中文说明](README.zh.md)
+[中文](README.zh.md)
 
-A focused GPU collective communication library implementing out-of-place
-AllReduce, ReduceScatter, and AllGather with `Ring` + `Simple`. The three
-collectives have finite-input correctness coverage on the single-host SHM,
-auto, and available P2P paths. Optional MPI/socket and MPI/RDMA paths currently
-have multi-host correctness and performance evidence for AllReduce only. RDMA
-defaults to a host-pinned FIFO, with opt-in host-proxy GPUDirect RDMA via
-`NANO_NCCL_RDMA_GDR=1`; the data plane defaults to SEND/RECV, with optional
-WRITE+CTS via `NANO_NCCL_RDMA_USE_WRITE=1`.
+nano-nccl is a deliberately narrow GPU collective communication library. It
+implements out-of-place AllReduce, ReduceScatter, and AllGather with readable
+`Ring` + `Simple` code. It is not a drop-in NCCL replacement and does not
+promise NCCL API or ABI compatibility.
 
-Current ReduceScatter/AllGather execution coverage is 2 and 4 ranks on one
-4x RTX A6000 (SM86) host with forced SHM, auto, and forced P2P. The 8-rank
-configuration is compile-tested only and is not claimed as validated support.
+The current execution model is **one OS process per GPU rank**: every MPI rank
+in a communicator selects and owns one GPU. This matches the usual
+PyTorch/nano-megatron model, so each public collective descriptor contains one
+local `send_buffer`, `recv_buffer`, and `stream`.
 
----
+## Implemented scope
 
-## Performance
+- Collectives: AllReduce, ReduceScatter, and AllGather
+- Algorithm and protocol: Ring only, Simple only
+- Dtypes: `float`, FP16, and BF16
+- Reduce ops: `sum`, `avg`, `max`, and `min`; AllGather has no reduce op
+- Buffers: out-of-place only; arbitrary overlap and in-place are unsupported
+- Ranks: build-time `NANO_NCCL_NRANKS`; the contract set is 2, 4, and 8
+- Same-host interprocess transports: SHM, CUDA IPC P2P, and per-edge `auto`
+- Cross-host transports: Socket, host-pinned RDMA, and optional GDR
 
-[Detailed performance results](performance.md) record the tested topology, environment, and point-by-point NCCL comparisons for in-process auto (P2P/SHM), two-host TCP socket, host-pinned RDMA, and two-host RDMA GDR (`float` / FP16 / BF16 × `sum` / `avg` / `max` / `min`).
+The one-process-per-GPU path has been validated on one 4x RTX A6000 (SM86)
+host as follows:
 
----
+- rank 2: explicit SHM, explicit CUDA IPC P2P, and `auto`
+- rank 4: explicit SHM, explicit CUDA IPC P2P, and `auto`
+- all three collectives, `float`/FP16/BF16, and every applicable reduce op
+- NaN propagation for AllReduce and ReduceScatter
+- the native C++ API and C ABI v2
+- injected SHM allocation/registration and CUDA IPC allocation/open failures,
+  each followed by successful communicator reconstruction
+
+CUDA IPC P2P is selected from a real open/close probe, so a working PCIe P2P
+edge is accepted even without direct NVLink. Rank 8 is not validated support
+until it has matching hardware execution coverage.
+
+The historical tables in [performance.md](performance.md) predate the
+one-process-per-GPU contract. Unless a result is explicitly marked as
+revalidated, it is not acceptance evidence for this architecture.
+
+A post-change rank-2 repeatability smoke (`float`/`sum`, `-w 5 -n 20`, three
+runs) produced median busbw of 7.60/19.39/26.62/32.62/34.36 GB/s for P2P and
+5.57/10.91/13.62/15.08/15.32 GB/s for SHM at 256 KiB/1 MiB/4 MiB/16 MiB/64
+MiB, with zero wrong values. These are nano-nccl-only smoke numbers, not a
+same-round NCCL comparison or performance acceptance result.
+
+## Same-host interprocess transports
+
+Transport is resolved independently for every directed Ring edge:
+
+- `p2p`: the receiver allocates a Simple FIFO/control region on its GPU and
+  exports it with `cudaIpcGetMemHandle`; the sender maps it with
+  `cudaIpcOpenMemHandle`. Selection requires a successful CUDA IPC probe for
+  that edge; NVLink and PCIe P2P are both valid.
+- `shm`: the receiver owns a POSIX shared-memory FIFO/control region created
+  with `shm_open`; both neighboring processes `mmap` it and expose it to their
+  GPUs with `cudaHostRegisterMapped`.
+- `auto`: a same-host edge uses CUDA IPC P2P when available and SHM otherwise;
+  a cross-host edge uses Socket. Different edges may resolve to a `mixed` plan.
+
+An explicit `p2p` or `shm` request fails during communicator creation if any
+edge cannot satisfy it, and the error names the directed edge and available
+backend. `Communicator::edge_transport` and `nano_nccl_edge_transport` expose
+the resolved backend of every directed edge. Simple step/credit and system-scope release/acquire
+ordering remain transport-neutral; the SHM and CUDA IPC backends own only
+region allocation, exchange, mapping, and lifetime.
 
 ## Build
 
-Dependencies: CUDA 12+, CMake 3.18+, libnuma-dev. Distributed builds require Open MPI 4.1.2 on every host with the same MPI ABI. RDMA builds additionally require libibverbs-dev.
+Dependencies are CUDA 12+, CMake 3.18+, and libnuma-dev. Communicator
+bootstrap, interprocess transports, and the benchmark require the Open MPI
+4.1.2 C ABI, so a normal runnable build enables MPI:
 
 ```bash
-mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release \
-  -DNANO_NCCL_NRANKS=<your_gpu_count> \
-  -DNANO_NCCL_CUDA_ARCH=<your_cuda_arch>
-make -j$(nproc)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DNANO_NCCL_ENABLE_MPI=ON \
+  -DNANO_NCCL_NRANKS=4 \
+  -DNANO_NCCL_CUDA_ARCH=86
+cmake --build build -j$(nproc)
+ctest --test-dir build --output-on-failure
 ```
 
-For example, for a 4-GPU RTX A6000 (sm_86) system:
+`NANO_NCCL_NRANKS` is the global MPI process count for a communicator, not the
+number of GPUs owned by one process. A process may see one GPU and use local
+`cuda:0`, or see multiple GPUs and select exactly one with
+`CommunicatorConfig::device`. Communicator creation rejects two same-host MPI
+ranks that select the same physical CUDA device.
 
-```bash
-cmake .. -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=86
-```
+Important build products:
 
-Build artifacts:
+- `build/src/libnano_nccl.a`: core implementation and collective C ABI
+- `build/src/libnano_nccl_mpi.a`: native MPI communicator factory
+- `build/src/libnano_nccl_mpi_c.so`: MPI C adapter for Python/ctypes consumers
+- `build/benchmarks/nano_nccl_all_reduce_bench`: one-process-per-GPU benchmark
+- `build/tests/nano_nccl_mpi_native_api`: native correctness matrix for all collectives
+- `build/tests/nano_nccl_mpi_c_api`: C ABI v2 smoke matrix for all collectives
 
-- `build/benchmarks/nano_nccl_all_reduce_bench` — perf + correctness benchmark
-- `build/tests/nano_nccl_correctness` — correctness-only test
-- `build/tests/nano_nccl_smoke` — smoke test
-- `build/tests/nano_nccl_public_api` — public C++ API coverage
-- `build/tests/nano_nccl_c_api` — public C ABI compile/link and behavior coverage
-- `build/tests/nano_nccl_collectives` — single-host ReduceScatter and AllGather finite-input matrix plus float/FP16/BF16 NaN coverage
-- `build/tests/nano_nccl_p2p_step_counters` — P2P step-counter coverage
-- `build/tests/nano_nccl_p2p_topology` — P2P topology coverage
-- `build/tests/nano_nccl_simple_protocol` — Simple protocol layout coverage
-- `build-mpi/tests/nano_nccl_mpi_correctness` — MPI/socket correctness test (MPI build)
-- `build-mpi/tests/nano_nccl_mpi_bootstrap` — MPI bootstrap smoke test (MPI build)
-- `build-mpi/tests/nano_nccl_socket_protocol` — socket framing and proxy test (MPI build)
-- `build-rdma/tests/nano_nccl_rdma_protocol` — RDMA protocol-layout test (MPI/RDMA build)
-- `build-rdma/tests/nano_nccl_rdma_bootstrap` — local RC QP bootstrap smoke test (MPI/RDMA build)
-- `build-rdma/tests/nano_nccl_rdma_gdr` — GDR device-registration and receive-flush capability test (MPI/RDMA build)
+Common CMake options:
 
-When `BUILD_TESTING` is enabled (the default), `ctest --test-dir build
---output-on-failure` also runs the static BF16 capability-validation regression
-and benchmark profiling static regressions, including the CQE -> GDR flush ->
-`recv_tail` publication-order check.
-
-### CMake options
-
-| Option | Default | Description |
-|---|---|---|
-| `NANO_NCCL_NRANKS` | 4 | Number of GPU ranks |
-| `NANO_NCCL_NCHANNELS` | 4 | Number of channels |
-| `NANO_NCCL_CUDA_ARCH` | 70 | CUDA compute capability (e.g. 70 for Volta, 75 for Turing, 86 for Ampere); values below 70 are rejected |
+| Option | Default | Meaning |
+|---|---:|---|
+| `NANO_NCCL_NRANKS` | 4 | Global ranks/processes in one communicator |
+| `NANO_NCCL_NCHANNELS` | 4 | Channel count |
+| `NANO_NCCL_CUDA_ARCH` | 70 | CUDA compute capability; values below 70 are rejected |
 | `NANO_NCCL_BLOCK_THREADS` | 512 | Threads per block |
-| `NANO_NCCL_FIFO_BUFF_BYTES` | 33554432 | FIFO buffer size in bytes (32 MiB) |
-| `NANO_NCCL_ENABLE_MPI` | `OFF` | Build the MPI communicator bootstrap and distributed benchmark/test |
-| `NANO_NCCL_ENABLE_RDMA` | `OFF` | Build the RC send/receive RDMA transport; requires `NANO_NCCL_ENABLE_MPI=ON` and libibverbs |
-| `NANO_NCCL_SOCKET_TEST_FAULT_INJECTION` | `OFF` | Build a separate test-only fault-injection library for `nano_nccl_mpi_correctness`; ordinary MPI benchmarks never include the hook |
-| `NANO_NCCL_ENABLE_BENCH_PROFILING` | `OFF` | Compile NVTX/CUDA-profiler instrumentation into the all-reduce benchmark; keep `OFF` for reported bandwidth |
+| `NANO_NCCL_FIFO_BUFF_BYTES` | 33554432 | FIFO bytes per channel |
+| `NANO_NCCL_ENABLE_MPI` | `OFF` | Build MPI bootstrap, interprocess transports, and benchmark |
+| `NANO_NCCL_ENABLE_RDMA` | `OFF` | Build RC RDMA; requires MPI and libibverbs |
+| `NANO_NCCL_ENABLE_BENCH_PROFILING` | `OFF` | Add NVTX/CUDA profiling to the benchmark; keep off for acceptance runs |
 
-`float` and FP16 require SM70+ because Simple FIFO counters use system-scope
-release/acquire operations. BF16 requires SM80+.
+`float` and FP16 require SM70+ because Simple counters use system-scope
+ordering. BF16 requires SM80+.
 
-NUMA topology is detected at runtime by reading `/sys/bus/pci/devices/*/numa_node` — no source code changes needed when moving to a different machine.
+## Run
 
-### Optional MPI/socket build
-
-Build the same commit on each host with the global GPU count. The socket listener is IPv4-only; set `NANO_NCCL_SOCKET_IFNAME` to an interface that resolves to exactly one usable IPv4 address. The socket connection has no TLS, authentication, or automatic reconnect, so use it only on a trusted private network.
-
-```bash
-cmake -S . -B build-mpi -DCMAKE_BUILD_TYPE=Release \
-  -DNANO_NCCL_ENABLE_MPI=ON -DNANO_NCCL_NRANKS=8 -DNANO_NCCL_CUDA_ARCH=86
-cmake --build build-mpi -j$(nproc)
-```
-
-### Optional MPI/RDMA build
-
-Build the same commit on every host with the global GPU count (`RdmaPeerInfo` is
-64 bytes; mismatched commits fail bootstrap). RDMA defaults to RC send/receive
-over registered host-pinned FIFO memory; the host proxy multi-flights SEND/RECV
-up to Simple FIFO slice depth with selective CQ signaling. Empty Simple trailing
-slices do not take a network round-trip. Set `NANO_NCCL_RDMA_USE_WRITE=1` to
-opt into the WRITE+CTS data plane (RC `WRITE_WITH_IMM` plus a host-pinned CTS
-slot ring); unset/`0` keeps SEND/RECV. Set `NANO_NCCL_RDMA_GDR=1` to place the
-data FIFO in registered GPU memory while the host proxy still posts work. GDR
-is explicit: unavailable registration or receive-visibility support fails
-during setup instead of falling back to host-pinned memory. Compare the
-host-pinned path against NCCL with `NCCL_NET_GDR_LEVEL=0`, and the GDR path with
-GDR enabled in NCCL. SEND and WriteCts post SGE from the registered FIFO
-(`fifo_mr_`). After worker FIFO stores and a full-block sync, the publisher
-advances `send_tail` with `st.release.sys`; proxies load it with acquire (no
-host bounce path). On GDR receive, the proxy flushes completed third-party
-writes with the CUDA GPUDirect ordering API before publishing `recv_tail` when
-the device does not provide native ordering. The system-scope counter ordering
-does not replace this receive-data flush. The host-pinned and GDR WRITE+CTS
-  matrices (float/fp16/bf16 × sum/avg/max/min, 256 KiB–64 MiB) are in
-  [performance.md](performance.md) with `#wrong=0` (dedicated progress
-  default). The MPI binding uses the MPI C API,
-  so an Open MPI installation need not ship the retired C++ binding library.
+The launcher may expose only the process-local GPU. This same-host example
+uses Open MPI's local rank to set `CUDA_VISIBLE_DEVICES`, making `--device 0`
+implicit:
 
 ```bash
-cmake -S . -B build-rdma -DCMAKE_BUILD_TYPE=Release \
-  -DNANO_NCCL_ENABLE_MPI=ON -DNANO_NCCL_ENABLE_RDMA=ON \
-  -DNANO_NCCL_NRANKS=<global_gpu_count> -DNANO_NCCL_CUDA_ARCH=<cuda_arch>
-cmake --build build-rdma -j$(nproc)
-```
-
-Set `NANO_NCCL_SOCKET_IFNAME=<interface>` and
-`NANO_NCCL_RDMA_IFNAME=<rdma-interface>` in every MPI process. Set
-`NANO_NCCL_RDMA_GID_INDEX=<gid-index>` when the default GID entry is not
-routable. Use `--transport rdma`; cross-process ring edges use RDMA and local
-edges resolve like `auto` (P2P when bidirectional NVLink peer access is
-available, otherwise SHM), so the reported aggregate transport is normally
-`mixed`. For a host-pinned comparison use `NCCL_NET_GDR_LEVEL=0`; for a GDR
-comparison enable GDR in both implementations. Bind Open MPI TCP/OOB to the bootstrap interface (`btl_tcp_if_include` /
-`oob_tcp_if_include`) so MPI does not pick a non-routable NIC.
-
-For a two-host, four-GPU-per-host correctness launch:
-
-```bash
-mpirun \
-  -np 1 --host <host-a> -x NANO_NCCL_SOCKET_IFNAME=<interface> \
-    ./build-mpi/tests/nano_nccl_mpi_correctness --dtype float \
-  : -np 1 --host <host-b> -x NANO_NCCL_SOCKET_IFNAME=<interface> \
-    ./build-mpi/tests/nano_nccl_mpi_correctness --dtype float
-```
-
-RDMA bench (one 4-GPU process per host; matching trees on every host):
-
-```bash
-mpirun --mca btl_tcp_if_include <interface> --mca oob_tcp_if_include <interface> \
-  --host <host-a>:1 -np 1 \
-  -x CUDA_VISIBLE_DEVICES -x LD_LIBRARY_PATH \
-  -x NANO_NCCL_SOCKET_IFNAME -x NANO_NCCL_RDMA_IFNAME -x NANO_NCCL_RDMA_GID_INDEX \
-  ./build-rdma/benchmarks/nano_nccl_all_reduce_bench \
-    --algo ring_simple --transport rdma --dtype float --redop sum \
-    -b 262144 -e 67108864 -f 4 -w 5 -n 20 : \
-  --host <host-b>:1 -np 1 \
-  -x CUDA_VISIBLE_DEVICES -x LD_LIBRARY_PATH \
-  -x NANO_NCCL_SOCKET_IFNAME -x NANO_NCCL_RDMA_IFNAME -x NANO_NCCL_RDMA_GID_INDEX \
-  ./build-rdma/benchmarks/nano_nccl_all_reduce_bench \
-    --algo ring_simple --transport rdma --dtype float --redop sum \
+mpirun -np 4 --bind-to none bash -c '
+  export CUDA_VISIBLE_DEVICES=$OMPI_COMM_WORLD_LOCAL_RANK
+  exec ./build/benchmarks/nano_nccl_all_reduce_bench \
+    --algo ring_simple --transport auto --dtype float --redop sum \
     -b 262144 -e 67108864 -f 4 -w 5 -n 20
+'
 ```
 
----
-
-## Usage
+Explicit SHM and P2P correctness runs:
 
 ```bash
-# Benchmark (perf + correctness)
-CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
-  --algo ring_simple --dtype float --redop sum --transport auto \
-  -b 262144 -e 67108864 -f 4 -w 5 -n 20
+mpirun -np 4 --bind-to none bash -c '
+  export CUDA_VISIBLE_DEVICES=$OMPI_COMM_WORLD_LOCAL_RANK
+  exec ./build/tests/nano_nccl_mpi_native_api shm
+'
 
-# FP16 and BF16 correctness/performance runs (BF16 requires SM80+)
-CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
-  --algo ring_simple --dtype fp16 --redop max --transport auto \
-  -b 262144 -e 67108864 -f 4 -w 5 -n 20
-CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
-  --algo ring_simple --dtype bf16 --redop avg --transport auto \
-  -b 262144 -e 67108864 -f 4 -w 5 -n 20
-
-# Correctness-only test
-CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_correctness
-
-# Smoke test
-CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_smoke
+# Use only when the CUDA IPC probe succeeds for every Ring edge.
+mpirun -np 2 --bind-to none bash -c '
+  export CUDA_VISIBLE_DEVICES=$OMPI_COMM_WORLD_LOCAL_RANK
+  exec ./build/tests/nano_nccl_mpi_native_api p2p
+'
 ```
 
-`--redop` accepts `sum` (the default), `avg`, `max`, and `min`. `avg` is the
-element-wise `sum / nranks`. All four operations propagate NaN; in particular,
-`max` and `min` return NaN when either operand is NaN. This is an intentional
-`Different` (correctness-critical) choice from NCCL commit `5067397c`: NCCL's
-`src/device/reduce_kernel.h`, `Apply_Reduce<FuncMinMax<...>>`, uses ordinary
-floating-point `min`/`max` intrinsics that ignore a single NaN. The selected
-reduction operation is compiled into the device kernel; the rank count remains
-a runtime kernel parameter.
+`--redop` accepts `sum`, `avg`, `max`, and `min`. `avg` means element-wise
+`sum / nranks`. nano-nccl propagates NaN for every reduce op and dtype,
+including packed FP16/BF16 `max` and `min`.
 
-### Optional NVTX/CUDA profiling
+## Native C++ API
 
-Build a separate profiling binary; do not use this build for performance comparisons:
-
-```bash
-cmake -S . -B build-profile -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
-  -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=86 \
-  -DNANO_NCCL_ENABLE_BENCH_PROFILING=ON
-cmake --build build-profile -j$(nproc)
-nsys profile --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop --output=bench-nvtx-profile \
-  ./build-profile/benchmarks/nano_nccl_all_reduce_bench \
-  --algo ring_simple --transport auto --dtype float -b 262144 -e 262144 -f 2 -w 1 -n 2
-nsys stats --report nvtx_pushpop_sum bench-nvtx-profile.nsys-rep
-```
-
-For every message size, the capture contains an outer `all_reduce size=<bytes>B` range and one `all_reduce size=<bytes>B iteration=<iteration>` range per measured iteration. Warmup is outside capture. CUDA 12.8 emits an NVTX 2 deprecation notice for `<nvToolsExt.h>`; it does not invalidate the capture.
-
-## Public C++ API
-
-`nano_nccl/communicator.h` exposes a move-only `Communicator` for one process
-that owns all configured local GPUs. The caller owns the device buffers and
-CUDA streams. Buffer and stream arrays must have one entry per device, in the
-same order as `CommunicatorConfig::devices`.
+The caller initializes MPI, then creates nano-nccl from an MPI communicator
+containing exactly `NANO_NCCL_NRANKS` processes. `CommunicatorConfig::device`
+selects the one GPU rank owned by this process. With torchrun-style unmasked
+visibility, pass `local_rank`; with per-process masking, pass `0`.
 
 ```cpp
-#include "nano_nccl/communicator.h"
+#include "nano_nccl/mpi.h"
 
-#include <memory>
-#include <vector>
+MPI_Init(&argc, &argv);
 
-std::vector<int> devices{0, 1, 2, 3};
-nano_nccl::CommunicatorConfig config{devices};
-std::unique_ptr<nano_nccl::Communicator> communicator =
-    nano_nccl::create_communicator(config);
+nano_nccl::CommunicatorConfig config;
+config.device = 0;
+config.transport = nano_nccl::TransportKind::Auto;
+auto communicator =
+    nano_nccl::create_communicator_from_mpi(MPI_COMM_WORLD, config);
 
-std::vector<const void*> send_buffers(devices.size());
-std::vector<void*> recv_buffers(devices.size());
-std::vector<cudaStream_t> streams(devices.size());
-
-// Allocate one out-of-place send/receive pair and one stream on each device.
-// send_buffers[i], recv_buffers[i], and streams[i] must belong to devices[i].
-// ... cudaSetDevice(devices[i]), cudaMalloc, cudaStreamCreateWithFlags ...
-
-constexpr std::size_t count = 1 << 20;  // Elements per local rank.
+// send, recv, and stream belong to config.device.
 nano_nccl::AllReduceArgs args{
-    send_buffers,
-    recv_buffers,
-    streams,
+    send,
+    recv,
+    stream,
     count,
     nano_nccl::DType::Float,
     nano_nccl::RedOp::Sum,
 };
-
-communicator->all_reduce(args);  // Enqueues work; it does not synchronize.
-
-for (std::size_t i = 0; i < devices.size(); ++i) {
-    cudaSetDevice(devices[i]);
-    cudaStreamSynchronize(streams[i]);
-}
+communicator->all_reduce(args);  // Enqueues work; does not synchronize.
+cudaStreamSynchronize(stream);
 communicator->check_async_error();
+
+communicator.reset();
+MPI_Finalize();
 ```
 
-The single-host adapter requires `devices` to be the visible-device sequence
-`{0, ..., NANO_NCCL_NRANKS - 1}`. In an MPI build, `nano_nccl/mpi.h` provides
-`create_communicator_from_mpi(MPI_COMM_WORLD, config)` for a distributed
-communicator. All three operations are out-of-place and use distinct typed
-descriptors:
+The three typed descriptors have these count and layout semantics:
 
-| Operation | Descriptor count | Per-rank buffer layout | Reduction |
+| Operation | Count field | Local input | Local output |
 |---|---|---|---|
-| `all_reduce` | `AllReduceArgs::count` | input `count`, output `count` | `sum`, `avg`, `max`, `min` |
-| `reduce_scatter` | `ReduceScatterArgs::recv_count` | input `recv_count * global_rank_count`, output `recv_count` | `sum`, `avg`, `max`, `min` |
-| `all_gather` | `AllGatherArgs::send_count` | input `send_count`, output `send_count * global_rank_count` | none |
+| `all_reduce` | `AllReduceArgs::count` | `count` | `count` |
+| `reduce_scatter` | `ReduceScatterArgs::recv_count` | `recv_count * global_rank_count` | `recv_count` |
+| `all_gather` | `AllGatherArgs::send_count` | `send_count` | `send_count * global_rank_count` |
 
-The single-host implementations support `float`, FP16, and BF16. `avg` is
-`sum / nranks`; every reduction propagates NaN for all three dtypes, including
-packed FP16/BF16 elements. Distributed ReduceScatter and AllGather have not yet
-completed their correctness or performance acceptance matrices.
+The caller owns both buffers and the non-null CUDA stream. Input and output
+byte ranges must not be identical or partially overlap. Destroy the
+communicator before releasing its buffers/stream and before `MPI_Finalize`.
 
-## C ABI
+## C ABI v2 and the nano-megatron adapter
 
-`nano_nccl/nano_nccl.h` exposes an exception-safe C ABI in the existing static
-`nano_nccl` library. It provides an opaque communicator, lifecycle and query
-functions, stable-width status/dtype/redop/transport values, thread-local error
-details, and distinct argument structures for the three scoped collectives.
-It is not NCCL API or ABI compatible and has no shared-library/SONAME contract.
-
-The caller owns all device buffers and streams. Each pointer/stream array has
-one entry per local rank in communicator device order. Calls enqueue work and
-do not synchronize the supplied streams. Input and output byte ranges must not
-overlap, including partial or cross-entry overlap.
-
-| Function | Count field | Per-rank buffer layout | Current result |
-|---|---|---|---|
-| `nano_nccl_all_reduce` | `count` | input `count`, output `count` | implemented |
-| `nano_nccl_reduce_scatter` | `recv_count` | input `recv_count * global_rank_count`, output `recv_count` | implemented; single-host validated |
-| `nano_nccl_all_gather` | `send_count` | input `send_count`, output `send_count * global_rank_count` | implemented; single-host validated |
+`nano_nccl/nano_nccl.h` provides an exception-safe C ABI. Its MPI factory is in
+`nano_nccl/mpi_c_api.h` and exported by `libnano_nccl_mpi_c.so`. ABI v2 changes
+collective descriptors from local-rank arrays to one scalar pointer/stream and
+removes the old in-process multi-GPU `nano_nccl_create_communicator` factory.
 
 ```c
-#include "nano_nccl/nano_nccl.h"
+#include "nano_nccl/mpi_c_api.h"
 
-#include <stdio.h>
-
-int devices[] = {0, 1, 2, 3};
-nano_nccl_communicator_config_t config = {
-    devices, 4, NANO_NCCL_TRANSPORT_AUTO,
+nano_nccl_mpi_subgroup_config_t config = {
+    .color = dp_group_id,
+    .key = dp_rank,
+    .device = local_rank,  // Use 0 instead when CUDA_VISIBLE_DEVICES is masked.
+    .transport = NANO_NCCL_TRANSPORT_AUTO,
 };
 nano_nccl_communicator_t* communicator = NULL;
 nano_nccl_status_t status =
-    nano_nccl_create_communicator(&config, &communicator);
+    nano_nccl_create_mpi_subgroup_communicator(&config, &communicator);
 
-// Allocate and populate one out-of-place buffer pair and stream per device.
-const void* send_buffers[4];
-void* recv_buffers[4];
-cudaStream_t streams[4];
-size_t count = 1 << 20;
 nano_nccl_all_reduce_args_t args = {
-    send_buffers, recv_buffers, streams, count,
-    NANO_NCCL_DTYPE_FLOAT, NANO_NCCL_REDOP_SUM,
+    .send_buffer = send,
+    .recv_buffer = recv,
+    .stream = stream,
+    .count = count,
+    .dtype = NANO_NCCL_DTYPE_FLOAT,
+    .redop = NANO_NCCL_REDOP_SUM,
 };
 if (status == NANO_NCCL_STATUS_SUCCESS) {
     status = nano_nccl_all_reduce(communicator, &args);
@@ -328,87 +234,62 @@ if (status != NANO_NCCL_STATUS_SUCCESS) {
 nano_nccl_destroy_communicator(communicator);
 ```
 
-`nano_nccl_get_last_error()` remains valid until the next stateful C ABI call
-on the same thread; ABI/status query functions do not clear it.
-`nano_nccl_check_async_error()` reports a communicator's latched asynchronous
-transport error after stream synchronization.
+The adapter's `color` selects a subgroup of `MPI_COMM_WORLD`; `key` determines
+its Ring rank order. Every subgroup must contain the build-time
+`NANO_NCCL_NRANKS` processes. If the embedding application has not initialized
+MPI, the adapter initializes it with `MPI_THREAD_FUNNELED` and releases its
+owned MPI state after the last adapter-created communicator is destroyed.
 
-With `NANO_NCCL_ENABLE_MPI=ON`, the build also produces
-`libnano_nccl_mpi_c.so`. Its C ABI in `nano_nccl/mpi_c_api.h` lets an embedding
-runtime split `MPI_COMM_WORLD` into independent collective groups. The factory
-returns the same opaque handle used by `nano_nccl_all_reduce`, communicator
-queries, asynchronous error checks, and `nano_nccl_destroy_communicator`. Each
-one-GPU process selects `cuda:0`; processes with the same color form a
-communicator, and the key fixes their Ring rank order. The adapter initializes
-MPI when needed and releases its subgroup during normal handle destruction.
+The nano-megatron ctypes adapter must move with ABI v2: expect version `2`, use
+direct `c_void_p` fields for each collective buffer/stream, and stop building
+length-one pointer arrays. An ABI v1 consumer cannot load an ABI v2 library.
 
-### Transport selection
+## Cross-host Socket/RDMA
 
-`--transport` accepts `auto`, `shm`, and `p2p` on a single host. Distributed
-MPI communicators accept `auto` and `rdma`; `auto` resolves cross-process ring
-edges to socket, while explicit `rdma` selects RDMA for those edges only when
-built with MPI/RDMA support.
+The Socket listener is IPv4-only. Each process sets
+`NANO_NCCL_SOCKET_IFNAME=<interface>`. It has no TLS, authentication, or
+automatic reconnect and must only be used on a trusted private network.
 
-- `auto` (the default) selects P2P independently for each ring edge only when
-  it has a direct NVLink and CUDA peer access in both directions; other edges
-  use SHM. The resulting transport is `shm`, `p2p`, or `mixed`.
-- `shm` forces the mapped-host-memory SHM FIFO path.
-- `p2p` requires that every ring edge has the required bidirectional peer
-  access and fails during setup on the first unavailable direction.
-- `rdma` requires `NANO_NCCL_ENABLE_MPI=ON` and `NANO_NCCL_ENABLE_RDMA=ON`.
-  It uses multi-flight RC RDMA (up to Simple FIFO slice depth, selective CQ
-  signal, empty-slice elision) for cross-process ring edges and resolves local
-  edges like `auto` (P2P when bidirectional NVLink peer access is available,
-  otherwise SHM). Default data plane is SEND/RECV; `NANO_NCCL_RDMA_USE_WRITE=1`
-  selects WRITE+CTS. `NANO_NCCL_RDMA_GDR=1` moves the data FIFO to registered
-  GPU memory without changing host-proxy progress; unsupported GDR setup fails
-  explicitly. Both hosts must build the same commit (64-byte
-  `RdmaPeerInfo`). SEND/WriteCts post from the registered mapped FIFO; after
-  worker stores and block sync, the publisher uses `st.release.sys(send_tail)`
-  (host acquire loads; no host bounce). Small Simple slices may post recv
-  credit immediately after consuming the recv FIFO. Cross-process RDMA edges
-  default to dedicated per-proxy host threads; set
-  `NANO_NCCL_RDMA_SHARED_PROGRESS=1` for one shared progress thread. GDR receive
-  completion is flushed before `recv_tail` publication when native GPU/RDMA
-  write ordering is insufficient. Host-pinned and GDR WRITE+CTS comparisons
-  are in [performance.md](performance.md).
+RDMA build:
 
-P2P is a single-node transport. It requires CUDA peer access for the complete
-configured ring; it is not a multi-node or network transport. Socket uses a
-trusted, IPv4-only TCP network boundary and has no TLS or auto reconnect.
+```bash
+cmake -S . -B build-rdma -DCMAKE_BUILD_TYPE=Release \
+  -DNANO_NCCL_ENABLE_MPI=ON -DNANO_NCCL_ENABLE_RDMA=ON \
+  -DNANO_NCCL_NRANKS=<global-rank-count> \
+  -DNANO_NCCL_CUDA_ARCH=<cuda-arch>
+cmake --build build-rdma -j$(nproc)
+```
 
-### Implementation ownership
+Each process also sets `NANO_NCCL_RDMA_IFNAME=<rdma-interface>` and, when
+needed, `NANO_NCCL_RDMA_GID_INDEX=<gid-index>`. The default data plane is a
+registered host-pinned FIFO with RC SEND/RECV.
+`NANO_NCCL_RDMA_USE_WRITE=1` selects WRITE+CTS, and
+`NANO_NCCL_RDMA_GDR=1` explicitly selects GPU memory registration. Unsupported
+GDR setup fails rather than falling back. `rdma` still resolves same-host edges
+with the P2P/SHM auto rule and uses RDMA only for cross-host edges, so the
+aggregate result is commonly `mixed`.
 
-- `src/transport/simple/` owns the Simple FIFO layout, step ordering, and slice geometry.
+## Implementation ownership
+
+- `src/transport/simple/` owns the Simple FIFO layout, step ordering, and slice geometry,
+  including distinct send and recv base steps.
 - `src/transport/shm/` owns mapped host FIFO storage and control only.
+- `src/transport/p2p/` owns CUDA IPC allocation, handle exchange, mapping, and
+  capability checks.
 - `src/collective/all_reduce/ring_simple_geometry.h` owns Ring channel/rank work partitioning.
 
-Persistent progress uses distinct send and recv base steps for every rank/channel.
-The kernel initializes and persists each direction independently so elided empty
-slices do not couple incoming and outgoing progress.
+Transport runtime lifecycle and orchestration remain in `Communicator::Impl`.
 
-Transport runtime lifecycle and orchestration remain in `Communicator::Impl`;
-this module split does not move them into `src/transport/simple/`. Make Simple
-protocol changes in `src/transport/simple/` and Ring scheduling changes in
-`ring_simple_geometry.h`.
+## Current limitations
 
----
-
-## Limitations
-
-Current validated scope:
-
-- Single-host AllReduce, ReduceScatter, and AllGather; multi-host correctness and performance evidence currently covers AllReduce only
-- `float` and FP16 (`fp16`) on SM70+, and BF16 (`bf16`) on SM80+
-- `sum`, `avg`, `max`, and `min` for AllReduce and ReduceScatter; AllGather has no reduction operation. `avg` is `sum / nranks`; every reduction propagates NaN for float, FP16, and BF16
-- out-of-place
-- SHM FIFO and device P2P FIFO transports, plus optional MPI/socket or MPI/RDMA for cross-process ring edges; P2P is single-node only; RDMA supports a host-pinned FIFO and opt-in host-proxy GDR
-- one build-time rank count; generated 2/4/8 rank specialization dispatch is not implemented yet. ReduceScatter/AllGather are executed at ranks 2 and 4; rank 8 is compile-tested only
-
-The performance tables state their transport class and matching NCCL GDR setting. This project is not a general NCCL replacement.
-
----
-
-## License
-
-[MIT](LICENSE)
+- Ring + Simple only; no Tree, CollNet, NVLS, LL, or LL128.
+- Out-of-place only; no in-place, arbitrary overlap, broadcast, `double`,
+  `int8`, or `prod`.
+- `nranks` is still fixed by one build; the generated 2/4/8 specialization
+  registry is not implemented yet.
+- Socket/RDMA one-process-per-GPU matrices and NCCL-relative performance still
+  require revalidation.
+- CUDA IPC teardown uses a bounded peer-close acknowledgement. If a peer does
+  not close its imported handle within the timeout, the exporter intentionally
+  leaks that device region instead of freeing memory still mapped by the peer;
+  abnormal process-failure recovery remains constrained by the MPI runtime.

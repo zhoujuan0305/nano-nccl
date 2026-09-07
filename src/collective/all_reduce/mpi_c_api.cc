@@ -5,6 +5,7 @@
 #include "nano_nccl/types.h"
 
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
@@ -29,21 +30,73 @@ nano_nccl::TransportKind to_cpp_transport(nano_nccl_transport_t transport) {
     switch (transport) {
         case NANO_NCCL_TRANSPORT_AUTO:
             return nano_nccl::TransportKind::Auto;
+        case NANO_NCCL_TRANSPORT_SHM:
+            return nano_nccl::TransportKind::Shm;
+        case NANO_NCCL_TRANSPORT_P2P:
+            return nano_nccl::TransportKind::P2p;
         case NANO_NCCL_TRANSPORT_SOCKET:
             return nano_nccl::TransportKind::Socket;
         case NANO_NCCL_TRANSPORT_RDMA:
             return nano_nccl::TransportKind::Rdma;
         default:
             throw std::invalid_argument(
-                "MPI subgroup transport must be auto, socket, or rdma");
+                "MPI subgroup transport must be auto, shm, p2p, socket, or rdma");
     }
 }
 
-void release_mpi(MPI_Comm communicator, bool owns_mpi) noexcept {
-    if (communicator != MPI_COMM_NULL) MPI_Comm_free(&communicator);
-    if (!owns_mpi) return;
+struct MpiRuntimeState {
+    std::mutex mutex;
+    std::size_t leases = 0;
+    bool initialized_by_adapter = false;
+};
+
+MpiRuntimeState& mpi_runtime_state() {
+    static MpiRuntimeState state;
+    return state;
+}
+
+void acquire_mpi() {
+    MpiRuntimeState& state = mpi_runtime_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    int initialized = 0;
+    mpi_check(MPI_Initialized(&initialized), "MPI_Initialized");
+    if (initialized == 0) {
+        int provided = MPI_THREAD_SINGLE;
+        mpi_check(MPI_Init_thread(nullptr, nullptr, MPI_THREAD_FUNNELED,
+                                  &provided),
+                  "MPI_Init_thread");
+        if (provided < MPI_THREAD_FUNNELED) {
+            MPI_Finalize();
+            throw std::runtime_error(
+                "MPI does not provide MPI_THREAD_FUNNELED");
+        }
+        state.initialized_by_adapter = true;
+    } else {
+        int finalized = 0;
+        mpi_check(MPI_Finalized(&finalized), "MPI_Finalized");
+        if (finalized != 0) {
+            throw std::runtime_error("MPI has already been finalized");
+        }
+    }
+    ++state.leases;
+}
+
+void release_mpi(MPI_Comm communicator, bool has_lease) noexcept {
     int finalized = 0;
-    if (MPI_Finalized(&finalized) == MPI_SUCCESS && finalized == 0) MPI_Finalize();
+    const bool mpi_active =
+        MPI_Finalized(&finalized) == MPI_SUCCESS && finalized == 0;
+    if (mpi_active && communicator != MPI_COMM_NULL) {
+        MPI_Comm_free(&communicator);
+    }
+    if (!has_lease) return;
+
+    MpiRuntimeState& state = mpi_runtime_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.leases > 0) --state.leases;
+    if (mpi_active && state.initialized_by_adapter && state.leases == 0) {
+        MPI_Finalize();
+        state.initialized_by_adapter = false;
+    }
 }
 
 }  // namespace
@@ -67,20 +120,8 @@ extern "C" nano_nccl_status_t nano_nccl_create_mpi_subgroup_communicator(
     }
 
     return translate_exceptions([&] {
-        int initialized = 0;
-        mpi_check(MPI_Initialized(&initialized), "MPI_Initialized");
-        const bool owns_mpi = initialized == 0;
-        if (owns_mpi) {
-            int provided = MPI_THREAD_SINGLE;
-            mpi_check(MPI_Init_thread(nullptr, nullptr, MPI_THREAD_FUNNELED,
-                                      &provided),
-                      "MPI_Init_thread");
-            if (provided < MPI_THREAD_FUNNELED) {
-                MPI_Finalize();
-                throw std::runtime_error(
-                    "MPI does not provide MPI_THREAD_FUNNELED");
-            }
-        }
+        acquire_mpi();
+        bool has_lease = true;
 
         MPI_Comm control_comm = MPI_COMM_NULL;
         try {
@@ -88,17 +129,18 @@ extern "C" nano_nccl_status_t nano_nccl_create_mpi_subgroup_communicator(
                                      &control_comm),
                       "MPI_Comm_split");
             nano_nccl::CommunicatorConfig cpp_config;
-            cpp_config.devices = {config->device};
+            cpp_config.device = config->device;
             cpp_config.transport = to_cpp_transport(config->transport);
             auto owner = std::make_unique<NanoNcclCommunicator>();
             owner->communicator = nano_nccl::create_communicator_from_mpi(
                 control_comm, cpp_config);
-            owner->cleanup = [control_comm, owns_mpi] {
-                release_mpi(control_comm, owns_mpi);
+            owner->cleanup = [control_comm, has_lease] {
+                release_mpi(control_comm, has_lease);
             };
             *output = owner.release();
+            has_lease = false;
         } catch (...) {
-            release_mpi(control_comm, owns_mpi);
+            release_mpi(control_comm, has_lease);
             throw;
         }
     });

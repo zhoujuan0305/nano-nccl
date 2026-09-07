@@ -6,10 +6,8 @@
 #include <cstdint>
 #include <exception>
 #include <limits>
-#include <new>
 #include <stdexcept>
 #include <utility>
-#include <vector>
 
 namespace nano_nccl::c_api {
 
@@ -71,32 +69,6 @@ bool to_cpp_redop(nano_nccl_redop_t value, nano_nccl::RedOp* redop) {
     }
 }
 
-bool to_cpp_transport(nano_nccl_transport_t value,
-                      nano_nccl::TransportKind* transport) {
-    switch (value) {
-        case NANO_NCCL_TRANSPORT_AUTO:
-            *transport = nano_nccl::TransportKind::Auto;
-            return true;
-        case NANO_NCCL_TRANSPORT_SHM:
-            *transport = nano_nccl::TransportKind::Shm;
-            return true;
-        case NANO_NCCL_TRANSPORT_P2P:
-            *transport = nano_nccl::TransportKind::P2p;
-            return true;
-        case NANO_NCCL_TRANSPORT_SOCKET:
-            *transport = nano_nccl::TransportKind::Socket;
-            return true;
-        case NANO_NCCL_TRANSPORT_RDMA:
-            *transport = nano_nccl::TransportKind::Rdma;
-            return true;
-        case NANO_NCCL_TRANSPORT_MIXED:
-            *transport = nano_nccl::TransportKind::Mixed;
-            return true;
-        default:
-            return false;
-    }
-}
-
 nano_nccl_transport_t from_cpp_transport(nano_nccl::TransportKind transport) {
     switch (transport) {
         case nano_nccl::TransportKind::Auto:
@@ -124,28 +96,19 @@ nano_nccl_status_t validate_handle(const nano_nccl_communicator_t* communicator)
 }
 
 nano_nccl_status_t validate_buffer_args(
-    const nano_nccl_communicator_t* communicator,
-    const void* const* send_buffers, void* const* recv_buffers,
-    const cudaStream_t* streams, std::size_t count) {
-    if (send_buffers == nullptr || recv_buffers == nullptr || streams == nullptr) {
+    const void* send_buffer, void* recv_buffer, cudaStream_t stream,
+    std::size_t count) {
+    if (send_buffer == nullptr || recv_buffer == nullptr || stream == nullptr) {
         return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
-                    "collective buffer and stream arrays must be non-null");
+                    "collective buffers and stream must be non-null");
     }
     if (count == 0) {
         return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
                     "collective count must be positive");
     }
-    const int rank_count = communicator->communicator->local_rank_count();
-    for (int rank = 0; rank < rank_count; ++rank) {
-        if (send_buffers[rank] == nullptr || recv_buffers[rank] == nullptr ||
-            streams[rank] == nullptr) {
-            return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
-                        "collective buffers and streams must be non-null");
-        }
-        if (send_buffers[rank] == recv_buffers[rank]) {
-            return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
-                        "in-place collectives are unsupported");
-        }
+    if (send_buffer == recv_buffer) {
+        return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
+                    "in-place collectives are unsupported");
     }
     return NANO_NCCL_STATUS_SUCCESS;
 }
@@ -164,10 +127,8 @@ std::size_t dtype_size(nano_nccl_dtype_t dtype) {
 }
 
 nano_nccl_status_t validate_buffer_overlap(
-    const nano_nccl_communicator_t* communicator,
-    const void* const* send_buffers, void* const* recv_buffers,
-    std::size_t send_count, std::size_t recv_count,
-    nano_nccl_dtype_t dtype) {
+    const void* send_buffer, void* recv_buffer, std::size_t send_count,
+    std::size_t recv_count, nano_nccl_dtype_t dtype) {
     std::size_t send_bytes = 0;
     std::size_t recv_bytes = 0;
     const std::size_t element_size = dtype_size(dtype);
@@ -176,30 +137,22 @@ nano_nccl_status_t validate_buffer_overlap(
         return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
                     "collective byte count overflows");
     }
-    const int rank_count = communicator->communicator->local_rank_count();
-    for (int send_rank = 0; send_rank < rank_count; ++send_rank) {
-        const std::uintptr_t send_begin =
-            reinterpret_cast<std::uintptr_t>(send_buffers[send_rank]);
-        if (send_bytes > std::numeric_limits<std::uintptr_t>::max() -
-                             send_begin) {
-            return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
-                        "collective send address range overflows");
-        }
-        const std::uintptr_t send_end = send_begin + send_bytes;
-        for (int recv_rank = 0; recv_rank < rank_count; ++recv_rank) {
-            const std::uintptr_t recv_begin =
-                reinterpret_cast<std::uintptr_t>(recv_buffers[recv_rank]);
-            if (recv_bytes > std::numeric_limits<std::uintptr_t>::max() -
-                                 recv_begin) {
-                return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
-                            "collective receive address range overflows");
-            }
-            const std::uintptr_t recv_end = recv_begin + recv_bytes;
-            if (send_begin < recv_end && recv_begin < send_end) {
-                return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
-                            "overlapping send and receive buffers are unsupported");
-            }
-        }
+    const std::uintptr_t send_begin =
+        reinterpret_cast<std::uintptr_t>(send_buffer);
+    if (send_bytes > std::numeric_limits<std::uintptr_t>::max() - send_begin) {
+        return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
+                    "collective send address range overflows");
+    }
+    const std::uintptr_t recv_begin =
+        reinterpret_cast<std::uintptr_t>(recv_buffer);
+    if (recv_bytes > std::numeric_limits<std::uintptr_t>::max() - recv_begin) {
+        return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
+                    "collective receive address range overflows");
+    }
+    if (send_begin < recv_begin + recv_bytes &&
+        recv_begin < send_begin + send_bytes) {
+        return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
+                    "overlapping send and receive buffers are unsupported");
     }
     return NANO_NCCL_STATUS_SUCCESS;
 }
@@ -229,39 +182,6 @@ const char* nano_nccl_get_last_error(void) {
     return nano_nccl::c_api::last_error;
 }
 
-nano_nccl_status_t nano_nccl_create_communicator(
-    const nano_nccl_communicator_config_t* config,
-    nano_nccl_communicator_t** communicator) {
-    begin_call();
-    if (communicator == nullptr) {
-        return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
-                    "communicator output must be non-null");
-    }
-    *communicator = nullptr;
-    if (config == nullptr) {
-        return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT, "config must be non-null");
-    }
-    if (config->devices == nullptr || config->device_count == 0) {
-        return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
-                    "config devices must be non-null and non-empty");
-    }
-    nano_nccl::TransportKind transport;
-    if (!to_cpp_transport(config->transport, &transport)) {
-        return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
-                    "unsupported transport value");
-    }
-
-    return translate_exceptions([&] {
-        nano_nccl::CommunicatorConfig cpp_config;
-        cpp_config.devices.assign(config->devices,
-                                  config->devices + config->device_count);
-        cpp_config.transport = transport;
-        auto owner = std::make_unique<nano_nccl_communicator_t>();
-        owner->communicator = nano_nccl::create_communicator(cpp_config);
-        *communicator = owner.release();
-    });
-}
-
 nano_nccl_status_t nano_nccl_destroy_communicator(
     nano_nccl_communicator_t* communicator) {
     begin_call();
@@ -282,8 +202,8 @@ nano_nccl_status_t nano_nccl_all_reduce(
                     "all_reduce args must be non-null");
     }
 
-    status = validate_buffer_args(communicator, args->send_buffers,
-                                  args->recv_buffers, args->streams, args->count);
+    status = validate_buffer_args(args->send_buffer, args->recv_buffer,
+                                  args->stream, args->count);
     if (status != NANO_NCCL_STATUS_SUCCESS) return status;
     nano_nccl::DType dtype;
     nano_nccl::RedOp redop;
@@ -291,8 +211,8 @@ nano_nccl_status_t nano_nccl_all_reduce(
         return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT, "unsupported dtype value");
     }
     status = validate_buffer_overlap(
-        communicator, args->send_buffers, args->recv_buffers, args->count,
-        args->count, args->dtype);
+        args->send_buffer, args->recv_buffer, args->count, args->count,
+        args->dtype);
     if (status != NANO_NCCL_STATUS_SUCCESS) return status;
     if (!to_cpp_redop(args->redop, &redop)) {
         return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
@@ -300,13 +220,10 @@ nano_nccl_status_t nano_nccl_all_reduce(
     }
 
     return translate_exceptions([&] {
-        const int rank_count = communicator->communicator->local_rank_count();
         nano_nccl::AllReduceArgs cpp_args{
-            std::vector<const void*>(args->send_buffers,
-                                     args->send_buffers + rank_count),
-            std::vector<void*>(args->recv_buffers,
-                               args->recv_buffers + rank_count),
-            std::vector<cudaStream_t>(args->streams, args->streams + rank_count),
+            args->send_buffer,
+            args->recv_buffer,
+            args->stream,
             args->count,
             dtype,
             redop,
@@ -325,9 +242,8 @@ nano_nccl_status_t nano_nccl_reduce_scatter(
         return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
                     "reduce_scatter args must be non-null");
     }
-    status = validate_buffer_args(communicator, args->send_buffers,
-                                  args->recv_buffers, args->streams,
-                                  args->recv_count);
+    status = validate_buffer_args(args->send_buffer, args->recv_buffer,
+                                  args->stream, args->recv_count);
     if (status != NANO_NCCL_STATUS_SUCCESS) return status;
     nano_nccl::DType dtype;
     nano_nccl::RedOp redop;
@@ -344,21 +260,18 @@ nano_nccl_status_t nano_nccl_reduce_scatter(
                     "reduce_scatter element count overflows");
     }
     status = validate_buffer_overlap(
-        communicator, args->send_buffers, args->recv_buffers, send_count,
-        args->recv_count, args->dtype);
+        args->send_buffer, args->recv_buffer, send_count, args->recv_count,
+        args->dtype);
     if (status != NANO_NCCL_STATUS_SUCCESS) return status;
     if (!to_cpp_redop(args->redop, &redop)) {
         return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
                     "unsupported reduction operation value");
     }
     return translate_exceptions([&] {
-        const int rank_count = communicator->communicator->local_rank_count();
         nano_nccl::ReduceScatterArgs cpp_args{
-            std::vector<const void*>(args->send_buffers,
-                                     args->send_buffers + rank_count),
-            std::vector<void*>(args->recv_buffers,
-                               args->recv_buffers + rank_count),
-            std::vector<cudaStream_t>(args->streams, args->streams + rank_count),
+            args->send_buffer,
+            args->recv_buffer,
+            args->stream,
             args->recv_count,
             dtype,
             redop,
@@ -377,9 +290,8 @@ nano_nccl_status_t nano_nccl_all_gather(
         return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
                     "all_gather args must be non-null");
     }
-    status = validate_buffer_args(communicator, args->send_buffers,
-                                  args->recv_buffers, args->streams,
-                                  args->send_count);
+    status = validate_buffer_args(args->send_buffer, args->recv_buffer,
+                                  args->stream, args->send_count);
     if (status != NANO_NCCL_STATUS_SUCCESS) return status;
     nano_nccl::DType dtype;
     if (!to_cpp_dtype(args->dtype, &dtype)) {
@@ -395,17 +307,14 @@ nano_nccl_status_t nano_nccl_all_gather(
                     "all_gather element count overflows");
     }
     status = validate_buffer_overlap(
-        communicator, args->send_buffers, args->recv_buffers, args->send_count,
-        recv_count, args->dtype);
+        args->send_buffer, args->recv_buffer, args->send_count, recv_count,
+        args->dtype);
     if (status != NANO_NCCL_STATUS_SUCCESS) return status;
     return translate_exceptions([&] {
-        const int rank_count = communicator->communicator->local_rank_count();
         nano_nccl::AllGatherArgs cpp_args{
-            std::vector<const void*>(args->send_buffers,
-                                     args->send_buffers + rank_count),
-            std::vector<void*>(args->recv_buffers,
-                               args->recv_buffers + rank_count),
-            std::vector<cudaStream_t>(args->streams, args->streams + rank_count),
+            args->send_buffer,
+            args->recv_buffer,
+            args->stream,
             args->send_count,
             dtype,
         };
@@ -460,6 +369,22 @@ nano_nccl_status_t nano_nccl_transport(
     }
     *transport = from_cpp_transport(communicator->communicator->transport());
     return NANO_NCCL_STATUS_SUCCESS;
+}
+
+nano_nccl_status_t nano_nccl_edge_transport(
+    const nano_nccl_communicator_t* communicator, int source_global_rank,
+    nano_nccl_transport_t* transport) {
+    begin_call();
+    nano_nccl_status_t status = validate_handle(communicator);
+    if (status != NANO_NCCL_STATUS_SUCCESS) return status;
+    if (transport == nullptr) {
+        return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
+                    "transport output must be non-null");
+    }
+    return translate_exceptions([&] {
+        *transport = from_cpp_transport(
+            communicator->communicator->edge_transport(source_global_rank));
+    });
 }
 
 }  // extern "C"

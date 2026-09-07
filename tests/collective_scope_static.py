@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep single-host collective guards and AllGather's copy-only dispatch."""
+"""Keep all collectives available on distributed communicators."""
 
 from pathlib import Path
 import sys
@@ -33,6 +33,7 @@ def require_in_order(body: str, fragments: list[str]) -> None:
 def main() -> int:
     source = Path(sys.argv[1]).read_text()
     for collective, args_type in (
+        ("all_reduce", "AllReduceArgs"),
         ("all_gather", "AllGatherArgs"),
         ("reduce_scatter", "ReduceScatterArgs"),
     ):
@@ -40,10 +41,11 @@ def main() -> int:
             source, f"void {collective}(const {args_type}& args)")
         require_in_order(dispatch, [
             "check_async_error();",
-            "if (topology_.distributed)",
-            f'"{collective} currently supports single-host communicators only"',
             "validate_args(args);",
         ])
+        if "topology_.distributed" in dispatch:
+            raise AssertionError(
+                f"{collective} must not reject interprocess communicators")
 
     launcher = function_body(source, "struct AllGatherKernelLauncher")
     if "RedOp" in launcher:

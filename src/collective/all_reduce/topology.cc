@@ -33,6 +33,10 @@ void validate_process_topology(const ProcessTopology& topology) {
     if (topology.devices.empty()) {
         throw std::runtime_error("process topology requires local devices");
     }
+    if (topology.distributed && topology.devices.size() != 1) {
+        throw std::runtime_error(
+            "distributed topology requires exactly one local GPU rank");
+    }
     if (topology.local_rank_offset < 0 ||
         topology.local_rank_offset + static_cast<int>(topology.devices.size()) >
             topology.global_rank_count) {

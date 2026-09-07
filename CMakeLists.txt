@@ -12,10 +12,10 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# 编译期可配置参数：默认值对应当前单机 4 GPU / sm_70 最低架构。
+# 编译期可配置参数：默认值对应 4 个单 GPU rank / sm_70 最低架构。
 # NRANKS/NCHANNELS/BLOCK_THREADS/FIFO_BUFF_BYTES 通过 compile definitions
 # 注入代码；CUDA_ARCH 统一设置所有 CUDA target 的编译架构，不作为宏传递。
-set(NANO_NCCL_NRANKS 4 CACHE STRING "Number of GPU ranks")
+set(NANO_NCCL_NRANKS 4 CACHE STRING "Global communicator rank count")
 set(NANO_NCCL_NCHANNELS 4 CACHE STRING "Number of channels")
 set(NANO_NCCL_CUDA_ARCH 70 CACHE STRING "CUDA compute capability (minimum 70)")
 set(NANO_NCCL_BLOCK_THREADS 512 CACHE STRING "Threads per block")
@@ -32,7 +32,7 @@ set(CMAKE_CUDA_ARCHITECTURES ${NANO_NCCL_CUDA_ARCH})
 
 option(NANO_NCCL_ENABLE_MPI "Build the optional MPI communicator bootstrap adapter" OFF)
 option(NANO_NCCL_SOCKET_TEST_FAULT_INJECTION
-       "Build a test-only MPI socket fault-injection library" OFF)
+       "Build test-only MPI transport fault-injection libraries" OFF)
 option(NANO_NCCL_ENABLE_BENCH_PROFILING "Enable NVTX and CUDA profiler instrumentation in the all-reduce benchmark" OFF)
 option(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE
        "Enable host RDMA proxy hot-path stage timeline counters" OFF)

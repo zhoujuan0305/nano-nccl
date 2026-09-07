@@ -8,6 +8,7 @@
 #include "kernels/ring_simple_kernel.cuh"
 #include "transport/socket/socket_proxy.h"
 #include "nano_nccl/traits.h"
+#include "transport/connection.h"
 #include "transport/p2p/p2p_fifo.h"
 #include "transport/p2p/p2p_step_counters.h"
 #include "transport/p2p/p2p_topology.h"
@@ -82,32 +83,14 @@ struct AllGatherKernelLauncher {
     }
 };
 
-void require_single_process_devices(const std::vector<int>& devices) {
-    if (devices.size() != kRanks) {
-        throw std::runtime_error("communicator requires exactly " +
-                                 std::to_string(kRanks) + " local devices");
-    }
-}
-
-void require_local_devices(const std::vector<int>& devices) {
-    if (devices.empty()) {
-        throw std::runtime_error("communicator requires at least one local device");
-    }
-    for (int rank = 0; rank < kRanks; ++rank) {
-        if (rank >= static_cast<int>(devices.size())) break;
-        if (devices[rank] != rank) {
-            throw std::runtime_error(
-                "communicator devices must be the visible sequence 0.." +
-                std::to_string(devices.size() - 1));
-        }
-    }
-
+void require_local_device(int device) {
     int device_count = 0;
     CUDA_CHECK_THROW(cudaGetDeviceCount(&device_count));
-    if (device_count < static_cast<int>(devices.size())) {
-        throw std::runtime_error("need at least " + std::to_string(devices.size()) +
-                                 " visible CUDA devices");
+    if (device < 0 || device >= device_count) {
+        throw std::invalid_argument(
+            "communicator device must name one visible CUDA device");
     }
+    CUDA_CHECK_THROW(cudaSetDevice(device));
 }
 
 void require_bf16_devices(const std::vector<int>& devices) {
@@ -177,40 +160,20 @@ collective::all_reduce::SocketFdOwner::release_connections() noexcept {
 
 class Communicator::Impl {
 public:
-    explicit Impl(const CommunicatorConfig& config) : devices_(config.devices) {
-        require_single_process_devices(devices_);
-        require_local_devices(devices_);
-        topology_ = collective::all_reduce::make_single_process_topology(
-            devices_, std::vector<TransportKind>(kRanks, TransportKind::Shm));
-        transport_plan_ = transport::p2p::resolve_ring_transport(
-            config.transport, topology_);
-        topology_.edge_kinds = transport_plan_.edge_kinds();
-        collective::all_reduce::validate_process_topology(topology_);
-        if (transport_plan_.uses_p2p()) {
-            transport::p2p::enable_p2p_ring_peer_access_or_throw(
-                transport_plan_, topology_);
-        }
-        simple_fifo_steps_.reset(2 * kChannels * kRanks, -1, devices_);
-        simple_fifo_base_steps_.reset(2 * kRanks * kChannels, -1, devices_);
-        completion_events_.resize(devices_.size());
-        fallback_streams_.resize(devices_.size());
-        completion_recorded_.resize(devices_.size());
-        fallback_in_flight_.resize(devices_.size());
-        maybe_enable_ring_turnaround();
-    }
-
     Impl(const CommunicatorConfig& config,
          collective::all_reduce::ProcessTopology topology,
-         collective::all_reduce::SocketFdOwner socket_fds)
-        : devices_(config.devices), topology_(std::move(topology)),
-          socket_fds_(std::move(socket_fds)) {
-        require_local_devices(devices_);
+         collective::all_reduce::SocketFdOwner socket_fds,
+         transport::ConnectionResources transport_connections)
+        : devices_{config.device}, topology_(std::move(topology)),
+          socket_fds_(std::move(socket_fds)),
+          transport_connections_(std::move(transport_connections)) {
+        require_local_device(config.device);
         if (topology_.devices != devices_) {
             throw std::runtime_error("communicator topology devices do not match configuration");
         }
         collective::all_reduce::validate_process_topology(topology_);
         transport_plan_ = transport::p2p::RingTransportPlan(topology_.edge_kinds);
-        if (transport_plan_.uses_p2p()) {
+        if (transport_plan_.uses_p2p() && !topology_.distributed) {
             transport::p2p::enable_p2p_ring_peer_access_or_throw(
                 transport_plan_, topology_);
         }
@@ -283,10 +246,6 @@ public:
 
     void all_gather(const AllGatherArgs& args) {
         check_async_error();
-        if (topology_.distributed) {
-            throw std::runtime_error(
-                "all_gather currently supports single-host communicators only");
-        }
         validate_args(args);
         switch (args.dtype) {
             case DType::Float:
@@ -305,10 +264,6 @@ public:
 
     void reduce_scatter(const ReduceScatterArgs& args) {
         check_async_error();
-        if (topology_.distributed) {
-            throw std::runtime_error(
-                "reduce_scatter currently supports single-host communicators only");
-        }
         validate_args(args);
         switch (args.dtype) {
             case DType::Float:
@@ -328,6 +283,14 @@ public:
     int local_rank_count() const noexcept { return static_cast<int>(devices_.size()); }
 
     TransportKind transport() const noexcept { return transport_plan_.resolved_kind(); }
+
+    TransportKind edge_transport(int source_global_rank) const {
+        if (source_global_rank < 0 || source_global_rank >= kRanks) {
+            throw std::invalid_argument(
+                "source_global_rank must identify a Ring edge");
+        }
+        return transport_plan_.edge_kind(source_global_rank);
+    }
 
     void check_async_error() const {
         if (socket_errors_ != nullptr && socket_errors_->has_error()) {
@@ -955,39 +918,25 @@ private:
     void validate_buffer_args(const Args& args, std::size_t send_count,
                               std::size_t recv_count, DType dtype,
                               const char* collective_name) const {
-        if (args.send_buffers.size() != devices_.size() ||
-            args.recv_buffers.size() != devices_.size() ||
-            args.streams.size() != devices_.size()) {
-            throw std::runtime_error("collective arguments must have one entry per rank");
-        }
         if (send_count == 0 || recv_count == 0) {
             throw std::runtime_error("collective count must be positive");
+        }
+        if (args.send_buffer == nullptr || args.recv_buffer == nullptr ||
+            args.stream == nullptr) {
+            throw std::runtime_error(
+                "collective buffers and stream must be non-null");
         }
         const std::size_t element_size = dtype_size(dtype);
         const std::size_t send_bytes = checked_multiply(
             send_count, element_size, "collective send byte count overflows");
         const std::size_t recv_bytes = checked_multiply(
             recv_count, element_size, "collective receive byte count overflows");
-        std::vector<AddressRange> send_ranges;
-        std::vector<AddressRange> recv_ranges;
-        send_ranges.reserve(devices_.size());
-        recv_ranges.reserve(devices_.size());
-        for (int rank = 0; rank < local_rank_count(); ++rank) {
-            if (args.send_buffers[rank] == nullptr || args.recv_buffers[rank] == nullptr ||
-                args.streams[rank] == nullptr) {
-                throw std::runtime_error("collective buffers and streams must be non-null");
-            }
-            send_ranges.push_back(address_range(args.send_buffers[rank], send_bytes));
-            recv_ranges.push_back(address_range(args.recv_buffers[rank], recv_bytes));
-        }
-        for (const AddressRange& send : send_ranges) {
-            for (const AddressRange& recv : recv_ranges) {
-                if (send.begin < recv.end && recv.begin < send.end) {
-                    throw std::runtime_error(
-                        std::string("overlapping ") + collective_name +
-                        " send and receive buffers are unsupported");
-                }
-            }
+        const AddressRange send = address_range(args.send_buffer, send_bytes);
+        const AddressRange recv = address_range(args.recv_buffer, recv_bytes);
+        if (send.begin < recv.end && recv.begin < send.end) {
+            throw std::runtime_error(
+                std::string("overlapping ") + collective_name +
+                " send and receive buffers are unsupported");
         }
     }
 
@@ -1043,19 +992,16 @@ private:
         }
     }
 
-    void wait_for_previous_launch_on_streams(
-        const std::vector<cudaStream_t>& streams) const {
+    void wait_for_previous_launch_on_stream(cudaStream_t stream) const {
         if (has_untracked_launch_) {
             throw std::runtime_error(
                 "cannot launch collective after completion tracking failed");
         }
         if (!has_launch_) return;
-        for (int stream_rank = 0; stream_rank < local_rank_count(); ++stream_rank) {
-            CUDA_CHECK_THROW(cudaSetDevice(devices_[stream_rank]));
-            for (int event_rank = 0; event_rank < local_rank_count(); ++event_rank) {
-                CUDA_CHECK_THROW(cudaStreamWaitEvent(streams[stream_rank],
-                                                     completion_events_[event_rank], 0));
-            }
+        CUDA_CHECK_THROW(cudaSetDevice(devices_[0]));
+        for (int event_rank = 0; event_rank < local_rank_count(); ++event_rank) {
+            CUDA_CHECK_THROW(cudaStreamWaitEvent(stream,
+                                                 completion_events_[event_rank], 0));
         }
     }
 
@@ -1101,29 +1047,29 @@ private:
                     core::gpu_numa_node(devices_[receiver_local]), devices_);
             }
         }
-        if (transport_plan_.uses_p2p()) {
+        if (transport_plan_.uses_p2p() && !topology_.distributed) {
             replacement.p2p_fifo = std::make_unique<transport::p2p::P2pFifo<T>>(
                 replacement.slot_elems, transport_plan_, topology_);
         }
         *resources = std::move(replacement);
     }
 
-    void reset_control(const std::vector<cudaStream_t>& streams) {
+    void reset_control(cudaStream_t stream) {
         simple_fifo_steps_.clear_host();
         simple_fifo_base_steps_.clear_host();
-        if (!transport_plan_.uses_p2p()) return;
+        if (p2p_steps_ == nullptr) return;
 
-        p2p_steps_->reset(streams);
+        p2p_steps_->reset(std::vector<cudaStream_t>{stream});
 
         ResetEvents reset_events(local_rank_count());
         for (int rank = 0; rank < local_rank_count(); ++rank) {
             reset_events.create(rank);
-            reset_events.record(rank, streams[rank]);
+            reset_events.record(rank, stream);
         }
         for (int stream_rank = 0; stream_rank < local_rank_count(); ++stream_rank) {
             CUDA_CHECK_THROW(cudaSetDevice(stream_rank));
             for (int event_rank = 0; event_rank < local_rank_count(); ++event_rank) {
-                CUDA_CHECK_THROW(cudaStreamWaitEvent(streams[stream_rank],
+                CUDA_CHECK_THROW(cudaStreamWaitEvent(stream,
                                                      reset_events.at(event_rank), 0));
             }
         }
@@ -1142,8 +1088,8 @@ private:
             kernel_args.count = count;
             kernel_args.slot_elems = resources->slot_elems;
             kernel_args.step_elems = transport::simple::step_elems<T>();
-            kernel_args.input = static_cast<const T*>(args.send_buffers[rank]);
-            kernel_args.output = static_cast<T*>(args.recv_buffers[rank]);
+            kernel_args.input = static_cast<const T*>(args.send_buffer);
+            kernel_args.output = static_cast<T*>(args.recv_buffer);
 
             ControlArgs shm_control = transport::shm::make_simple_control_args(
                 simple_fifo_steps_.device_ptr(devices_[rank]),
@@ -1171,6 +1117,14 @@ private:
                 bool send_rdma = transport_plan_.edge_kind(send_edge) == TransportKind::Rdma;
                 bool recv_rdma = transport_plan_.edge_kind(recv_edge) == TransportKind::Rdma;
 #endif
+                const bool send_ipc =
+                    (transport_plan_.edge_kind(send_edge) == TransportKind::Shm ||
+                     transport_plan_.edge_kind(send_edge) == TransportKind::P2p) &&
+                    transport_connections_.view.send_fifo[channel] != nullptr;
+                const bool recv_ipc =
+                    (transport_plan_.edge_kind(recv_edge) == TransportKind::Shm ||
+                     transport_plan_.edge_kind(recv_edge) == TransportKind::P2p) &&
+                    transport_connections_.view.recv_fifo[channel] != nullptr;
                 if (send_socket) {
                     auto& socket = *socket_send_resources_[channel][send_edge];
                     kernel_args.send_fifo[channel] = reinterpret_cast<T*>(
@@ -1191,6 +1145,13 @@ private:
                     kernel_args.send_payload_bytes[channel] =
                         rdma.payload_bytes.device_ptr(devices_[rank]);
 #endif
+                } else if (send_ipc) {
+                    kernel_args.send_fifo[channel] = reinterpret_cast<T*>(
+                        transport_connections_.view.send_fifo[channel]);
+                    kernel_args.control.send_head[channel] =
+                        transport_connections_.view.send_head[channel];
+                    kernel_args.control.send_tail[channel] =
+                        transport_connections_.view.send_tail[channel];
                 } else {
                     kernel_args.send_fifo[channel] = send_p2p
                         ? resources->p2p_fifo->edge_ptr(channel, send_edge)
@@ -1220,6 +1181,13 @@ private:
                     kernel_args.recv_payload_bytes[channel] =
                         rdma.payload_bytes.device_ptr(devices_[rank]);
 #endif
+                } else if (recv_ipc) {
+                    kernel_args.recv_fifo[channel] = reinterpret_cast<const T*>(
+                        transport_connections_.view.recv_fifo[channel]);
+                    kernel_args.control.recv_head[channel] =
+                        transport_connections_.view.recv_head[channel];
+                    kernel_args.control.recv_tail[channel] =
+                        transport_connections_.view.recv_tail[channel];
                 } else {
                     kernel_args.recv_fifo[channel] = recv_p2p
                         ? resources->p2p_fifo->edge_ptr(channel, recv_edge)
@@ -1261,9 +1229,9 @@ private:
 #endif
 
             CUDA_CHECK_THROW(cudaSetDevice(devices_[rank]));
-            launch_kernel(kernel_args, args.streams[rank]);
+            launch_kernel(kernel_args, args.stream);
             CUDA_CHECK_THROW(cudaGetLastError());
-            record_completion(rank, args.streams[rank]);
+            record_completion(rank, args.stream);
         }
     }
 
@@ -1288,16 +1256,14 @@ private:
         has_launch_ = true;
     }
 
-    void begin_fallback_tracking(const std::vector<cudaStream_t>& streams) {
-        for (int rank = 0; rank < local_rank_count(); ++rank) {
-            fallback_streams_[rank] = streams[rank];
-            fallback_in_flight_[rank] = true;
-        }
+    void begin_fallback_tracking(cudaStream_t stream) {
+        fallback_streams_[0] = stream;
+        fallback_in_flight_[0] = true;
     }
 
     void release_lifetime_tracking() noexcept {
         for (int rank = 0; rank < local_rank_count(); ++rank) {
-            cudaError_t status = cudaSetDevice(rank);
+            cudaError_t status = cudaSetDevice(devices_[rank]);
             fail_stop_on_cuda_cleanup_error(status, "cudaSetDevice");
             if (fallback_in_flight_[rank]) {
                 status = cudaStreamSynchronize(fallback_streams_[rank]);
@@ -1433,17 +1399,17 @@ private:
         }
         // Every caller stream has a fallback before reset, waits, or a launch
         // can enqueue work. A successful completion event clears its fallback.
-        begin_fallback_tracking(args.streams);
+        begin_fallback_tracking(args.stream);
         try {
-            wait_for_previous_launch_on_streams(args.streams);
+            wait_for_previous_launch_on_stream(args.stream);
             if (!control_initialized_) {
-                if (transport_plan_.uses_p2p()) {
+                if (transport_plan_.uses_p2p() && !topology_.distributed) {
                     p2p_steps_ =
                         std::make_unique<transport::p2p::P2pStepCounters>(
                             transport_plan_, topology_);
                 }
                 // Counters are reset once; subsequent launches advance persistent steps.
-                reset_control(args.streams);
+                reset_control(args.stream);
                 control_initialized_ = true;
             }
             launch_ring_simple<T>(args, count, resources, launch_kernel);
@@ -1456,6 +1422,7 @@ private:
     std::vector<int> devices_;
     collective::all_reduce::ProcessTopology topology_{};
     collective::all_reduce::SocketFdOwner socket_fds_;
+    transport::ConnectionResources transport_connections_;
     std::vector<std::vector<std::unique_ptr<SocketChannelResources>>> socket_send_resources_;
     std::vector<std::vector<std::unique_ptr<SocketChannelResources>>> socket_recv_resources_;
     MappedU32Array socket_abort_;
@@ -1516,16 +1483,18 @@ int Communicator::global_rank_count() const noexcept { return kRanks; }
 
 TransportKind Communicator::transport() const noexcept { return impl_->transport(); }
 
-std::unique_ptr<Communicator> create_communicator(const CommunicatorConfig& config) {
-    return std::unique_ptr<Communicator>(new Communicator(std::make_unique<Communicator::Impl>(config)));
+TransportKind Communicator::edge_transport(int source_global_rank) const {
+    return impl_->edge_transport(source_global_rank);
 }
 
 std::unique_ptr<Communicator> collective::all_reduce::CommunicatorFactory::create(
     const CommunicatorConfig& config, ProcessTopology topology,
-    SocketFdOwner socket_fds) {
+    SocketFdOwner socket_fds,
+    transport::ConnectionResources transport_connections) {
     return std::unique_ptr<Communicator>(new Communicator(
         std::make_unique<Communicator::Impl>(config, std::move(topology),
-                                             std::move(socket_fds))));
+                                             std::move(socket_fds),
+                                             std::move(transport_connections))));
 }
 
 }  // namespace nano_nccl

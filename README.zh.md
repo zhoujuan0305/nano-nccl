@@ -2,308 +2,215 @@
 
 [English](README.md)
 
-一个聚焦的 GPU collective 通信库，以 `Ring` + `Simple` 实现 out-of-place
-AllReduce、ReduceScatter 和 AllGather。三个 collective 已在单机 SHM、auto 和可用的
-P2P 路径覆盖有限值正确性。可选 MPI/socket 与 MPI/RDMA 路径目前只有 AllReduce 完成了多机
-正确性与性能验证。RDMA 默认使用 host-pinned FIFO，可用
-`NANO_NCCL_RDMA_GDR=1` 显式启用 host-proxy GPUDirect RDMA；数据面默认
-SEND/RECV，可用 `NANO_NCCL_RDMA_USE_WRITE=1` 启用 WRITE+CTS。
+nano-nccl 是一个刻意收窄范围的 GPU collective 通信库，用可读的
+`Ring` + `Simple` 实现 out-of-place AllReduce、ReduceScatter 和 AllGather。
+它不是 NCCL 的 drop-in replacement，也不承诺兼容 NCCL API 或 ABI。
 
-ReduceScatter/AllGather 当前的实机覆盖为：单台 4x RTX A6000（SM86）主机，rank 2
-和 rank 4 配置，分别强制 SHM、使用 auto、强制 P2P。rank 8 仅完成编译验证，不能
-视为已验证支持。
+当前执行模型是 **1 个 OS 进程管理 1 个 GPU rank**：一个 communicator 内的每个
+MPI rank 对应一个进程，并选择、独占一张 GPU。这与 PyTorch/nano-megatron 常用的
+1 进程 1 GPU 模型一致，公共 collective descriptor 因此只接收一个本地
+`send_buffer`、`recv_buffer` 和 `stream`。
 
----
+## 已实现范围
 
-## 性能
+- collective：AllReduce、ReduceScatter、AllGather
+- 算法与协议：Ring only、Simple only
+- dtype：`float`、FP16、BF16
+- reduce op：`sum`、`avg`、`max`、`min`；AllGather 无 reduce op
+- buffer：仅 out-of-place，不支持任意重叠或 in-place
+- rank：构建期 `NANO_NCCL_NRANKS`，合同范围为 2、4、8
+- 同机进程间 transport：SHM、CUDA IPC P2P，以及逐 Ring edge 的 `auto`
+- 跨机 transport：Socket、host-pinned RDMA，以及可选 GDR
 
-[详细性能结果](performance.md)记录了测试拓扑、环境，以及进程内 auto（P2P/SHM）、两机 TCP socket、host-pinned RDMA 和两机 RDMA GDR 相对 NCCL 的逐点对比（`float` / FP16 / BF16 × `sum` / `avg` / `max` / `min`）。
+本次 1 进程 1 GPU 路径已在单台 4x RTX A6000（SM86）上验证：
 
----
+- rank 2：显式 SHM、显式 CUDA IPC P2P 和 `auto`
+- rank 4：显式 SHM、显式 CUDA IPC P2P 和 `auto`
+- 三个 collective，`float`/FP16/BF16，全部适用的 reduce op
+- AllReduce 与 ReduceScatter 的 NaN 传播
+- 原生 C++ API 与 C ABI v2
+- 注入 SHM allocation/registration 与 CUDA IPC allocation/open 失败后，均可成功重建
+  communicator
+
+CUDA IPC P2P 由实际 open/close probe 决定，因此即使没有 direct NVLink，只要 PCIe
+P2P 可用也会被接受。rank 8 在具备对应硬件执行覆盖前不能描述为已验证支持。
+
+历史 [performance.md](performance.md) 中的表格早于 1 进程 1 GPU 合同；除非明确
+标注重新验证，否则不能作为当前架构的性能验收数据。
+
+修改后的 rank 2 重复性 smoke（`float`/`sum`、`-w 5 -n 20`、连续 3 轮）在
+256 KiB/1 MiB/4 MiB/16 MiB/64 MiB 上得到的 busbw 中位数分别为：P2P
+7.60/19.39/26.62/32.62/34.36 GB/s，SHM
+5.57/10.91/13.62/15.08/15.32 GB/s，且 `#wrong=0`。这些只是 nano-nccl 本机
+smoke 数据，不是同轮 NCCL 对比或性能验收结果。
+
+## 同机进程间 transport
+
+transport 按有向 Ring edge 解析：
+
+- `p2p`：receiver 在自己的 GPU 上分配 Simple FIFO/control region，通过
+  `cudaIpcGetMemHandle` 导出，sender 使用 `cudaIpcOpenMemHandle` 映射。该 edge 的
+  CUDA IPC probe 成功即可选择；NVLink 与 PCIe P2P 都有效。
+- `shm`：receiver 使用 `shm_open` 创建 POSIX shared-memory FIFO/control region；
+  相邻进程 `mmap` 同一 region，并用 `cudaHostRegisterMapped` 暴露给各自 GPU。
+- `auto`：同机 edge 优先使用可用的 CUDA IPC P2P，否则使用 SHM；跨机 edge 使用
+  Socket。不同 edge 可以得到 `mixed` plan。
+
+显式请求 `p2p` 或 `shm` 时，任一 edge 不满足条件都会在 communicator 创建阶段
+失败，不会回退；错误会指出有向 edge 和实际可用 backend。
+`Communicator::edge_transport` 与 `nano_nccl_edge_transport` 可查询每条有向 edge 的
+解析结果。Simple FIFO 的 step/credit 和 system-scope release/acquire ordering
+保持 transport-neutral；SHM/CUDA IPC 只负责 region 的分配、交换、映射与生命周期。
 
 ## 构建
 
-依赖：CUDA 12+、CMake 3.18+、libnuma-dev。分布式构建要求每台机器使用 Open MPI 4.1.2，且所有启动端必须使用相同的 MPI ABI。RDMA 构建额外需要 libibverbs-dev。
+依赖：CUDA 12+、CMake 3.18+、libnuma-dev。communicator bootstrap、同机进程间
+transport 和 benchmark 都需要 Open MPI 4.1.2 C ABI，因此正常运行构建应开启 MPI：
 
 ```bash
-mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release \
-  -DNANO_NCCL_NRANKS=<你的GPU数量> \
-  -DNANO_NCCL_CUDA_ARCH=<你的CUDA算力>
-make -j$(nproc)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DNANO_NCCL_ENABLE_MPI=ON \
+  -DNANO_NCCL_NRANKS=4 \
+  -DNANO_NCCL_CUDA_ARCH=86
+cmake --build build -j$(nproc)
+ctest --test-dir build --output-on-failure
 ```
 
-例如，4 GPU RTX A6000 (sm_86) 系统：
+`NANO_NCCL_NRANKS` 是 communicator 的全局 MPI 进程数，不是单个进程管理的 GPU
+数量。进程既可以只看到一张 GPU 并使用本地 `cuda:0`，也可以看到多张 GPU，再通过
+`CommunicatorConfig::device` 只选择其中一张。
+communicator 创建阶段会拒绝两个同机 MPI rank 选择同一张物理 CUDA device。
 
-```bash
-cmake .. -DCMAKE_BUILD_TYPE=Release -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=86
-```
+主要构建产物：
 
-构建产物：
+- `build/src/libnano_nccl.a`：核心实现和公共 collective C ABI
+- `build/src/libnano_nccl_mpi.a`：原生 MPI communicator factory
+- `build/src/libnano_nccl_mpi_c.so`：供 Python/ctypes 等调用的 MPI C adapter
+- `build/benchmarks/nano_nccl_all_reduce_bench`：1 进程 1 GPU AllReduce benchmark
+- `build/tests/nano_nccl_mpi_native_api`：原生 API 三个 collective 的正确性矩阵
+- `build/tests/nano_nccl_mpi_c_api`：C ABI v2 三个 collective 的 smoke matrix
 
-- `build/benchmarks/nano_nccl_all_reduce_bench` — 性能 + 正确性 benchmark
-- `build/tests/nano_nccl_correctness` — 纯正确性测试
-- `build/tests/nano_nccl_smoke` — 冒烟测试
-- `build/tests/nano_nccl_public_api` — 公共 C++ API 覆盖测试
-- `build/tests/nano_nccl_c_api` — 公共 C ABI 编译、链接与行为覆盖测试
-- `build/tests/nano_nccl_collectives` — 单机 ReduceScatter 与 AllGather 有限值矩阵及 float/FP16/BF16 NaN 覆盖
-- `build/tests/nano_nccl_p2p_step_counters` — P2P step-counter 覆盖测试
-- `build/tests/nano_nccl_p2p_topology` — P2P topology 覆盖测试
-- `build/tests/nano_nccl_simple_protocol` — Simple protocol layout 覆盖测试
-- `build-mpi/tests/nano_nccl_mpi_correctness` — MPI/socket 正确性测试（MPI 构建）
-- `build-mpi/tests/nano_nccl_mpi_bootstrap` — MPI bootstrap 冒烟测试（MPI 构建）
-- `build-mpi/tests/nano_nccl_socket_protocol` — socket framing 与 proxy 测试（MPI 构建）
-- `build-rdma/tests/nano_nccl_rdma_protocol` — RDMA 协议布局测试（MPI/RDMA 构建）
-- `build-rdma/tests/nano_nccl_rdma_bootstrap` — 本地 RC QP bootstrap 冒烟测试（MPI/RDMA 构建）
-- `build-rdma/tests/nano_nccl_rdma_gdr` — GDR device registration 与 receive-flush capability 测试（MPI/RDMA 构建）
-
-启用 `BUILD_TESTING`（默认开启）时，`ctest --test-dir build
---output-on-failure` 还会运行 BF16 capability-validation 和 benchmark profiling 的静态回归检查，包括 CQE -> GDR flush -> `recv_tail` 发布顺序检查。
-
-### CMake 选项
+常用 CMake 选项：
 
 | 选项 | 默认值 | 说明 |
-|---|---|---|
-| `NANO_NCCL_NRANKS` | 4 | GPU 数 |
+|---|---:|---|
+| `NANO_NCCL_NRANKS` | 4 | communicator 的全局 rank/进程数 |
 | `NANO_NCCL_NCHANNELS` | 4 | channel 数 |
-| `NANO_NCCL_CUDA_ARCH` | 70 | CUDA 算力（如 70 对应 Volta，75 对应 Turing，86 对应 Ampere）；低于 70 的值会被拒绝 |
-| `NANO_NCCL_BLOCK_THREADS` | 512 | 每 block 线程数 |
-| `NANO_NCCL_FIFO_BUFF_BYTES` | 33554432 | FIFO buffer 大小（字节，默认 32 MiB） |
-| `NANO_NCCL_ENABLE_MPI` | `OFF` | 构建 MPI communicator bootstrap 与分布式 benchmark/test |
-| `NANO_NCCL_ENABLE_RDMA` | `OFF` | 构建 RC send/receive RDMA 通信路径；需要 `NANO_NCCL_ENABLE_MPI=ON` 与 libibverbs |
-| `NANO_NCCL_SOCKET_TEST_FAULT_INJECTION` | `OFF` | 为 `nano_nccl_mpi_correctness` 构建独立的仅测试故障注入库；普通 MPI benchmark 永不包含该钩子 |
-| `NANO_NCCL_ENABLE_BENCH_PROFILING` | `OFF` | 将 NVTX/CUDA profiler instrumentation 编译到 all-reduce benchmark；报告带宽时保持 `OFF` |
+| `NANO_NCCL_CUDA_ARCH` | 70 | CUDA compute capability；低于 70 的值会被拒绝 |
+| `NANO_NCCL_BLOCK_THREADS` | 512 | 每个 block 的线程数 |
+| `NANO_NCCL_FIFO_BUFF_BYTES` | 33554432 | 每 channel FIFO 字节数 |
+| `NANO_NCCL_ENABLE_MPI` | `OFF` | 构建 MPI bootstrap、进程间 transport 和 benchmark |
+| `NANO_NCCL_ENABLE_RDMA` | `OFF` | 构建 RC RDMA；要求 MPI 和 libibverbs |
+| `NANO_NCCL_ENABLE_BENCH_PROFILING` | `OFF` | 为 benchmark 启用 NVTX/CUDA profiler；性能验收时保持关闭 |
 
-`float` 和 FP16 需要 SM70+，因为 Simple FIFO counter 使用 system-scope
-release/acquire 操作。BF16 需要 SM80+。
-
-NUMA 拓扑在运行时从 `/sys/bus/pci/devices/*/numa_node` 自动检测，换机器不需要改源码。
-
-### 可选 MPI/socket 构建
-
-每台机器都要从同一个 commit、以全局 GPU 数构建。socket listener 仅支持 IPv4；`NANO_NCCL_SOCKET_IFNAME` 必须指定一个恰好解析为一个可用 IPv4 地址的接口。socket 连接没有 TLS、认证或自动重连，因此只能在可信私有网络中使用。
-
-```bash
-cmake -S . -B build-mpi -DCMAKE_BUILD_TYPE=Release \
-  -DNANO_NCCL_ENABLE_MPI=ON -DNANO_NCCL_NRANKS=8 -DNANO_NCCL_CUDA_ARCH=86
-cmake --build build-mpi -j$(nproc)
-```
-
-### 可选 MPI/RDMA 构建
-
-每台机器都要从同一个 commit、以全局 GPU 数构建（`RdmaPeerInfo` 为 64 字节；commit
-不一致会导致 bootstrap 失败）。RDMA 默认通过注册的 host-pinned FIFO 执行 RC
-send/receive；host proxy 按 Simple FIFO slice 深度 multi-flight 提交 SEND/RECV，
-并对 CQ 做 selective signaling。Simple 协议末尾空 slice 不再走网络往返。设置
-`NANO_NCCL_RDMA_USE_WRITE=1` 可选用 WRITE+CTS 数据面（RC `WRITE_WITH_IMM` +
-host-pinned CTS slot ring）；未设置/`0` 保持 SEND/RECV。设置
-`NANO_NCCL_RDMA_GDR=1` 可将数据 FIFO 放在已注册 GPU 内存中，host proxy
-仍负责 post。GDR 是显式请求：注册或 receive visibility 能力不可用时会在
-setup 阶段失败，不回退到 host-pinned 内存。host-pinned 路径与 NCCL GDR=0 对比，
-GDR 路径则在两边都启用 GDR。SEND 与 WriteCts 从已注册 FIFO（`fifo_mr_`）直接
-post SGE。worker 写完并 block sync 后，publisher 以 `st.release.sys` 推进
-`send_tail`，proxy 侧 acquire 加载（无 host bounce 路径）。GDR receive
-完成后，若设备不提供原生 GPU/RDMA write ordering，proxy 会先调用 CUDA
-GPUDirect ordering API flush，再发布 `recv_tail`。system-scope counter ordering 不能
-取代这个 receive-data flush。host-pinned 与 GDR WRITE+CTS 矩阵
-  （float/fp16/bf16 × sum/avg/max/min，256 KiB–64 MiB）见
-  [performance.md](performance.md)，`#wrong=0`（默认 dedicated progress；可用
-  env 切 shared）。MPI binding 使用
-  MPI C API，因此 Open MPI 不需要提供已废弃的 C++ binding library。
-
-```bash
-cmake -S . -B build-rdma -DCMAKE_BUILD_TYPE=Release \
-  -DNANO_NCCL_ENABLE_MPI=ON -DNANO_NCCL_ENABLE_RDMA=ON \
-  -DNANO_NCCL_NRANKS=<全局GPU数> -DNANO_NCCL_CUDA_ARCH=<CUDA算力>
-cmake --build build-rdma -j$(nproc)
-```
-
-每个 MPI process 都要设置 `NANO_NCCL_SOCKET_IFNAME=<interface>` 与
-`NANO_NCCL_RDMA_IFNAME=<rdma-interface>`。默认 GID 不可路由时，设置
-`NANO_NCCL_RDMA_GID_INDEX=<gid-index>`。使用 `--transport rdma`；跨进程 ring edge
-使用 RDMA，本机 edge 按 `auto` 解析（双向 NVLink peer access 时用 P2P，否则
-SHM），因此聚合 transport 通常显示为 `mixed`。host-pinned 对比使用
-`NCCL_NET_GDR_LEVEL=0`；GDR 对比需在两边都启用 GDR。请将 Open MPI 的 TCP/OOB 绑定到
-bootstrap 网卡（`btl_tcp_if_include` / `oob_tcp_if_include`），避免选到不可路由
-网卡。
-
-两机、每机四张 GPU 的正确性启动示例：
-
-```bash
-mpirun \
-  -np 1 --host <host-a> -x NANO_NCCL_SOCKET_IFNAME=<interface> \
-    ./build-mpi/tests/nano_nccl_mpi_correctness --dtype float \
-  : -np 1 --host <host-b> -x NANO_NCCL_SOCKET_IFNAME=<interface> \
-    ./build-mpi/tests/nano_nccl_mpi_correctness --dtype float
-```
-
-RDMA bench（每机一个 4-GPU 进程；各机目录与 commit 一致）：
-
-```bash
-mpirun --mca btl_tcp_if_include <interface> --mca oob_tcp_if_include <interface> \
-  --host <host-a>:1 -np 1 \
-  -x CUDA_VISIBLE_DEVICES -x LD_LIBRARY_PATH \
-  -x NANO_NCCL_SOCKET_IFNAME -x NANO_NCCL_RDMA_IFNAME -x NANO_NCCL_RDMA_GID_INDEX \
-  ./build-rdma/benchmarks/nano_nccl_all_reduce_bench \
-    --algo ring_simple --transport rdma --dtype float --redop sum \
-    -b 262144 -e 67108864 -f 4 -w 5 -n 20 : \
-  --host <host-b>:1 -np 1 \
-  -x CUDA_VISIBLE_DEVICES -x LD_LIBRARY_PATH \
-  -x NANO_NCCL_SOCKET_IFNAME -x NANO_NCCL_RDMA_IFNAME -x NANO_NCCL_RDMA_GID_INDEX \
-  ./build-rdma/benchmarks/nano_nccl_all_reduce_bench \
-    --algo ring_simple --transport rdma --dtype float --redop sum \
-    -b 262144 -e 67108864 -f 4 -w 5 -n 20
-```
-
----
+`float` 和 FP16 需要 SM70+，因为 Simple counter 使用 system-scope ordering；
+BF16 需要 SM80+。
 
 ## 运行
 
-```bash
-# Benchmark（性能 + 正确性）
-CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
-  --algo ring_simple --dtype float --redop sum --transport auto \
-  -b 262144 -e 67108864 -f 4 -w 5 -n 20
-
-# FP16 和 BF16 的正确性/性能运行（BF16 需要 SM80+）
-CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
-  --algo ring_simple --dtype fp16 --redop max --transport auto \
-  -b 262144 -e 67108864 -f 4 -w 5 -n 20
-CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/benchmarks/nano_nccl_all_reduce_bench \
-  --algo ring_simple --dtype bf16 --redop avg --transport auto \
-  -b 262144 -e 67108864 -f 4 -w 5 -n 20
-
-# 纯正确性测试
-CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_correctness
-
-# 冒烟测试
-CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/tests/nano_nccl_smoke
-```
-
-`--redop` 接受 `sum`（默认）、`avg`、`max` 与 `min`。`avg` 是逐元素的
-`sum / nranks`。四种操作都会传播 NaN；尤其是任一操作数为 NaN 时，`max` 和
-`min` 都返回 NaN。这是相对 NCCL commit `5067397c` 的有意 `Different`
-（correctness-critical）：NCCL 的 `src/device/reduce_kernel.h`、
-`Apply_Reduce<FuncMinMax<...>>` 使用普通浮点 `min`/`max` intrinsic，会忽略单个
-NaN。选择的规约操作会编译进 device kernel；rank 数仍是 kernel 的运行时参数。
-
-### 可选 NVTX/CUDA profiling
-
-构建独立的 profiling binary；请勿将此构建用于性能比较：
+启动器可以让每个进程只看到自己的 GPU。下面的本机示例使用 Open MPI 提供的
+local rank 设置 `CUDA_VISIBLE_DEVICES`，因此隐式使用 `--device 0`：
 
 ```bash
-cmake -S . -B build-profile -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
-  -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_CUDA_ARCH=86 \
-  -DNANO_NCCL_ENABLE_BENCH_PROFILING=ON
-cmake --build build-profile -j$(nproc)
-nsys profile --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop --output=bench-nvtx-profile \
-  ./build-profile/benchmarks/nano_nccl_all_reduce_bench \
-  --algo ring_simple --transport auto --dtype float -b 262144 -e 262144 -f 2 -w 1 -n 2
-nsys stats --report nvtx_pushpop_sum bench-nvtx-profile.nsys-rep
+mpirun -np 4 --bind-to none bash -c '
+  export CUDA_VISIBLE_DEVICES=$OMPI_COMM_WORLD_LOCAL_RANK
+  exec ./build/benchmarks/nano_nccl_all_reduce_bench \
+    --algo ring_simple --transport auto --dtype float --redop sum \
+    -b 262144 -e 67108864 -f 4 -w 5 -n 20
+'
 ```
 
-对于每个消息大小，capture 包含一个外层 `all_reduce size=<bytes>B` range，以及每个测量 iteration 一个 `all_reduce size=<bytes>B iteration=<iteration>` range。warmup 位于 capture 之外。CUDA 12.8 会针对 `<nvToolsExt.h>` 输出 NVTX 2 deprecation notice；这不会导致 capture 无效。
+显式 SHM/P2P 正确性测试：
+
+```bash
+mpirun -np 4 --bind-to none bash -c '
+  export CUDA_VISIBLE_DEVICES=$OMPI_COMM_WORLD_LOCAL_RANK
+  exec ./build/tests/nano_nccl_mpi_native_api shm
+'
+
+# 仅当构建 rank 的每条 Ring edge 都通过 CUDA IPC probe 时使用。
+mpirun -np 2 --bind-to none bash -c '
+  export CUDA_VISIBLE_DEVICES=$OMPI_COMM_WORLD_LOCAL_RANK
+  exec ./build/tests/nano_nccl_mpi_native_api p2p
+'
+```
+
+`--redop` 接受 `sum`、`avg`、`max`、`min`。`avg` 是逐元素
+`sum / nranks`。nano-nccl 对三种 dtype 的四种 reduce op 都保持 NaN 传播语义，
+包括 packed FP16/BF16 的 `max`/`min`。
 
 ## 公共 C++ API
 
-`nano_nccl/communicator.h` 暴露 move-only 的 `Communicator`，用于一个进程管理
-全部已配置的本机 GPU。device buffer 与 CUDA stream 由调用者持有。三个数组都必须
-对每个 device 各有一个元素，且顺序与 `CommunicatorConfig::devices` 一致。
+调用者先初始化 MPI，再用一个包含 `NANO_NCCL_NRANKS` 个进程的 communicator 创建
+nano-nccl communicator。`CommunicatorConfig::device` 选择该进程拥有的唯一 GPU
+rank；torchrun 风格不屏蔽 GPU 时传 `local_rank`，逐进程屏蔽后传 `0`。
 
 ```cpp
-#include "nano_nccl/communicator.h"
+#include "nano_nccl/mpi.h"
 
-#include <memory>
-#include <vector>
+MPI_Init(&argc, &argv);
 
-std::vector<int> devices{0, 1, 2, 3};
-nano_nccl::CommunicatorConfig config{devices};
-std::unique_ptr<nano_nccl::Communicator> communicator =
-    nano_nccl::create_communicator(config);
+nano_nccl::CommunicatorConfig config;
+config.device = 0;
+config.transport = nano_nccl::TransportKind::Auto;
+auto communicator =
+    nano_nccl::create_communicator_from_mpi(MPI_COMM_WORLD, config);
 
-std::vector<const void*> send_buffers(devices.size());
-std::vector<void*> recv_buffers(devices.size());
-std::vector<cudaStream_t> streams(devices.size());
-
-// 在每张 device 上各分配一对 out-of-place 的 send/receive buffer 和一个 stream。
-// send_buffers[i]、recv_buffers[i]、streams[i] 必须属于 devices[i]。
-// ... cudaSetDevice(devices[i]), cudaMalloc, cudaStreamCreateWithFlags ...
-
-constexpr std::size_t count = 1 << 20;  // 每个本地 rank 的元素数。
+// send、recv 和 stream 都属于 config.device。
 nano_nccl::AllReduceArgs args{
-    send_buffers,
-    recv_buffers,
-    streams,
+    send,
+    recv,
+    stream,
     count,
     nano_nccl::DType::Float,
     nano_nccl::RedOp::Sum,
 };
-
-communicator->all_reduce(args);  // 仅入队，不会同步。
-
-for (std::size_t i = 0; i < devices.size(); ++i) {
-    cudaSetDevice(devices[i]);
-    cudaStreamSynchronize(streams[i]);
-}
+communicator->all_reduce(args);  // 只入队，不同步 stream。
+cudaStreamSynchronize(stream);
 communicator->check_async_error();
+
+communicator.reset();
+MPI_Finalize();
 ```
 
-单机 adapter 要求 `devices` 正好是可见 device 顺序
-`{0, ..., NANO_NCCL_NRANKS - 1}`。MPI 构建时，`nano_nccl/mpi.h` 提供
-`create_communicator_from_mpi(MPI_COMM_WORLD, config)` 以创建分布式 communicator。
-三个操作均为 out-of-place，并使用各自独立的 typed descriptor：
+三个独立 descriptor 的 count/layout 语义为：
 
-| 操作 | descriptor count | 每个 rank 的 buffer layout | reduction |
+| 操作 | count 字段 | 当前 rank 的输入 | 当前 rank 的输出 |
 |---|---|---|---|
-| `all_reduce` | `AllReduceArgs::count` | 输入 `count`，输出 `count` | `sum`、`avg`、`max`、`min` |
-| `reduce_scatter` | `ReduceScatterArgs::recv_count` | 输入 `recv_count * global_rank_count`，输出 `recv_count` | `sum`、`avg`、`max`、`min` |
-| `all_gather` | `AllGatherArgs::send_count` | 输入 `send_count`，输出 `send_count * global_rank_count` | 无 |
+| `all_reduce` | `AllReduceArgs::count` | `count` | `count` |
+| `reduce_scatter` | `ReduceScatterArgs::recv_count` | `recv_count * global_rank_count` | `recv_count` |
+| `all_gather` | `AllGatherArgs::send_count` | `send_count` | `send_count * global_rank_count` |
 
-单机实现支持 `float`、FP16 和 BF16。`avg` 为 `sum / nranks`；全部规约操作都会
-为这三种 dtype（包括 packed FP16/BF16 元素）传播 NaN。分布式 ReduceScatter 和
-AllGather 尚未完成正确性与性能验收矩阵。
+buffer 和非空 CUDA stream 由调用者持有。输入与输出 byte range 不得相同或部分重叠。
+communicator 必须在调用者释放 buffer/stream 和 `MPI_Finalize` 之前销毁。
 
-## C ABI
+## C ABI v2 与 nano-megatron adapter
 
-`nano_nccl/nano_nccl.h` 在现有静态 `nano_nccl` library 中提供 exception-safe
-C ABI，包括 opaque communicator、生命周期和查询函数、固定宽度的
-status/dtype/redop/transport 值、thread-local 错误详情，以及三个 scoped
-collective 各自独立的参数结构。它不兼容 NCCL API 或 ABI，也不承诺
-shared-library/SONAME contract。
-
-device buffer 与 stream 均由调用者持有。每个 pointer/stream 数组都须按
-communicator device 顺序为每个本地 rank 提供一个元素。collective 调用仅入队，
-不会同步传入的 stream。输入与输出的 byte range 不得重叠，包括部分重叠和跨数组
-entry 的重叠。
-
-| 函数 | count 字段 | 每个 rank 的 buffer layout | 当前结果 |
-|---|---|---|---|
-| `nano_nccl_all_reduce` | `count` | 输入 `count`，输出 `count` | 已实现 |
-| `nano_nccl_reduce_scatter` | `recv_count` | 输入 `recv_count * global_rank_count`，输出 `recv_count` | 已实现；已完成单机验证 |
-| `nano_nccl_all_gather` | `send_count` | 输入 `send_count`，输出 `send_count * global_rank_count` | 已实现；已完成单机验证 |
+`nano_nccl/nano_nccl.h` 提供 exception-safe C ABI；MPI factory 位于
+`nano_nccl/mpi_c_api.h`，由 `libnano_nccl_mpi_c.so` 导出。ABI v2 将 collective
+descriptor 从本地 rank 数组改成单个标量 pointer/stream，并移除了旧的进程内多 GPU
+`nano_nccl_create_communicator` factory。
 
 ```c
-#include "nano_nccl/nano_nccl.h"
+#include "nano_nccl/mpi_c_api.h"
 
-#include <stdio.h>
-
-int devices[] = {0, 1, 2, 3};
-nano_nccl_communicator_config_t config = {
-    devices, 4, NANO_NCCL_TRANSPORT_AUTO,
+nano_nccl_mpi_subgroup_config_t config = {
+    .color = dp_group_id,
+    .key = dp_rank,
+    .device = local_rank,  // 若逐进程设置 CUDA_VISIBLE_DEVICES，则改为 0。
+    .transport = NANO_NCCL_TRANSPORT_AUTO,
 };
 nano_nccl_communicator_t* communicator = NULL;
 nano_nccl_status_t status =
-    nano_nccl_create_communicator(&config, &communicator);
+    nano_nccl_create_mpi_subgroup_communicator(&config, &communicator);
 
-// 在每个 device 上分配并填充一对 out-of-place buffer 和一个 stream。
-const void* send_buffers[4];
-void* recv_buffers[4];
-cudaStream_t streams[4];
-size_t count = 1 << 20;
 nano_nccl_all_reduce_args_t args = {
-    send_buffers, recv_buffers, streams, count,
-    NANO_NCCL_DTYPE_FLOAT, NANO_NCCL_REDOP_SUM,
+    .send_buffer = send,
+    .recv_buffer = recv,
+    .stream = stream,
+    .count = count,
+    .dtype = NANO_NCCL_DTYPE_FLOAT,
+    .redop = NANO_NCCL_REDOP_SUM,
 };
 if (status == NANO_NCCL_STATUS_SUCCESS) {
     status = nano_nccl_all_reduce(communicator, &args);
@@ -315,75 +222,55 @@ if (status != NANO_NCCL_STATUS_SUCCESS) {
 nano_nccl_destroy_communicator(communicator);
 ```
 
-`nano_nccl_get_last_error()` 返回的 pointer 在同一线程下一次 stateful C ABI 调用前
-有效；ABI/status query 不会清除它。stream 同步之后，可用
-`nano_nccl_check_async_error()` 查询 communicator 已 latch 的 asynchronous
-transport error。
+adapter 的 `color` 决定从 `MPI_COMM_WORLD` 切出的通信组，`key` 决定 Ring rank 顺序；
+每个 subgroup 的大小必须等于构建期 `NANO_NCCL_NRANKS`。如果 embedding application
+尚未初始化 MPI，adapter 会以 `MPI_THREAD_FUNNELED` 初始化，并在最后一个由 adapter
+创建的 communicator 销毁后释放 MPI。
 
-启用 `NANO_NCCL_ENABLE_MPI=ON` 时还会生成 `libnano_nccl_mpi_c.so`。
-`nano_nccl/mpi_c_api.h` 中的 factory 可按 color/key 将 `MPI_COMM_WORLD` 切成
-多个独立 communicator，并返回与上述 collective、查询、错误检查和销毁函数
-相同的 opaque handle。每个单 GPU 进程使用 `cuda:0`；color 决定通信组，key
-决定 Ring rank 顺序。adapter 会在需要时初始化 MPI，并在正常销毁 handle 时
-释放子通信域。
+nano-megatron 的 ctypes adapter 需要同步到 ABI v2：期望版本改为 `2`，三个
+collective args 的 buffer/stream 字段使用直接的 `c_void_p`，不再构造长度为 1 的
+pointer 数组。ABI v1 consumer 不能加载 ABI v2 library。
 
-### 通信路径选择
+## 跨机 Socket/RDMA
 
-单机时 `--transport` 接受 `auto`、`shm` 和 `p2p`。分布式 MPI communicator
-接受 `auto` 与 `rdma`；`auto` 将跨进程 ring edge 解析为 socket，显式 `rdma`
-仅在 MPI/RDMA 构建时为这些 edge 选择 RDMA。
+Socket listener 只支持 IPv4；每个进程设置
+`NANO_NCCL_SOCKET_IFNAME=<interface>`。它没有 TLS、认证或自动重连，只能用于可信
+私有网络。
 
-- `auto`（默认值）对每条 ring edge 独立选择：只有具备 direct NVLink 和双向 CUDA peer access 时才选择 P2P；其余 edge 使用 SHM。最终路径可能是 `shm`、`p2p` 或 `mixed`。
-- `shm` 强制使用 mapped host memory 的 SHM FIFO 路径。
-- `p2p` 要求每条 ring edge 都具备所需的双向 peer access。任一方向不可用时，初始化会在第一个不可用方向报错，不会回退。
-- `rdma` 需要 `NANO_NCCL_ENABLE_MPI=ON` 与 `NANO_NCCL_ENABLE_RDMA=ON`。它为跨进程
-  ring edge 使用 multi-flight RC RDMA（深度不超过 Simple FIFO slice，selective CQ
-  signal，空 slice 跳过网络），本机 edge 按 `auto` 解析（双向 NVLink peer access
-  时用 P2P，否则 SHM）。默认数据面为 SEND/RECV；`NANO_NCCL_RDMA_USE_WRITE=1`
-  选用 WRITE+CTS。`NANO_NCCL_RDMA_GDR=1` 将数据 FIFO 移到已注册 GPU 内存，
-  但仍由 host proxy progress；不支持的 GDR setup 会显式失败。
-  双机须同一 commit（64 字节 `RdmaPeerInfo`）。SEND/WriteCts 从已注册 mapped
-  FIFO 直接 post；worker 写完并 block sync 后 publisher 以 `st.release.sys`
-  推进 `send_tail`（host acquire；无 host bounce）。小 Simple slice 可在消费完
-  recv FIFO 后立刻 `post_recv_credit`。跨进程 RDMA edge 默认每条 proxy 独立
-  host 线程；设 `NANO_NCCL_RDMA_SHARED_PROGRESS=1` 可改为单线程 shared
-  progress。GDR receive 在原生 GPU/RDMA write ordering 不足时，会在发布
-  `recv_tail` 前 flush。host-pinned 与 GDR WRITE+CTS 对比见
-  [performance.md](performance.md)。
+RDMA 构建：
 
-P2P 是单机通信路径，需要每对完整配置环邻居之间的双向 CUDA peer access；它不是多机或网络通信路径。socket 使用可信、仅 IPv4 的 TCP 网络边界，不提供 TLS 或自动重连。
+```bash
+cmake -S . -B build-rdma -DCMAKE_BUILD_TYPE=Release \
+  -DNANO_NCCL_ENABLE_MPI=ON -DNANO_NCCL_ENABLE_RDMA=ON \
+  -DNANO_NCCL_NRANKS=<global-rank-count> \
+  -DNANO_NCCL_CUDA_ARCH=<cuda-arch>
+cmake --build build-rdma -j$(nproc)
+```
 
-### 实现归属
+每个进程还需设置 `NANO_NCCL_RDMA_IFNAME=<rdma-interface>`；必要时设置
+`NANO_NCCL_RDMA_GID_INDEX=<gid-index>`。默认是注册的 host-pinned FIFO 与 RC
+SEND/RECV；`NANO_NCCL_RDMA_USE_WRITE=1` 选择 WRITE+CTS，
+`NANO_NCCL_RDMA_GDR=1` 显式选择 GPU memory registration。GDR 能力不可用时会失败，
+不会回退。`rdma` 对同机 edge 仍按 P2P/SHM auto 规则解析，对跨机 edge 使用 RDMA，
+因此聚合结果通常是 `mixed`。
 
-- `src/transport/simple/` 负责 Simple FIFO layout、step ordering 和 slice geometry。
+## 实现归属
+
+- `src/transport/simple/` 负责 Simple FIFO layout、step ordering 和 slice geometry，
+  并为每个 rank/channel 独立持久化 send 和 recv base step。
 - `src/transport/shm/` 仅负责 mapped host FIFO storage 和 control。
+- `src/transport/p2p/` 负责 CUDA IPC allocation、handle exchange、mapping 和
+  capability check。
 - `src/collective/all_reduce/ring_simple_geometry.h` 负责 Ring channel/rank work partitioning。
 
-每个 rank/channel 独立持久化 send 和 recv base step。kernel 分别初始化并持久化
-两个方向，因此 empty slice elision 不会耦合 incoming 与 outgoing progress。
-
-transport runtime lifecycle 与 orchestration 仍由 `Communicator::Impl` 管理；本次模块拆分
-没有将其移入 `src/transport/simple/`。Simple protocol 变更应在
-`src/transport/simple/` 中完成，Ring scheduling 变更应在
-`ring_simple_geometry.h` 中完成。
-
----
+transport runtime lifecycle 与 orchestration 仍由 `Communicator::Impl` 管理。
 
 ## 当前限制
 
-当前已验证范围：
-
-- 单机 AllReduce、ReduceScatter 和 AllGather；多机正确性与性能证据目前仅覆盖 AllReduce
-- SM70+ 上的 `float` 和 FP16（`fp16`），以及 SM80+ 上的 BF16（`bf16`）
-- AllReduce 与 ReduceScatter 支持 `sum`、`avg`、`max`、`min`；AllGather 无规约操作。`avg` 为 `sum / nranks`；float、FP16 和 BF16 的全部规约操作都会传播 NaN
-- out-of-place
-- SHM FIFO、device P2P FIFO，以及跨进程 ring edge 的可选 MPI/socket 或 MPI/RDMA；P2P 仅单机；RDMA 支持 host-pinned FIFO 与显式启用的 host-proxy GDR
-- 一次构建只固定一个 rank 数；生成式 2/4/8 rank specialization dispatch 尚未实现。ReduceScatter/AllGather 已实机执行 rank 2 和 4，rank 8 仅完成编译验证
-
-性能表会标明 transport class 及匹配的 NCCL GDR 设置。本项目不是通用 NCCL 替代品。
-
----
-
-## 许可证
-
-[MIT](LICENSE)
+- 仅 Ring + Simple；无 Tree、CollNet、NVLS、LL、LL128。
+- 仅 out-of-place；无 in-place、任意 overlap、broadcast、`double`、`int8`、`prod`。
+- `nranks` 仍由一次构建固定，尚未切换到生成的 2/4/8 specialization registry。
+- Socket/RDMA 的 1 进程 1 GPU 全矩阵和 NCCL-relative 性能需要重新验收。
+- CUDA IPC teardown 使用有界的 peer-close acknowledgement；如果 peer 未在超时内关闭
+  imported handle，exporter 会有意泄漏该 device region，而不是释放仍被 peer 映射的
+  内存。异常进程失败恢复仍受 MPI runtime 约束。

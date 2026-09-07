@@ -2,6 +2,7 @@
 
 #include "collective/all_reduce/topology.h"
 #include "nano_nccl/communicator.h"
+#include "transport/connection.h"
 #include "transport/socket/socket_endpoint.h"
 
 #include <memory>
@@ -34,7 +35,8 @@ class CommunicatorFactory {
 public:
     static std::unique_ptr<Communicator> create(
         const CommunicatorConfig& config, ProcessTopology topology,
-        SocketFdOwner socket_fds);
+        SocketFdOwner socket_fds,
+        transport::ConnectionResources transport_connections = {});
 };
 
 }  // namespace nano_nccl::collective::all_reduce

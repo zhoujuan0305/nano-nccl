@@ -89,6 +89,32 @@ bool has_active_direct_nvlink(NvmlSession* nvml, int src, int dst) {
     return false;
 }
 
+bool has_active_direct_nvlink(NvmlSession* nvml,
+                              const char* source_pci_bus_id,
+                              const char* destination_pci_bus_id) {
+    if (!nvml->initialized()) return false;
+    nvmlDevice_t source_device;
+    if (nvmlDeviceGetHandleByPciBusId(source_pci_bus_id, &source_device) !=
+        NVML_SUCCESS) {
+        return false;
+    }
+    for (unsigned int link = 0; link < NVML_NVLINK_MAX_LINKS; ++link) {
+        nvmlEnableState_t state;
+        if (nvmlDeviceGetNvLinkState(source_device, link, &state) !=
+                NVML_SUCCESS ||
+            state != NVML_FEATURE_ENABLED) {
+            continue;
+        }
+        nvmlPciInfo_t remote_pci{};
+        if (nvmlDeviceGetNvLinkRemotePciInfo(source_device, link,
+                                             &remote_pci) == NVML_SUCCESS &&
+            pci_bus_ids_match(remote_pci.busId, destination_pci_bus_id)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool cuda_peer_access_available(int src, int dst) {
     int can_access = 0;
     return cudaDeviceCanAccessPeer(&can_access, src, dst) == cudaSuccess &&
@@ -130,6 +156,15 @@ void enable_peer_access_or_throw(int src, int dst) {
 }
 
 }  // namespace
+
+bool has_bidirectional_direct_nvlink(const char* first_pci_bus_id,
+                                     const char* second_pci_bus_id) {
+    NvmlSession nvml;
+    return has_active_direct_nvlink(&nvml, first_pci_bus_id,
+                                    second_pci_bus_id) &&
+           has_active_direct_nvlink(&nvml, second_pci_bus_id,
+                                    first_pci_bus_id);
+}
 
 RingTransportPlan::RingTransportPlan(
     std::vector<TransportKind> edge_kinds)
