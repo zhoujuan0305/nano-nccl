@@ -134,6 +134,10 @@ extern "C" nano_nccl_status_t nano_nccl_create_mpi_subgroup_communicator(
             auto owner = std::make_unique<NanoNcclCommunicator>();
             owner->communicator = nano_nccl::create_communicator_from_mpi(
                 control_comm, cpp_config);
+            owner->before_destroy = [control_comm] {
+                mpi_check(MPI_Barrier(control_comm),
+                          "MPI_Barrier(communicator destroy)");
+            };
             owner->cleanup = [control_comm, has_lease] {
                 release_mpi(control_comm, has_lease);
             };

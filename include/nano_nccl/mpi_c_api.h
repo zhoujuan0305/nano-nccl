@@ -12,7 +12,9 @@ extern "C" {
 // rank count. device selects this process's one GPU rank from the visible
 // CUDA devices; callers may either mask to cuda:0 or pass their local rank.
 // MPI is initialized here when the embedding application has not initialized
-// it already.
+// it already. Destruction is collective within the created subgroup so every
+// member must call nano_nccl_destroy_communicator in the same communicator
+// order.
 typedef struct NanoNcclMpiSubgroupConfig {
     int color;
     int key;

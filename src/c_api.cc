@@ -188,7 +188,11 @@ nano_nccl_status_t nano_nccl_destroy_communicator(
     if (communicator == nullptr) {
         return NANO_NCCL_STATUS_SUCCESS;
     }
-    return translate_exceptions([&] { delete communicator; });
+    std::unique_ptr<NanoNcclCommunicator> owner(communicator);
+    return translate_exceptions([&] {
+        if (owner->before_destroy) owner->before_destroy();
+        owner.reset();
+    });
 }
 
 nano_nccl_status_t nano_nccl_all_reduce(

@@ -11,6 +11,7 @@
 
 struct NanoNcclCommunicator {
     std::unique_ptr<nano_nccl::Communicator> communicator;
+    std::function<void()> before_destroy;
     std::function<void()> cleanup;
 
     ~NanoNcclCommunicator() {

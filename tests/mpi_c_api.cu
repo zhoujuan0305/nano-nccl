@@ -1,9 +1,11 @@
 #include "nano_nccl/mpi_c_api.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <cuda_bf16.h>
@@ -269,6 +271,18 @@ int main(int argc, char** argv) {
                               NANO_NCCL_DTYPE_FLOAT) &&
               run_case<__nv_bfloat16>(communicator, rank, global_rank_count,
                                       NANO_NCCL_DTYPE_BFLOAT16);
+    if (actual_transport == NANO_NCCL_TRANSPORT_SOCKET && rank == 0) {
+        // A rank may begin communicator destruction as soon as its last GPU
+        // work is complete. Its peers must not observe that normal close as an
+        // asynchronous transport failure while entering their own teardown.
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        status = nano_nccl_check_async_error(communicator);
+        if (status != NANO_NCCL_STATUS_SUCCESS) {
+            std::fprintf(stderr, "staggered teardown latched an async error: %s\n",
+                         nano_nccl_get_last_error());
+            ok = false;
+        }
+    }
     status = nano_nccl_destroy_communicator(communicator);
     if (status != NANO_NCCL_STATUS_SUCCESS) {
         std::fprintf(stderr, "communicator destruction failed: %s\n",
