@@ -2,12 +2,16 @@
 
 #include "collective/all_reduce/communicator_internal.h"
 #include "collective/all_reduce/topology.h"
+#include "transport/p2p/mpi_p2p.h"
 #include "transport/p2p/p2p_topology.h"
+#include "transport/shm/mpi_shm.h"
+#include "transport/connection.h"
 #include "transport/socket/socket_endpoint.h"
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
@@ -15,6 +19,8 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#include <cuda_runtime.h>
 
 namespace nano_nccl {
 
@@ -33,6 +39,105 @@ void mpi_check(int status, const char* operation) {
     MPI_Error_string(status, error, &length);
     throw std::runtime_error(std::string(operation) + ": " +
                              std::string(error, static_cast<std::size_t>(length)));
+}
+
+void validate_local_device_with_consensus(MPI_Comm control_comm, int mpi_rank,
+                                          int device) {
+    std::array<char, 256> local_error{};
+    int local_ok = 1;
+    int device_count = 0;
+    cudaError_t status = cudaGetDeviceCount(&device_count);
+    if (status != cudaSuccess) {
+        local_ok = 0;
+        std::snprintf(local_error.data(), local_error.size(),
+                      "MPI rank %d cudaGetDeviceCount failed: %s", mpi_rank,
+                      cudaGetErrorString(status));
+        cudaGetLastError();
+    } else if (device < 0 || device >= device_count) {
+        local_ok = 0;
+        std::snprintf(
+            local_error.data(), local_error.size(),
+            "MPI rank %d selected invalid CUDA device %d (visible device count=%d)",
+            mpi_rank, device, device_count);
+    } else {
+        status = cudaSetDevice(device);
+        if (status != cudaSuccess) {
+            local_ok = 0;
+            std::snprintf(local_error.data(), local_error.size(),
+                          "MPI rank %d cudaSetDevice failed: %s", mpi_rank,
+                          cudaGetErrorString(status));
+            cudaGetLastError();
+        }
+    }
+
+    int all_ok = 0;
+    mpi_check(MPI_Allreduce(&local_ok, &all_ok, 1, MPI_INT, MPI_MIN,
+                            control_comm),
+              "MPI_Allreduce(local device validation)");
+    if (all_ok != 0) return;
+
+    std::vector<std::array<char, 256>> errors(kRanks);
+    mpi_check(MPI_Allgather(local_error.data(),
+                            static_cast<int>(local_error.size()), MPI_CHAR,
+                            errors.data(), static_cast<int>(local_error.size()),
+                            MPI_CHAR, control_comm),
+              "MPI_Allgather(local device validation errors)");
+    for (const auto& error : errors) {
+        if (error[0] != '\0') throw std::invalid_argument(error.data());
+    }
+    throw std::invalid_argument("one-process-per-GPU device validation failed");
+}
+
+void validate_unique_device_per_node(MPI_Comm control_comm, int mpi_rank,
+                                     int device,
+                                     const std::vector<int>& node_ids) {
+    cudaDeviceProp properties{};
+    std::array<char, 256> local_error{};
+    int local_ok = 1;
+    const cudaError_t status = cudaGetDeviceProperties(&properties, device);
+    if (status != cudaSuccess) {
+        local_ok = 0;
+        std::snprintf(local_error.data(), local_error.size(),
+                      "MPI rank %d cudaGetDeviceProperties failed: %s", mpi_rank,
+                      cudaGetErrorString(status));
+        cudaGetLastError();
+    }
+
+    int all_ok = 0;
+    mpi_check(MPI_Allreduce(&local_ok, &all_ok, 1, MPI_INT, MPI_MIN,
+                            control_comm),
+              "MPI_Allreduce(CUDA device identity)");
+    if (all_ok == 0) {
+        std::vector<std::array<char, 256>> errors(kRanks);
+        mpi_check(MPI_Allgather(local_error.data(),
+                                static_cast<int>(local_error.size()), MPI_CHAR,
+                                errors.data(),
+                                static_cast<int>(local_error.size()), MPI_CHAR,
+                                control_comm),
+                  "MPI_Allgather(CUDA device identity errors)");
+        for (const auto& error : errors) {
+            if (error[0] != '\0') throw std::runtime_error(error.data());
+        }
+        throw std::runtime_error("CUDA device identity validation failed");
+    }
+
+    std::vector<cudaUUID_t> uuids(kRanks);
+    mpi_check(MPI_Allgather(&properties.uuid, sizeof(properties.uuid), MPI_BYTE,
+                            uuids.data(), sizeof(properties.uuid), MPI_BYTE,
+                            control_comm),
+              "MPI_Allgather(CUDA device identities)");
+    for (int first = 0; first < kRanks; ++first) {
+        for (int second = first + 1; second < kRanks; ++second) {
+            if (node_ids[first] == node_ids[second] &&
+                std::memcmp(&uuids[first], &uuids[second],
+                            sizeof(cudaUUID_t)) == 0) {
+                throw std::invalid_argument(
+                    "MPI ranks " + std::to_string(first) + " and " +
+                    std::to_string(second) +
+                    " select the same CUDA device on one host");
+            }
+        }
+    }
 }
 
 SocketEndpoint create_listener_with_consensus(MPI_Comm control_comm) {
@@ -107,6 +212,86 @@ bool is_expected_hello(const SocketHello& hello, const ProcessTopology& topology
             edge_kind == TransportKind::Rdma);
 }
 
+std::vector<int> discover_node_ids(MPI_Comm control_comm, int global_rank) {
+    MPI_Comm node_comm = MPI_COMM_NULL;
+    mpi_check(MPI_Comm_split_type(control_comm, MPI_COMM_TYPE_SHARED, 0,
+                                  MPI_INFO_NULL, &node_comm),
+              "MPI_Comm_split_type(topology)");
+    int node_rank = 0;
+    mpi_check(MPI_Comm_rank(node_comm, &node_rank),
+              "MPI_Comm_rank(node topology)");
+    int node_id = node_rank == 0 ? global_rank : -1;
+    mpi_check(MPI_Bcast(&node_id, 1, MPI_INT, 0, node_comm),
+              "MPI_Bcast(node id)");
+    mpi_check(MPI_Comm_free(&node_comm), "MPI_Comm_free(node topology)");
+
+    std::vector<int> node_ids(kRanks);
+    mpi_check(MPI_Allgather(&node_id, 1, MPI_INT, node_ids.data(), 1,
+                            MPI_INT, control_comm),
+              "MPI_Allgather(node ids)");
+    return node_ids;
+}
+
+std::vector<TransportKind> resolve_interprocess_transports(
+    TransportKind requested, const std::vector<int>& node_ids,
+    const std::vector<bool>& p2p_capable) {
+    std::vector<TransportKind> edge_kinds(kRanks, TransportKind::Shm);
+    for (int edge = 0; edge < kRanks; ++edge) {
+        const int receiver = (edge + 1) % kRanks;
+        const bool same_host = node_ids[edge] == node_ids[receiver];
+        switch (requested) {
+            case TransportKind::Auto:
+                edge_kinds[edge] = same_host
+                    ? (p2p_capable[edge] ? TransportKind::P2p
+                                          : TransportKind::Shm)
+                    : TransportKind::Socket;
+                break;
+            case TransportKind::Shm:
+                if (!same_host) {
+                    throw std::invalid_argument(
+                        "SHM edge " + std::to_string(edge) + "->" +
+                        std::to_string(receiver) +
+                        " unavailable across hosts; actual available backend is socket");
+                }
+                edge_kinds[edge] = TransportKind::Shm;
+                break;
+            case TransportKind::P2p:
+                if (!same_host) {
+                    throw std::invalid_argument(
+                        "P2P edge " + std::to_string(edge) + "->" +
+                        std::to_string(receiver) +
+                        " unavailable across hosts; actual available backend is socket");
+                }
+                if (!p2p_capable[edge]) {
+                    throw std::invalid_argument(
+                        "P2P edge " + std::to_string(edge) + "->" +
+                        std::to_string(receiver) +
+                        " failed the CUDA IPC probe; actual available backend is shm");
+                }
+                edge_kinds[edge] = TransportKind::P2p;
+                break;
+            case TransportKind::Socket:
+                edge_kinds[edge] = TransportKind::Socket;
+                break;
+            case TransportKind::Rdma:
+#if defined(NANO_NCCL_ENABLE_RDMA)
+                edge_kinds[edge] = same_host
+                    ? (p2p_capable[edge] ? TransportKind::P2p
+                                          : TransportKind::Shm)
+                    : TransportKind::Rdma;
+#else
+                throw std::invalid_argument(
+                    "rdma transport requires NANO_NCCL_ENABLE_RDMA=ON");
+#endif
+                break;
+            case TransportKind::Mixed:
+                throw std::invalid_argument(
+                    "mixed is a resolved transport and cannot be requested");
+        }
+    }
+    return edge_kinds;
+}
+
 }  // namespace
 
 std::unique_ptr<Communicator> create_communicator_from_mpi(
@@ -121,87 +306,58 @@ std::unique_ptr<Communicator> create_communicator_from_mpi(
     if (finalized != 0) {
         throw std::runtime_error("MPI has already been finalized");
     }
-    if (config.devices.empty()) {
-        throw std::runtime_error("MPI communicator requires at least one local device");
-    }
-
     int mpi_rank = 0;
     int mpi_size = 0;
     mpi_check(MPI_Comm_rank(control_comm, &mpi_rank), "MPI_Comm_rank");
     mpi_check(MPI_Comm_size(control_comm, &mpi_size), "MPI_Comm_size");
-    if (mpi_size <= 0) throw std::runtime_error("MPI communicator has no processes");
-
-    int local_count = static_cast<int>(config.devices.size());
-    std::vector<int> process_counts(mpi_size);
-    mpi_check(MPI_Allgather(&local_count, 1, MPI_INT, process_counts.data(), 1, MPI_INT,
-                            control_comm), "MPI_Allgather(local GPU counts)");
-    for (int count : process_counts) {
-        if (count <= 0) {
-            throw std::runtime_error("every MPI process must manage at least one GPU");
-        }
-    }
-
-    int local_offset = 0;
-    mpi_check(MPI_Exscan(&local_count, &local_offset, 1, MPI_INT, MPI_SUM,
-                          control_comm), "MPI_Exscan(local GPU counts)");
-    if (mpi_rank == 0) local_offset = 0;
-
-    int global_count = 0;
-    mpi_check(MPI_Allreduce(&local_count, &global_count, 1, MPI_INT, MPI_SUM,
-                            control_comm), "MPI_Allreduce(global GPU count)");
-    if (global_count != kRanks) {
-        throw std::runtime_error("MPI global GPU count must match kRanks=" +
+    if (mpi_size != kRanks) {
+        throw std::runtime_error("MPI process count must match kRanks=" +
                                  std::to_string(kRanks));
     }
+    validate_local_device_with_consensus(control_comm, mpi_rank, config.device);
+
+    std::vector<int> process_counts(mpi_size, 1);
+    const std::vector<int> node_ids = discover_node_ids(control_comm, mpi_rank);
+    validate_unique_device_per_node(control_comm, mpi_rank, config.device,
+                                    node_ids);
+    std::vector<bool> p2p_capable(kRanks, false);
+    if (config.transport == TransportKind::Auto ||
+        config.transport == TransportKind::P2p ||
+        config.transport == TransportKind::Rdma) {
+        p2p_capable = transport::p2p::probe_mpi_p2p_edges(
+            control_comm, mpi_rank, config.device, node_ids);
+    }
+    std::vector<TransportKind> edge_kinds = resolve_interprocess_transports(
+        config.transport, node_ids, p2p_capable);
 
     ProcessTopology topology{
-        global_count,
-        local_offset,
-        config.devices,
-        std::vector<TransportKind>(global_count, TransportKind::Shm),
+        kRanks,
+        mpi_rank,
+        {config.device},
+        std::move(edge_kinds),
         true,
     };
-    for (int edge = 0; edge < global_count; ++edge) {
-        int receiver = (edge + 1) % global_count;
-        if (process_for_global_rank(process_counts, edge) !=
-            process_for_global_rank(process_counts, receiver)) {
-            topology.edge_kinds[edge] = TransportKind::Socket;
-        }
-    }
     collective::all_reduce::validate_process_topology(topology);
 
-    if (config.transport == TransportKind::Auto) {
-        topology.edge_kinds = transport::p2p::resolve_ring_transport(
-            config.transport, topology).edge_kinds();
-    } else if (config.transport == TransportKind::Socket) {
-        for (int edge = 0; edge < global_count; ++edge) {
-            if (topology.edge_kinds[edge] != TransportKind::Socket) {
-                topology.edge_kinds[edge] = TransportKind::Shm;
-            }
-        }
-    } else if (config.transport == TransportKind::Rdma) {
-#if defined(NANO_NCCL_ENABLE_RDMA)
-        // Match NCCL local edge selection: upgrade NVLink pairs to P2P, keep
-        // SYS-local edges on SHM, then promote only cross-process edges to RDMA.
-        topology.edge_kinds = transport::p2p::resolve_ring_transport(
-            TransportKind::Auto, topology).edge_kinds();
-        for (int edge = 0; edge < global_count; ++edge) {
-            if (topology.edge_kinds[edge] == TransportKind::Socket) {
-                topology.edge_kinds[edge] = TransportKind::Rdma;
-            }
-        }
-#else
-        throw std::invalid_argument(
-            "rdma transport requires NANO_NCCL_ENABLE_RDMA=ON");
-#endif
-    } else {
-        throw std::invalid_argument(
-            "distributed communicators require auto, socket, or rdma transport");
-    }
-    collective::all_reduce::validate_process_topology(topology);
+    transport::ConnectionResources transport_connections;
+    transport::merge_connection_resources(
+        &transport_connections, transport::shm::create_mpi_shm_connections(
+            control_comm, mpi_rank, config.device, topology.edge_kinds));
+    transport::merge_connection_resources(
+        &transport_connections, transport::p2p::create_mpi_p2p_connections(
+            control_comm, mpi_rank, config.device, topology.edge_kinds));
 
-    SocketEndpoint listener = create_listener_with_consensus(control_comm);
-    SocketAddress local_endpoint = listener.address();
+    const bool uses_network =
+        std::find(topology.edge_kinds.begin(), topology.edge_kinds.end(),
+                  TransportKind::Socket) != topology.edge_kinds.end() ||
+        std::find(topology.edge_kinds.begin(), topology.edge_kinds.end(),
+                  TransportKind::Rdma) != topology.edge_kinds.end();
+    SocketEndpoint listener;
+    SocketAddress local_endpoint{};
+    if (uses_network) {
+        listener = create_listener_with_consensus(control_comm);
+        local_endpoint = listener.address();
+    }
     std::vector<SocketAddress> endpoints(mpi_size);
     mpi_check(MPI_Allgather(&local_endpoint, sizeof(local_endpoint), MPI_BYTE,
                             endpoints.data(), sizeof(local_endpoint), MPI_BYTE,
@@ -209,7 +365,7 @@ std::unique_ptr<Communicator> create_communicator_from_mpi(
 
     std::vector<SocketConnection> connections;
     int expected_accepts = 0;
-    for (int edge = 0; edge < global_count; ++edge) {
+    for (int edge = 0; edge < kRanks; ++edge) {
         // Both Socket and Rdma edges walk through this TCP bootstrap. Rdma
         // re-uses the same fds afterwards for the RdmaPeerInfo swap inside
         // Communicator::Impl::setup_rdma_transport().
@@ -217,7 +373,7 @@ std::unique_ptr<Communicator> create_communicator_from_mpi(
             topology.edge_kinds[edge] != TransportKind::Rdma) {
             continue;
         }
-        int receiver = (edge + 1) % global_count;
+        int receiver = (edge + 1) % kRanks;
         int source_process = process_for_global_rank(process_counts, edge);
         int destination_process = process_for_global_rank(process_counts, receiver);
         int remote_process = source_process == mpi_rank ? destination_process : source_process;
@@ -249,7 +405,8 @@ std::unique_ptr<Communicator> create_communicator_from_mpi(
     return collective::all_reduce::CommunicatorFactory::create(
         config, std::move(topology),
         collective::all_reduce::SocketFdOwner::from_connections(
-            std::move(connections)));
+            std::move(connections)),
+        std::move(transport_connections));
 }
 
 }  // namespace nano_nccl

@@ -1,6 +1,7 @@
 #include "collective/all_reduce/ring_simple_geometry.h"
 #include "transport/simple/geometry.h"
 #include "transport/simple/protocol.h"
+#include "transport/simple/connection.h"
 #include "transport/simple/step.h"
 
 #include <chrono>
@@ -30,7 +31,11 @@ constexpr bool non_aligned_channel_geometry_is_bounded() {
     std::size_t count = 0;
     std::size_t chunk = 0;
     ring::cbd_part<float>(1025, 3, &offset, &count, &chunk);
-    return offset == 768 && count == 257 && chunk == 128;
+    const std::size_t expected_chunk = simple::align_up(
+        simple::div_up(count, nano_nccl::kRanks),
+        ring::simple_grain_elems<float>());
+    return offset == 768 && count == 257 && chunk == expected_chunk &&
+           chunk <= count;
 }
 
 }  // namespace
@@ -76,6 +81,12 @@ static_assert(offsetof(simple::FifoArgs<float>, control) ==
               56 + sizeof(void*) * 4 * nano_nccl::kChannels);
 static_assert(offsetof(simple::ChannelArgs<float>, slot_elems) == 0);
 static_assert(offsetof(simple::ChannelArgs<float>, send_fifo) == 16);
+static_assert(simple::kConnectionControlBytes ==
+              2 * nano_nccl::kChannels * sizeof(std::uint64_t));
+static_assert(simple::kConnectionDataOffset % 256 == 0);
+static_assert(simple::kConnectionRegionBytes ==
+              simple::kConnectionDataOffset +
+                  nano_nccl::kChannels * simple::kFifoBytes);
 static_assert(offsetof(simple::ChannelArgs<float>, send_head) == 32);
 static_assert(offsetof(simple::ChannelArgs<float>, send_payload_bytes) == 64);
 static_assert(offsetof(simple::ChannelArgs<float>, abort) == 80);

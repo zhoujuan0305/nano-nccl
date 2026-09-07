@@ -1,18 +1,3 @@
-add_executable(nano_nccl_smoke smoke.cu)
-add_executable(nano_nccl_correctness correctness.cu)
-target_link_libraries(nano_nccl_correctness PRIVATE nano_nccl)
-
-add_executable(nano_nccl_public_api public_api.cu)
-target_link_libraries(nano_nccl_public_api PRIVATE nano_nccl)
-
-add_executable(nano_nccl_c_api c_api.c)
-target_compile_features(nano_nccl_c_api PRIVATE c_std_11)
-set_target_properties(nano_nccl_c_api PROPERTIES LINKER_LANGUAGE CXX)
-target_link_libraries(nano_nccl_c_api PRIVATE nano_nccl)
-
-add_executable(nano_nccl_collectives collectives.cu)
-target_link_libraries(nano_nccl_collectives PRIVATE nano_nccl)
-
 add_executable(nano_nccl_p2p_step_counters p2p_step_counters.cu)
 target_link_libraries(nano_nccl_p2p_step_counters PRIVATE nano_nccl)
 
@@ -21,6 +6,11 @@ target_link_libraries(nano_nccl_p2p_topology PRIVATE nano_nccl)
 
 add_executable(nano_nccl_simple_protocol simple_protocol.cu)
 target_link_libraries(nano_nccl_simple_protocol PRIVATE nano_nccl)
+
+add_executable(nano_nccl_c_api_contract c_api.c)
+target_compile_features(nano_nccl_c_api_contract PRIVATE c_std_11)
+set_target_properties(nano_nccl_c_api_contract PROPERTIES LINKER_LANGUAGE CXX)
+target_link_libraries(nano_nccl_c_api_contract PRIVATE nano_nccl)
 
 if(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
     add_executable(nano_nccl_rdma_proxy_timeline rdma_proxy_timeline_test.cc)
@@ -39,20 +29,9 @@ endif()
 
 if(BUILD_TESTING)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
-    add_test(NAME nano_nccl_public_api COMMAND nano_nccl_public_api)
-    set_tests_properties(nano_nccl_public_api PROPERTIES TIMEOUT 30)
-    add_test(NAME nano_nccl_c_api COMMAND nano_nccl_c_api)
-    set_tests_properties(nano_nccl_c_api PROPERTIES SKIP_RETURN_CODE 77)
-    add_test(NAME nano_nccl_collectives_shm COMMAND nano_nccl_collectives shm)
-    add_test(NAME nano_nccl_collectives_auto COMMAND nano_nccl_collectives auto)
-    add_test(NAME nano_nccl_collectives_p2p COMMAND nano_nccl_collectives p2p)
-    set_tests_properties(
-        nano_nccl_collectives_shm
-        nano_nccl_collectives_auto
-        nano_nccl_collectives_p2p
-        PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME nano_nccl_simple_protocol COMMAND nano_nccl_simple_protocol)
     set_tests_properties(nano_nccl_simple_protocol PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME nano_nccl_c_api_contract COMMAND nano_nccl_c_api_contract)
     add_test(
         NAME nano_nccl_cuda_arch_contract
         COMMAND ${Python3_EXECUTABLE}
@@ -91,7 +70,6 @@ if(BUILD_TESTING)
                  ${CMAKE_SOURCE_DIR}/src/CMakeLists.txt
                  ${CMAKE_SOURCE_DIR}/benchmarks/CMakeLists.txt
                  ${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
-                 ${CMAKE_SOURCE_DIR}/src/collective/all_reduce/ring_simple.cu
                  ${CMAKE_SOURCE_DIR}/src/collective/all_reduce/bench_profiling.h
                  ${CMAKE_SOURCE_DIR}/benchmarks/all_reduce_bench.cu
     )
@@ -118,21 +96,98 @@ if(BUILD_TESTING)
 endif()
 
 if(NANO_NCCL_ENABLE_MPI)
-    add_executable(nano_nccl_mpi_correctness mpi_correctness.cu)
-    target_include_directories(nano_nccl_mpi_correctness PRIVATE ${MPI_C_INCLUDE_DIRS})
-    if(NANO_NCCL_SOCKET_TEST_FAULT_INJECTION)
-        target_link_libraries(nano_nccl_mpi_correctness PRIVATE
-            nano_nccl_mpi_test_fault MPI::MPI_C)
-    else()
-        target_link_libraries(nano_nccl_mpi_correctness PRIVATE nano_nccl_mpi MPI::MPI_C)
+    add_executable(nano_nccl_mpi_c_api mpi_c_api.cu)
+    target_link_libraries(nano_nccl_mpi_c_api PRIVATE nano_nccl_mpi_c)
+
+    add_executable(nano_nccl_mpi_native_api mpi_native_api.cu)
+    target_link_libraries(nano_nccl_mpi_native_api PRIVATE nano_nccl_mpi MPI::MPI_C)
+
+    add_executable(nano_nccl_mpi_device_selection mpi_device_selection.cc)
+    target_link_libraries(nano_nccl_mpi_device_selection PRIVATE
+        nano_nccl_mpi MPI::MPI_C)
+
+    if(BUILD_TESTING AND
+       (NANO_NCCL_NRANKS EQUAL 2 OR NANO_NCCL_NRANKS EQUAL 4))
+        foreach(transport IN ITEMS shm auto p2p)
+            add_test(
+                NAME nano_nccl_mpi_native_${transport}
+                COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG}
+                        ${NANO_NCCL_NRANKS}
+                        --bind-to none --mca btl ^openib
+                        $<TARGET_FILE:nano_nccl_mpi_native_api> ${transport}
+            )
+        endforeach()
+        set_tests_properties(
+            nano_nccl_mpi_native_shm
+            nano_nccl_mpi_native_auto
+            nano_nccl_mpi_native_p2p
+            PROPERTIES TIMEOUT 60
+        )
+        set_tests_properties(nano_nccl_mpi_native_p2p
+                             PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 
-    add_executable(nano_nccl_mpi_bootstrap mpi_bootstrap.cu)
-    target_include_directories(nano_nccl_mpi_bootstrap PRIVATE ${MPI_C_INCLUDE_DIRS})
-    target_link_libraries(nano_nccl_mpi_bootstrap PRIVATE nano_nccl_mpi MPI::MPI_C)
+    if(BUILD_TESTING AND NANO_NCCL_NRANKS EQUAL 2)
+        add_test(
+            NAME nano_nccl_mpi_duplicate_device_rejected
+            COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2
+                    --bind-to none --mca btl ^openib
+                    $<TARGET_FILE:nano_nccl_mpi_device_selection>
+        )
+        add_test(
+            NAME nano_nccl_mpi_native_shm_visible_local_rank
+            COMMAND ${CMAKE_COMMAND} -E env
+                    NANO_NCCL_TEST_VISIBLE_LOCAL_RANK=1
+                    ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2
+                    --bind-to none --mca btl ^openib
+                    $<TARGET_FILE:nano_nccl_mpi_native_api> shm
+        )
+        foreach(transport IN ITEMS shm p2p)
+            add_test(
+                NAME nano_nccl_mpi_c_api_${transport}
+                COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2
+                        --bind-to none --mca btl ^openib
+                        $<TARGET_FILE:nano_nccl_mpi_c_api> ${transport}
+            )
+        endforeach()
+        add_test(
+            NAME nano_nccl_mpi_c_api_auto
+            COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2
+                    --bind-to none --mca btl ^openib
+                    $<TARGET_FILE:nano_nccl_mpi_c_api> auto
+        )
+        set_tests_properties(
+            nano_nccl_mpi_native_shm
+            nano_nccl_mpi_native_auto
+            nano_nccl_mpi_native_shm_visible_local_rank
+            nano_nccl_mpi_duplicate_device_rejected
+            nano_nccl_mpi_c_api_shm
+            nano_nccl_mpi_c_api_p2p
+            nano_nccl_mpi_c_api_auto
+            PROPERTIES TIMEOUT 60
+        )
+        set_tests_properties(nano_nccl_mpi_c_api_p2p
+                             PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
 
     add_executable(nano_nccl_socket_protocol socket_protocol_test.cc)
     target_link_libraries(nano_nccl_socket_protocol PRIVATE nano_nccl_mpi)
+
+    if(NANO_NCCL_SOCKET_TEST_FAULT_INJECTION AND
+       BUILD_TESTING AND NANO_NCCL_NRANKS EQUAL 2)
+        add_executable(nano_nccl_mpi_transport_faults mpi_transport_faults.cc)
+        target_link_libraries(nano_nccl_mpi_transport_faults PRIVATE
+            nano_nccl_mpi_test_fault MPI::MPI_C)
+        add_test(
+            NAME nano_nccl_mpi_transport_faults
+            COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2
+                    --bind-to none --mca btl ^openib
+                    $<TARGET_FILE:nano_nccl_mpi_transport_faults>
+        )
+        set_tests_properties(nano_nccl_mpi_transport_faults PROPERTIES
+            TIMEOUT 60
+            SKIP_RETURN_CODE 77)
+    endif()
 
     if(NANO_NCCL_ENABLE_RDMA)
         add_test(NAME nano_nccl_rdma_gdr_static

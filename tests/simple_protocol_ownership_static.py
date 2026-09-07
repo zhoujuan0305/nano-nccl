@@ -14,6 +14,7 @@ def main() -> int:
         root / "src/transport/simple/protocol.h",
         root / "src/transport/simple/step.h",
         root / "src/transport/simple/geometry.h",
+        root / "src/transport/simple/connection.h",
         root / "src/collective/all_reduce/ring_simple_geometry.h",
     ]
     missing = [str(path.relative_to(root)) for path in required if not path.is_file()]
@@ -34,6 +35,20 @@ def main() -> int:
     for leaked in ("slice_elems", "cbd_part", "load_step", "store_step"):
         if leaked in shm_fifo:
             raise AssertionError(f"SHM adapter still owns {leaked}")
+    for backend in (
+        root / "src/transport/shm/mpi_shm.cc",
+        root / "src/transport/p2p/mpi_p2p.cc",
+    ):
+        text = backend.read_text()
+        for duplicate in (
+            "constexpr std::size_t kControlBytes",
+            "constexpr std::size_t kDataOffset",
+            "constexpr std::size_t kRegionBytes",
+        ):
+            if duplicate in text:
+                raise AssertionError(
+                    f"{backend.relative_to(root)} duplicates Simple {duplicate}"
+                )
     cmake = (root / "CMakeLists.txt").read_text()
     if "set(NANO_NCCL_CUDA_ARCH 70" not in cmake or "NANO_NCCL_CUDA_ARCH LESS 70" not in cmake:
         raise AssertionError("CMake does not enforce the SM70 architecture floor")

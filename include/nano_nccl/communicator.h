@@ -4,7 +4,6 @@
 
 #include <cstddef>
 #include <memory>
-#include <vector>
 
 #include <cuda_runtime.h>
 
@@ -15,23 +14,23 @@ class CommunicatorFactory;
 }
 
 struct CommunicatorConfig {
-    std::vector<int> devices;
+    int device = 0;
     TransportKind transport = TransportKind::Auto;
 };
 
 struct AllReduceArgs {
-    std::vector<const void*> send_buffers;
-    std::vector<void*> recv_buffers;
-    std::vector<cudaStream_t> streams;
+    const void* send_buffer = nullptr;
+    void* recv_buffer = nullptr;
+    cudaStream_t stream = nullptr;
     std::size_t count = 0;  // Input and output elements per rank.
     DType dtype = DType::Float;
     RedOp redop = RedOp::Sum;
 };
 
 struct ReduceScatterArgs {
-    std::vector<const void*> send_buffers;
-    std::vector<void*> recv_buffers;
-    std::vector<cudaStream_t> streams;
+    const void* send_buffer = nullptr;
+    void* recv_buffer = nullptr;
+    cudaStream_t stream = nullptr;
     // Output elements per rank; each input has recv_count * global ranks.
     std::size_t recv_count = 0;
     DType dtype = DType::Float;
@@ -39,9 +38,9 @@ struct ReduceScatterArgs {
 };
 
 struct AllGatherArgs {
-    std::vector<const void*> send_buffers;
-    std::vector<void*> recv_buffers;
-    std::vector<cudaStream_t> streams;
+    const void* send_buffer = nullptr;
+    void* recv_buffer = nullptr;
+    cudaStream_t stream = nullptr;
     // Input elements per rank; each output has send_count * global ranks.
     std::size_t send_count = 0;
     DType dtype = DType::Float;
@@ -62,18 +61,15 @@ public:
     int local_rank_count() const noexcept;
     int global_rank_count() const noexcept;
     TransportKind transport() const noexcept;
+    // Returns the backend for source_global_rank -> (source_global_rank + 1) % nranks.
+    TransportKind edge_transport(int source_global_rank) const;
 
 private:
     class Impl;
     explicit Communicator(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;
 
-    friend std::unique_ptr<Communicator> create_communicator(
-        const CommunicatorConfig& config);
     friend class collective::all_reduce::CommunicatorFactory;
 };
-
-std::unique_ptr<Communicator> create_communicator(
-    const CommunicatorConfig& config);
 
 }  // namespace nano_nccl
