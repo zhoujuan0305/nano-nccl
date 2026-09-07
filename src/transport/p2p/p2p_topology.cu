@@ -115,6 +115,38 @@ bool has_active_direct_nvlink(NvmlSession* nvml,
     return false;
 }
 
+bool p2p_capability_is_available(nvmlDevice_t source,
+                                 nvmlDevice_t destination,
+                                 nvmlGpuP2PCapsIndex_t capability) {
+    nvmlGpuP2PStatus_t status = NVML_P2P_STATUS_UNKNOWN;
+    return nvmlDeviceGetP2PStatus(source, destination, capability, &status) ==
+               NVML_SUCCESS &&
+           status == NVML_P2P_STATUS_OK;
+}
+
+bool has_native_atomic_path(NvmlSession* nvml,
+                            const char* source_pci_bus_id,
+                            const char* destination_pci_bus_id) {
+    if (!nvml->initialized()) return false;
+    nvmlDevice_t source_device;
+    nvmlDevice_t destination_device;
+    if (nvmlDeviceGetHandleByPciBusId(source_pci_bus_id, &source_device) !=
+            NVML_SUCCESS ||
+        nvmlDeviceGetHandleByPciBusId(destination_pci_bus_id,
+                                      &destination_device) != NVML_SUCCESS) {
+        return false;
+    }
+    return p2p_capability_is_available(
+               source_device, destination_device,
+               NVML_P2P_CAPS_INDEX_READ) &&
+           p2p_capability_is_available(
+               source_device, destination_device,
+               NVML_P2P_CAPS_INDEX_WRITE) &&
+           p2p_capability_is_available(
+               source_device, destination_device,
+               NVML_P2P_CAPS_INDEX_ATOMICS);
+}
+
 bool cuda_peer_access_available(int src, int dst) {
     int can_access = 0;
     return cudaDeviceCanAccessPeer(&can_access, src, dst) == cudaSuccess &&
@@ -164,6 +196,13 @@ bool has_bidirectional_direct_nvlink(const char* first_pci_bus_id,
                                     second_pci_bus_id) &&
            has_active_direct_nvlink(&nvml, second_pci_bus_id,
                                     first_pci_bus_id);
+}
+
+bool has_bidirectional_native_atomics(const char* first_pci_bus_id,
+                                      const char* second_pci_bus_id) {
+    NvmlSession nvml;
+    return has_native_atomic_path(&nvml, first_pci_bus_id, second_pci_bus_id) &&
+           has_native_atomic_path(&nvml, second_pci_bus_id, first_pci_bus_id);
 }
 
 RingTransportPlan::RingTransportPlan(

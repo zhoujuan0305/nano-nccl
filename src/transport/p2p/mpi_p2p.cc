@@ -1,6 +1,7 @@
 #include "transport/p2p/mpi_p2p.h"
 
 #include "core/buffer.h"
+#include "transport/p2p/p2p_topology.h"
 #include "transport/simple/connection.h"
 
 #include <algorithm>
@@ -34,6 +35,7 @@ namespace nano_nccl::transport::p2p {
 namespace {
 
 constexpr std::size_t kControlNameBytes = 128;
+constexpr std::size_t kPciBusIdBytes = 32;
 constexpr std::chrono::seconds kCloseTimeout{2};
 
 #if defined(NANO_NCCL_TRANSPORT_TEST_FAULT_INJECTION)
@@ -238,10 +240,16 @@ std::vector<bool> probe_mpi_p2p_edges(
     CUDA_CHECK_THROW(cudaSetDevice(device));
     void* local_probe = nullptr;
     cudaIpcMemHandle_t local_handle{};
+    std::array<char, kPciBusIdBytes> local_pci_bus_id{};
     int local_handle_ok = 1;
     cudaError_t cuda_status = cudaMalloc(&local_probe, 1);
     if (cuda_status == cudaSuccess) {
         cuda_status = cudaIpcGetMemHandle(&local_handle, local_probe);
+    }
+    if (cuda_status == cudaSuccess) {
+        cuda_status = cudaDeviceGetPCIBusId(
+            local_pci_bus_id.data(),
+            static_cast<int>(local_pci_bus_id.size()), device);
     }
     if (cuda_status != cudaSuccess) {
         local_handle_ok = 0;
@@ -250,6 +258,7 @@ std::vector<bool> probe_mpi_p2p_edges(
 
     std::vector<cudaIpcMemHandle_t> handles(kRanks);
     std::vector<int> handle_ok(kRanks);
+    std::vector<std::array<char, kPciBusIdBytes>> pci_bus_ids(kRanks);
     mpi_check(MPI_Allgather(&local_handle, sizeof(local_handle), MPI_BYTE,
                             handles.data(), sizeof(local_handle), MPI_BYTE,
                             control_comm),
@@ -257,11 +266,20 @@ std::vector<bool> probe_mpi_p2p_edges(
     mpi_check(MPI_Allgather(&local_handle_ok, 1, MPI_INT, handle_ok.data(), 1,
                             MPI_INT, control_comm),
               "MPI_Allgather(CUDA IPC probe status)");
+    mpi_check(MPI_Allgather(
+                  local_pci_bus_id.data(),
+                  static_cast<int>(local_pci_bus_id.size()), MPI_CHAR,
+                  pci_bus_ids.data(),
+                  static_cast<int>(local_pci_bus_id.size()), MPI_CHAR,
+                  control_comm),
+              "MPI_Allgather(CUDA PCI bus ids)");
 
     const int receiver = (global_rank + 1) % kRanks;
     int outgoing_ok = 0;
     if (node_ids[global_rank] == node_ids[receiver] &&
-        local_handle_ok != 0 && handle_ok[receiver] != 0) {
+        local_handle_ok != 0 && handle_ok[receiver] != 0 &&
+        has_bidirectional_native_atomics(
+            pci_bus_ids[global_rank].data(), pci_bus_ids[receiver].data())) {
         void* remote_probe = nullptr;
         cuda_status = cudaIpcOpenMemHandle(
             &remote_probe, handles[receiver], cudaIpcMemLazyEnablePeerAccess);
