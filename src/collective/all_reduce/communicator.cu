@@ -33,6 +33,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <limits>
@@ -292,6 +293,17 @@ public:
         return transport_plan_.edge_kind(source_global_rank);
     }
 
+    bool edge_uses_gdr(int source_global_rank) const {
+        if (edge_transport(source_global_rank) != TransportKind::Rdma) {
+            return false;
+        }
+#if defined(NANO_NCCL_ENABLE_RDMA)
+        return rdma_gdr_enabled_;
+#else
+        return false;
+#endif
+    }
+
     void check_async_error() const {
         if (socket_errors_ != nullptr && socket_errors_->has_error()) {
             throw std::runtime_error(socket_errors_->message());
@@ -470,7 +482,8 @@ private:
     }
 
     void allocate_rdma_fifo(RdmaChannelResources& r, int device,
-                            transport::rdma::RdmaMemoryPlacement placement) {
+                            transport::rdma::RdmaMemoryPlacement placement,
+                            int edge, int channel, const char* direction) {
         if (placement == transport::rdma::RdmaMemoryPlacement::GpuDirect) {
             r.device_fifo.reset(device, transport::simple::kFifoBytes);
             r.data_ptr = r.device_fifo.get();
@@ -486,6 +499,18 @@ private:
                     ex.what());
             }
             r.fifo_mr_raw = r.fifo_memory.mr();
+            const char* diagnostics = std::getenv("NANO_NCCL_RDMA_DIAGNOSTICS");
+            if (diagnostics != nullptr && std::strcmp(diagnostics, "1") == 0) {
+                std::fprintf(stderr,
+                             "rdma gdr fifo direction=%s edge=%d channel=%d "
+                             "device=%d method=%s addr=%p bytes=%zu lkey=%u "
+                             "rkey=%u\n",
+                             direction, edge, channel, device,
+                             r.fifo_memory.registration_method_name(),
+                             static_cast<void*>(r.data_ptr),
+                             transport::simple::kFifoBytes,
+                             r.fifo_memory.lkey(), r.fifo_memory.rkey());
+            }
             return;
         }
         r.fifo = std::make_unique<MappedBuffer<std::uint8_t>>(
@@ -538,6 +563,8 @@ private:
         const bool write_cts = plane == transport::rdma::RdmaDataPlane::WriteCts;
         const transport::rdma::RdmaMemoryPlacement placement =
             transport::rdma::parse_rdma_memory_placement_env();
+        rdma_gdr_enabled_ =
+            placement == transport::rdma::RdmaMemoryPlacement::GpuDirect;
         rdma_shared_progress_ = transport::rdma::parse_rdma_shared_progress_env();
 
         rdma_endpoint_ = std::make_shared<transport::rdma::RdmaEndpoint>(
@@ -569,7 +596,8 @@ private:
                     r.qp = std::make_unique<transport::rdma::RdmaQp>(
                         transport::rdma::RdmaQp::create_init(
                             *rdma_endpoint_, kRdmaProxyWr, kRdmaProxyWr));
-                    allocate_rdma_fifo(r, devices_[local], placement);
+                    allocate_rdma_fifo(r, devices_[local], placement, edge,
+                                       channel, "send");
                     if (write_cts) {
                         // Sender owns CTS FIFO; peer receiver RDMA_WRITEs into it.
                         register_rdma_cts_buffer(r, /*remote_write=*/true);
@@ -587,7 +615,8 @@ private:
                     r.qp = std::make_unique<transport::rdma::RdmaQp>(
                         transport::rdma::RdmaQp::create_init(
                             *rdma_endpoint_, kRdmaProxyWr, kRdmaProxyWr));
-                    allocate_rdma_fifo(r, devices_[local], placement);
+                    allocate_rdma_fifo(r, devices_[local], placement, edge,
+                                       channel, "recv");
                     if (write_cts) {
                         // Receiver owns CTS shadow SGE source (local write only).
                         register_rdma_cts_buffer(r, /*remote_write=*/false);
@@ -642,6 +671,9 @@ private:
             local_info.gid_index = rdma_endpoint_->gid_index();
             local_info.active_mtu = rdma_endpoint_->active_mtu();
             std::memcpy(local_info.gid, rdma_endpoint_->gid(), 16);
+            local_info.flags =
+                (rdma_gdr_enabled_ ? transport::rdma::kRdmaPeerFlagGpuDirect : 0u) |
+                (write_cts ? transport::rdma::kRdmaPeerFlagWriteCts : 0u);
             if (write_cts) {
                 if (is_recv) {
                     local_info.recv_fifo_addr =
@@ -690,6 +722,13 @@ private:
             const int fifo_numa_node = item.fifo_numa_node;
             RdmaChannelResources& r = *item.resources;
             const transport::rdma::RdmaPeerInfo remote_info = item.remote_info;
+
+            if ((remote_info.flags & ~transport::rdma::kRdmaPeerKnownFlags) != 0 ||
+                remote_info.flags != item.local_info.flags) {
+                throw std::runtime_error(
+                    "rdma peer data plane or GDR placement mismatch for edge " +
+                    std::to_string(edge));
+            }
 
             if (write_cts) {
                 if (is_send &&
@@ -1435,6 +1474,7 @@ private:
     std::vector<std::vector<std::unique_ptr<RdmaChannelResources>>> rdma_recv_resources_;
     MappedU32Array rdma_abort_;
     std::shared_ptr<transport::rdma::RdmaAsyncErrorState> rdma_errors_;
+    bool rdma_gdr_enabled_ = false;
     std::vector<std::unique_ptr<transport::rdma::RdmaSendProxy>> rdma_send_proxies_;
     std::vector<std::unique_ptr<transport::rdma::RdmaRecvProxy>> rdma_recv_proxies_;
     transport::rdma::RdmaProgressEngine rdma_progress_;
@@ -1485,6 +1525,10 @@ TransportKind Communicator::transport() const noexcept { return impl_->transport
 
 TransportKind Communicator::edge_transport(int source_global_rank) const {
     return impl_->edge_transport(source_global_rank);
+}
+
+bool Communicator::edge_uses_gdr(int source_global_rank) const {
+    return impl_->edge_uses_gdr(source_global_rank);
 }
 
 std::unique_ptr<Communicator> collective::all_reduce::CommunicatorFactory::create(

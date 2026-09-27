@@ -252,8 +252,12 @@ int main(int argc, char** argv) {
                    : actual_transport == expected_transport);
     for (int edge = 0; edge < global_rank_count && ok; ++edge) {
         nano_nccl_transport_t edge_transport = NANO_NCCL_TRANSPORT_AUTO;
+        int uses_gdr = -1;
         ok = nano_nccl_edge_transport(communicator, edge, &edge_transport) ==
                  NANO_NCCL_STATUS_SUCCESS &&
+             nano_nccl_edge_uses_gdr(communicator, edge, &uses_gdr) ==
+                 NANO_NCCL_STATUS_SUCCESS &&
+             uses_gdr == 0 &&
              (requested_transport == NANO_NCCL_TRANSPORT_AUTO
                   ? (edge_transport == NANO_NCCL_TRANSPORT_P2P ||
                      edge_transport == NANO_NCCL_TRANSPORT_SHM)
@@ -262,6 +266,12 @@ int main(int argc, char** argv) {
     nano_nccl_transport_t invalid_edge_transport = NANO_NCCL_TRANSPORT_AUTO;
     ok = nano_nccl_edge_transport(communicator, -1,
                                   &invalid_edge_transport) ==
+             NANO_NCCL_STATUS_INVALID_ARGUMENT &&
+         ok;
+    int invalid_edge_gdr = -1;
+    ok = nano_nccl_edge_uses_gdr(communicator, -1, &invalid_edge_gdr) ==
+             NANO_NCCL_STATUS_INVALID_ARGUMENT &&
+         nano_nccl_edge_uses_gdr(communicator, 0, nullptr) ==
              NANO_NCCL_STATUS_INVALID_ARGUMENT &&
          ok;
     ok = ok &&

@@ -105,6 +105,10 @@ nano_nccl_status_t nano_nccl_transport(
 nano_nccl_status_t nano_nccl_edge_transport(
     const nano_nccl_communicator_t* communicator, int source_global_rank,
     nano_nccl_transport_t* transport);
+// Writes 1 when the directed RDMA edge uses registered GPU FIFO memory.
+nano_nccl_status_t nano_nccl_edge_uses_gdr(
+    const nano_nccl_communicator_t* communicator, int source_global_rank,
+    int* uses_gdr);
 
 #ifdef __cplusplus
 }

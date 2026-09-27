@@ -1,4 +1,14 @@
 if(NANO_NCCL_ENABLE_MPI)
+    add_executable(nano_nccl_collective_bench collective_bench.cu)
+    target_link_libraries(nano_nccl_collective_bench PRIVATE
+        nano_nccl_mpi MPI::MPI_C)
+    target_compile_definitions(nano_nccl_collective_bench PRIVATE NANO_NCCL_ENABLE_MPI=1)
+    target_include_directories(nano_nccl_collective_bench PRIVATE ${MPI_C_INCLUDE_DIRS})
+    if(NANO_NCCL_ENABLE_RDMA)
+        target_compile_definitions(nano_nccl_collective_bench PRIVATE NANO_NCCL_ENABLE_RDMA=1)
+        target_link_libraries(nano_nccl_collective_bench PRIVATE ${IBVERBS_LIBRARY})
+    endif()
+
     add_executable(nano_nccl_all_reduce_bench all_reduce_bench.cu)
     target_link_libraries(nano_nccl_all_reduce_bench PRIVATE
         nano_nccl_mpi MPI::MPI_C)

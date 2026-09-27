@@ -101,8 +101,12 @@ std::string format_failure(RdmaProxyIdentity identity, std::uint64_t step,
 void check_wc(const ibv_wc& wc, RdmaProxyIdentity identity, std::uint64_t step,
               RdmaAsyncErrorState* errors) {
     if (wc.status == IBV_WC_SUCCESS) return;
-    std::string reason = std::string("ibv_wc status=") +
-                         ibv_wc_status_str(wc.status);
+    // For a failed WC, libibverbs only guarantees these four fields.
+    std::ostringstream details;
+    details << "ibv_wc status=" << ibv_wc_status_str(wc.status)
+            << " wr_id=" << wc.wr_id << " qp_num=" << wc.qp_num
+            << " vendor_err=" << wc.vendor_err;
+    const std::string reason = details.str();
     errors->record_failure(identity, step, reason);
     throw std::runtime_error(reason);
 }

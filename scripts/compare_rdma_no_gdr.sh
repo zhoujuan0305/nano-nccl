@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Differential nano-nccl vs NCCL (GDR=0) all_reduce busbw on 2-host × 4-GPU RDMA.
+# Both implementations use one MPI process per GPU (4 ranks per host).
 # Host/interface/GID values come from the environment only — never hard-code them.
 set -euo pipefail
 
-DEFAULT_OUT_DIR="/data02/zhiyuanzhou/apptainer/tmp/opencode/no-gdr-gap"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+DEFAULT_OUT_DIR="${ROOT}/.local/no-gdr-gap"
 NANO_BIN=""
 NCCL_BIN=""
 NCCL_LIB=""
@@ -12,6 +14,10 @@ DRY_RUN=0
 HELP=0
 PARSE_NANO_LOG=""
 PARSE_NCCL_LOG=""
+# Keep the comparative timing contract in one place for commands, dry-run, and
+# the generated summary.
+NCCL_TIMING_ARGS=(-z 2 -a 3 -m 1)
+NANO_WAIT_ARGS=(--wait-mode query)
 
 usage() {
     cat <<'EOF'
@@ -21,7 +27,7 @@ Options:
   --nano-bin PATH     nano_nccl_all_reduce_bench binary (required unless --parse-*)
   --nccl-bin PATH     nccl-tests all_reduce_perf binary (required unless --parse-*)
   --nccl-lib DIR      directory containing libnccl.so (required unless --parse-*)
-  --out-dir DIR       log/summary directory (default: /data02/.../no-gdr-gap)
+  --out-dir DIR       log/summary directory (default: .local/no-gdr-gap)
   --parse-nano LOG    skip runs; parse existing nano log
   --parse-nccl LOG    skip runs; parse existing nccl log
   --dry-run           print planned commands and env presence; do not execute benches
@@ -42,6 +48,9 @@ Optional environment:
   NCCL_IB_GID_INDEX           forwarded to NCCL ranks when set
   CUDA_VISIBLE_DEVICES        default 0,1,2,3
   LD_LIBRARY_PATH             extra library path prefix (NCCL lib is prepended)
+
+Comparison timing:
+  nano --wait-mode query; nccl-tests -z 2 -a 3 -m 1; both use -w 5 -n 20.
 
 Exit codes:
   0  success (all nano #wrong == 0, table printed)
@@ -159,6 +168,7 @@ print_planned() {
     echo "nccl_bin=${NCCL_BIN:-<unset>}"
     echo "nccl_lib=${NCCL_LIB:-<unset>}"
     echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES}"
+    echo "rank_layout: 8 MPI processes total, 4 per host, one process per GPU; NCCL uses -g 1"
     echo "has_COMPARE_HOST_A=$([[ -n "${COMPARE_HOST_A:-}" ]] && echo 1 || echo 0)"
     echo "has_COMPARE_HOST_B=$([[ -n "${COMPARE_HOST_B:-}" ]] && echo 1 || echo 0)"
     echo "has_NANO_NCCL_SOCKET_IFNAME=$([[ -n "${NANO_NCCL_SOCKET_IFNAME:-}" ]] && echo 1 || echo 0)"
@@ -169,13 +179,14 @@ print_planned() {
     echo "has_NCCL_SOCKET_IFNAME=$([[ -n "${NCCL_SOCKET_IFNAME:-}" ]] && echo 1 || echo 0)"
     echo "has_NCCL_IB_HCA=$([[ -n "${NCCL_IB_HCA:-}" ]] && echo 1 || echo 0)"
     echo "has_NCCL_IB_GID_INDEX=$([[ -n "${NCCL_IB_GID_INDEX:-}" ]] && echo 1 || echo 0)"
-    echo "nano_flags: --algo ring_simple --transport rdma --dtype float --redop sum -b 262144 -e 67108864 -f 4 -w 5 -n 20"
-    echo "nccl_flags: NCCL_NET_GDR_LEVEL=0 NCCL_ALGO=Ring NCCL_PROTO=Simple NCCL_MIN_NCHANNELS=4 NCCL_MAX_NCHANNELS=4 NCCL_BUFFSIZE=33554432 -b 262144 -e 67108864 -f 4 -g 4 -w 5 -n 20 -d float -o sum"
+    echo "nano_flags: NANO_NCCL_RDMA_GDR=0 --algo ring_simple --transport rdma --dtype float --redop sum -b 262144 -e 67108864 -f 4 -w 5 -n 20 ${NANO_WAIT_ARGS[*]}"
+    echo "nccl_flags: NCCL_NET_GDR_LEVEL=0 NCCL_ALGO=Ring NCCL_PROTO=Simple NCCL_MIN_NCHANNELS=4 NCCL_MAX_NCHANNELS=4 NCCL_BUFFSIZE=33554432 -b 262144 -e 67108864 -f 4 -g 1 -w 5 -n 20 ${NCCL_TIMING_ARGS[*]} -d float -o sum"
 }
 
 run_nano() {
     local -a nano_x=(-x CUDA_VISIBLE_DEVICES -x LD_LIBRARY_PATH
-        -x NANO_NCCL_SOCKET_IFNAME -x NANO_NCCL_RDMA_IFNAME)
+        -x NANO_NCCL_SOCKET_IFNAME -x NANO_NCCL_RDMA_IFNAME
+        -x NANO_NCCL_RDMA_GDR)
     if [[ -n "${NANO_NCCL_RDMA_GID_INDEX:-}" ]]; then
         nano_x+=(-x NANO_NCCL_RDMA_GID_INDEX)
     fi
@@ -187,7 +198,7 @@ run_nano() {
     fi
     local -a nano_args=(
         --algo ring_simple --transport rdma --dtype float --redop sum
-        -b 262144 -e 67108864 -f 4 -w 5 -n 20
+        -b 262144 -e 67108864 -f 4 -w 5 -n 20 "${NANO_WAIT_ARGS[@]}"
     )
     # Bind MPI TCP/OOB to the bootstrap interface so Open MPI does not pick a
     # non-routable NIC (can hang with connect() EINPROGRESS).
@@ -197,10 +208,10 @@ run_nano() {
         mca+=(--mca oob_tcp_if_include "${NANO_NCCL_SOCKET_IFNAME}")
         mca+=(--mca btl_openib_warn_no_device_params_found 0)
     fi
-    mpirun "${mca[@]}" \
-        --host "${COMPARE_HOST_A}:1" -np 1 "${nano_x[@]}" \
+    NANO_NCCL_RDMA_GDR=0 mpirun --bind-to none "${mca[@]}" \
+        --host "${COMPARE_HOST_A}:4" -np 4 "${nano_x[@]}" \
         "${NANO_BIN}" "${nano_args[@]}" : \
-        --host "${COMPARE_HOST_B}:1" -np 1 "${nano_x[@]}" \
+        --host "${COMPARE_HOST_B}:4" -np 4 "${nano_x[@]}" \
         "${NANO_BIN}" "${nano_args[@]}" \
         >"${NANO_LOG}" 2>"${NANO_ERR}"
 }
@@ -209,6 +220,7 @@ run_nccl() {
     local -a nccl_x=(-x CUDA_VISIBLE_DEVICES -x LD_LIBRARY_PATH
         -x NCCL_SOCKET_IFNAME -x NCCL_IB_HCA
         -x NCCL_ALGO -x NCCL_PROTO
+        -x NCCL_P2P_DISABLE -x NCCL_SHM_DISABLE
         -x NCCL_MIN_NCHANNELS -x NCCL_MAX_NCHANNELS -x NCCL_BUFFSIZE
         -x NCCL_NET_GDR_LEVEL)
     if [[ -n "${NCCL_IB_GID_INDEX:-}" ]]; then
@@ -216,12 +228,15 @@ run_nccl() {
     fi
     export NCCL_ALGO=Ring
     export NCCL_PROTO=Simple
+    export NCCL_P2P_DISABLE=0
+    export NCCL_SHM_DISABLE=0
     export NCCL_MIN_NCHANNELS=4
     export NCCL_MAX_NCHANNELS=4
     export NCCL_BUFFSIZE=33554432
     export NCCL_NET_GDR_LEVEL=0
     local -a nccl_args=(
-        -b 262144 -e 67108864 -f 4 -g 4 -w 5 -n 20 -d float -o sum
+        -b 262144 -e 67108864 -f 4 -g 1 -w 5 -n 20
+        "${NCCL_TIMING_ARGS[@]}" -d float -o sum
     )
     local -a mca=()
     if [[ -n "${NCCL_SOCKET_IFNAME:-}" ]]; then
@@ -229,10 +244,10 @@ run_nccl() {
         mca+=(--mca oob_tcp_if_include "${NCCL_SOCKET_IFNAME}")
         mca+=(--mca btl_openib_warn_no_device_params_found 0)
     fi
-    env -u NCCL_IB_DISABLE mpirun "${mca[@]}" \
-        --host "${COMPARE_HOST_A}:1" -np 1 "${nccl_x[@]}" \
+    env -u NCCL_IB_DISABLE mpirun --bind-to none "${mca[@]}" \
+        --host "${COMPARE_HOST_A}:4" -np 4 "${nccl_x[@]}" \
         "${NCCL_BIN}" "${nccl_args[@]}" : \
-        --host "${COMPARE_HOST_B}:1" -np 1 "${nccl_x[@]}" \
+        --host "${COMPARE_HOST_B}:4" -np 4 "${nccl_x[@]}" \
         "${NCCL_BIN}" "${nccl_args[@]}" \
         >"${NCCL_LOG}" 2>"${NCCL_ERR}"
 }
@@ -320,6 +335,12 @@ write_summary() {
 
     tmp="$(mktemp)"
     {
+        if [[ "${PARSE_ONLY}" -eq 1 ]]; then
+            echo 'Expected contract: nano `--wait-mode query`; nccl-tests `-z 2 -a 3 -m 1`; both use `-w 5 -n 20`. Rank layout is one MPI process per GPU, four per host; NCCL uses `-g 1`. Pre-existing logs do not prove which launch flags or rank layout were used.'
+        else
+            echo 'Timing contract used: nano `--wait-mode query`; nccl-tests `-z 2 -a 3 -m 1`; both use `-w 5 -n 20`. NCCL completes each collective before the next and reports the maximum across MPI ranks. Rank layout: one MPI process per GPU, four per host; NCCL uses `-g 1`.'
+        fi
+        echo
         echo "| size | nano_busbw | nccl_busbw | ratio |"
         echo "| ---: | ---: | ---: | ---: |"
         for size in 262144 1048576 4194304 16777216 67108864; do

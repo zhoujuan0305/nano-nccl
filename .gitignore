@@ -33,6 +33,7 @@ __pycache__/
 
 # Logs
 *.log
+.local/
 
 # Nsight Systems captures
 *.nsys-rep

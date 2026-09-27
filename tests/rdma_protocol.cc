@@ -16,10 +16,11 @@ static_assert(std::is_trivially_copyable_v<
                   nano_nccl::transport::rdma::RdmaPeerInfo>);
 static_assert(sizeof(nano_nccl::transport::rdma::RdmaCtsSlot) == 32);
 static_assert(alignof(nano_nccl::transport::rdma::RdmaCtsSlot) == 8);
-// active_mtu occupies the 4-byte hole after gid[16] so sizeof stays 64.
-static_assert(sizeof(nano_nccl::transport::rdma::RdmaPeerInfo) == 64);
+// active_mtu occupies the 4-byte hole after gid[16]; flags extend the POD to 72.
+static_assert(sizeof(nano_nccl::transport::rdma::RdmaPeerInfo) == 72);
 static_assert(offsetof(nano_nccl::transport::rdma::RdmaPeerInfo, active_mtu) ==
               28);
+static_assert(offsetof(nano_nccl::transport::rdma::RdmaPeerInfo, flags) == 64);
 
 static_assert(nano_nccl::transport::rdma::RdmaQp::slot_to_wr_id(0) == 0);
 static_assert(nano_nccl::transport::rdma::RdmaQp::slot_to_wr_id(7) == 7);
@@ -57,6 +58,8 @@ int main() {
     info.cts_fifo_addr = 0xeeeeffff00001111ULL;
     info.cts_fifo_rkey = 0x3333u;
     info.cts_slot_count = 8;
+    info.flags = nano_nccl::transport::rdma::kRdmaPeerFlagGpuDirect |
+                 nano_nccl::transport::rdma::kRdmaPeerFlagWriteCts;
 
     nano_nccl::transport::rdma::RdmaPeerInfo copy{};
     std::memcpy(&copy, &info, sizeof(info));
@@ -68,7 +71,9 @@ int main() {
         copy.recv_fifo_bytes != info.recv_fifo_bytes ||
         copy.cts_fifo_addr != info.cts_fifo_addr ||
         copy.cts_fifo_rkey != info.cts_fifo_rkey ||
-        copy.cts_slot_count != info.cts_slot_count) {
+        copy.cts_slot_count != info.cts_slot_count ||
+        copy.flags != info.flags ||
+        (copy.flags & ~nano_nccl::transport::rdma::kRdmaPeerKnownFlags) != 0) {
         std::fprintf(stderr, "rdma_protocol: POD copy mismatch\n");
         return 1;
     }

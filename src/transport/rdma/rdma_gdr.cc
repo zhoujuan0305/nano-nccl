@@ -25,6 +25,23 @@ int access_flags() {
            IBV_ACCESS_REMOTE_READ;
 }
 
+void enable_gpu_rdma_sync_memops(void* device_addr) {
+    // GPUDirect RDMA without legacy P2P tokens requires this per-allocation
+    // setting before the NIC pins the CUDA buffer. It orders CUDA memory APIs
+    // with third-party DMA access to the same allocation.
+    const unsigned int enabled = 1;
+    const CUresult result = cuPointerSetAttribute(
+        &enabled, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS,
+        reinterpret_cast<CUdeviceptr>(device_addr));
+    if (result != CUDA_SUCCESS) {
+        const char* error_name = nullptr;
+        (void)cuGetErrorName(result, &error_name);
+        throw std::runtime_error(
+            std::string("rdma gdr cuPointerSetAttribute(SYNC_MEMOPS) failed: ") +
+            (error_name != nullptr ? error_name : "unknown CUDA error"));
+    }
+}
+
 ibv_mr* try_reg_dmabuf(ibv_pd* pd, void* device_addr, std::size_t bytes) {
     CUdeviceptr ptr = reinterpret_cast<CUdeviceptr>(device_addr);
     const std::size_t page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
@@ -104,18 +121,20 @@ void RdmaGdrReceiveFlush::flush() const {
 
 RdmaRegisteredMemory::RdmaRegisteredMemory(ibv_mr* mr, void* addr,
                                            std::size_t bytes,
-                                           bool device) noexcept
-    : mr_(mr), addr_(addr), bytes_(bytes), device_(device) {}
+                                           bool device,
+                                           RdmaRegistrationMethod method) noexcept
+    : mr_(mr), addr_(addr), bytes_(bytes), device_(device), method_(method) {}
 
 RdmaRegisteredMemory::~RdmaRegisteredMemory() { reset(); }
 
 RdmaRegisteredMemory::RdmaRegisteredMemory(RdmaRegisteredMemory&& other) noexcept
     : mr_(other.mr_), addr_(other.addr_), bytes_(other.bytes_),
-      device_(other.device_) {
+      device_(other.device_), method_(other.method_) {
     other.mr_ = nullptr;
     other.addr_ = nullptr;
     other.bytes_ = 0;
     other.device_ = false;
+    other.method_ = RdmaRegistrationMethod::None;
 }
 
 RdmaRegisteredMemory& RdmaRegisteredMemory::operator=(
@@ -126,10 +145,12 @@ RdmaRegisteredMemory& RdmaRegisteredMemory::operator=(
     addr_ = other.addr_;
     bytes_ = other.bytes_;
     device_ = other.device_;
+    method_ = other.method_;
     other.mr_ = nullptr;
     other.addr_ = nullptr;
     other.bytes_ = 0;
     other.device_ = false;
+    other.method_ = RdmaRegistrationMethod::None;
     return *this;
 }
 
@@ -141,6 +162,17 @@ void RdmaRegisteredMemory::reset() noexcept {
     addr_ = nullptr;
     bytes_ = 0;
     device_ = false;
+    method_ = RdmaRegistrationMethod::None;
+}
+
+const char* RdmaRegisteredMemory::registration_method_name() const noexcept {
+    switch (method_) {
+        case RdmaRegistrationMethod::None: return "none";
+        case RdmaRegistrationMethod::HostVerbs: return "host-verbs";
+        case RdmaRegistrationMethod::DmaBuf: return "dmabuf";
+        case RdmaRegistrationMethod::DeviceVerbs: return "device-verbs";
+    }
+    return "unknown";
 }
 
 std::uint32_t RdmaRegisteredMemory::lkey() const noexcept {
@@ -158,7 +190,8 @@ RdmaRegisteredMemory RdmaRegisteredMemory::register_host(ibv_pd* pd, void* addr,
     }
     ibv_mr* mr = ibv_reg_mr(pd, addr, bytes, access_flags());
     if (mr == nullptr) throw gdr_error("ibv_reg_mr host");
-    return RdmaRegisteredMemory(mr, addr, bytes, false);
+    return RdmaRegisteredMemory(mr, addr, bytes, false,
+                                RdmaRegistrationMethod::HostVerbs);
 }
 
 RdmaRegisteredMemory RdmaRegisteredMemory::register_device(
@@ -167,14 +200,20 @@ RdmaRegisteredMemory RdmaRegisteredMemory::register_device(
         throw std::runtime_error("rdma gdr register_device: invalid args");
     }
 
+    enable_gpu_rdma_sync_memops(device_addr);
+
     ibv_mr* mr = try_reg_dmabuf(pd, device_addr, bytes);
-    if (mr == nullptr) mr = ibv_reg_mr(pd, device_addr, bytes, access_flags());
+    RdmaRegistrationMethod method = RdmaRegistrationMethod::DmaBuf;
+    if (mr == nullptr) {
+        mr = ibv_reg_mr(pd, device_addr, bytes, access_flags());
+        method = RdmaRegistrationMethod::DeviceVerbs;
+    }
     if (mr == nullptr) {
         throw std::runtime_error(
             std::string("rdma gdr register_device unavailable: ") +
             std::strerror(errno));
     }
-    return RdmaRegisteredMemory(mr, device_addr, bytes, true);
+    return RdmaRegisteredMemory(mr, device_addr, bytes, true, method);
 }
 
 }  // namespace nano_nccl::transport::rdma

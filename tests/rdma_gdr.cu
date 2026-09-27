@@ -6,6 +6,7 @@
 #include "core/buffer.h"
 #include "transport/rdma/rdma_endpoint.h"
 #include "transport/rdma/rdma_gdr.h"
+#include "transport/simple/protocol.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -47,7 +48,9 @@ int main() {
         }
 
         RdmaEndpoint endpoint = RdmaEndpoint::create_from_environment();
-        constexpr std::size_t kBytes = 4096;
+        // A tiny MR can succeed even when the real Simple FIFO cannot be pinned.
+        constexpr std::size_t kBytes =
+            nano_nccl::transport::simple::kFifoBytes;
         int device_ordinal = -1;
         CUDA_CHECK_THROW(cudaGetDevice(&device_ordinal));
         void* device = nullptr;
@@ -55,6 +58,7 @@ int main() {
         CUDA_CHECK_THROW(cudaMemset(device, 0x5a, kBytes));
         CUDA_CHECK_THROW(cudaDeviceSynchronize());
 
+        std::string registration_method;
         try {
             RdmaRegisteredMemory mem = RdmaRegisteredMemory::register_device(
                 endpoint.pd(), device, kBytes);
@@ -64,6 +68,13 @@ int main() {
             if (mem.addr() != device) {
                 throw std::runtime_error("device MR addr mismatch");
             }
+            if (mem.registration_method() !=
+                    nano_nccl::transport::rdma::RdmaRegistrationMethod::DmaBuf &&
+                mem.registration_method() !=
+                    nano_nccl::transport::rdma::RdmaRegistrationMethod::DeviceVerbs) {
+                throw std::runtime_error("device MR registration method missing");
+            }
+            registration_method = mem.registration_method_name();
             RdmaGdrReceiveFlush receive_flush =
                 RdmaGdrReceiveFlush::for_device(device_ordinal);
             int native_ordering = 0;
@@ -90,7 +101,8 @@ int main() {
             return 1;
         }
         CUDA_CHECK_THROW(cudaFree(device));
-        std::printf("rdma_gdr=PASS\n");
+        std::printf("rdma_gdr=PASS registration=%s\n",
+                    registration_method.c_str());
         return 0;
     } catch (const std::exception& ex) {
         std::fprintf(stderr, "rdma_gdr: %s\n", ex.what());
