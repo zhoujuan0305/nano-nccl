@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
-# Performance matrix helper. Published performance.md is single-host only
-# (in-process auto + 4-rank socket + 4-rank RDMA). The socket/rdma sections
-# below still launch two-host MPI pairs; do not regenerate performance.md
-# from those sections without rewriting this script.
+# Performance matrix helper. Nano uses one MPI rank per GPU: four local ranks
+# for the single-host section and four ranks on each host for socket/RDMA.
+# nccl-tests uses the same one-MPI-process-per-GPU layout (-g 1 per process).
+# Existing performance.md values were collected with a different timing
+# contract; regenerate only from fresh runs of this script.
 # Hosts and interfaces come from the environment only — never hard-code secrets.
 set -euo pipefail
 
-DEFAULT_OUT="/data02/zhiyuanzhou/apptainer/tmp/opencode/perf-matrix"
-OUT_DIR="${DEFAULT_OUT}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+DEFAULT_OUT="${ROOT}/.local/perf-matrix"
+OUT_DIR="${DEFAULT_OUT}"
 SINGLE_BIN="${ROOT}/build-perf-single/benchmarks/nano_nccl_all_reduce_bench"
 RDMA_BIN="${ROOT}/build-perf-rdma/benchmarks/nano_nccl_all_reduce_bench"
 NCCL_BIN=""
 NCCL_LIB=""
 SECTIONS="single,socket,rdma"
 DRY_RUN=0
+# Match nano's per-collective stream wait and MPI_MAX aggregation. Keep this
+# centralized so single-host and multi-host comparisons cannot drift apart.
+NCCL_TIMING_ARGS=(-z 2 -a 3 -m 1)
+NANO_WAIT_ARGS=(--wait-mode query)
 
 usage() {
     cat <<'EOF'
@@ -22,8 +27,8 @@ Usage: run_performance_matrix.sh --nccl-bin PATH --nccl-lib DIR [options]
 
 Options:
   --out-dir DIR       output directory for logs + matrix.json
-  --single-bin PATH   nano single-host bench (default: build-perf-single/...)
-  --rdma-bin PATH     nano MPI/RDMA bench (default: build-perf-rdma/...)
+  --single-bin PATH   nano single-host MPI bench (default: build-perf-single/...)
+  --rdma-bin PATH     nano multi-host MPI bench (default: build-perf-rdma/...)
   --sections LIST     comma list: single,socket,rdma (default: all)
   --dry-run           print plan only
   -h, --help
@@ -35,6 +40,14 @@ Required env (live multi-host):
 Optional:
   NANO_NCCL_RDMA_GID_INDEX NCCL_IB_GID_INDEX
   CUDA_VISIBLE_DEVICES (default 0,1,2,3)
+
+Build rank counts:
+  --single-bin must be built with NANO_NCCL_NRANKS=4 and MPI enabled.
+  --rdma-bin must be built with NANO_NCCL_NRANKS=8 and MPI enabled.
+
+Comparison timing:
+  nano uses --wait-mode query; nccl-tests uses -z 2 -a 3 -m 1
+  (per-collective completion, MPI maximum, one iteration per timing sample).
 EOF
 }
 
@@ -119,7 +132,7 @@ parse_nccl_lines() {
 
 append_cell() {
     local section="$1" dtype="$2" redop="$3" size="$4"
-    local nt="$5" nb="$6" ct="$7" cb="$8" nw="$9" cw="$10"
+    local nt="$5" nb="$6" ct="$7" cb="$8" nw="$9" cw="${10}"
     python3 - "$RAW_JSONL" "$section" "$dtype" "$redop" "$size" "$nt" "$nb" "$ct" "$cb" "$nw" "$cw" <<'PY'
 import json, sys
 path, section, dtype, redop, size, nt, nb, ct, cb, nw, cw = sys.argv[1:]
@@ -148,19 +161,30 @@ run_single_pair() {
     ndt="$(nccl_dtype "${dtype}")"
 
     echo "==> single ${dtype}/${redop}"
-    if [[ "${DRY_RUN}" -eq 1 ]]; then return 0; fi
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        printf '    nano: %q --prefix %q --bind-to none -np 4 -x CUDA_VISIBLE_DEVICES -x LD_LIBRARY_PATH %q --algo ring_simple --transport auto --dtype %q --redop %q -b 262144 -e 67108864 -f 4 -w 5 -n 20 %s (4 local MPI ranks, one rank per GPU)\n' "${MPIRUN}" "${MPI_HOME}" "${SINGLE_BIN}" "${dtype}" "${redop}" "${NANO_WAIT_ARGS[*]}"
+        printf '    nccl: %q --prefix %q --bind-to none -np 4 -x CUDA_VISIBLE_DEVICES -x LD_LIBRARY_PATH ... %q -b 262144 -e 67108864 -f 4 -g 1 -w 5 -n 20 %s -d %q -o %q (4 local MPI processes, one GPU per process)\n' "${MPIRUN}" "${MPI_HOME}" "${NCCL_BIN}" "${NCCL_TIMING_ARGS[*]}" "${ndt}" "${redop}"
+        return 0
+    fi
     [[ -x "${SINGLE_BIN}" ]] || die "missing single bin ${SINGLE_BIN}"
 
     CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
+    "${MPIRUN}" --prefix "${MPI_HOME}" --bind-to none -np 4 \
+      -x CUDA_VISIBLE_DEVICES -x LD_LIBRARY_PATH \
       "${SINGLE_BIN}" --algo ring_simple --transport auto \
       --dtype "${dtype}" --redop "${redop}" \
-      -b 262144 -e 67108864 -f 4 -w 5 -n 20 \
+      -b 262144 -e 67108864 -f 4 -w 5 -n 20 "${NANO_WAIT_ARGS[@]}" \
       >"${nano_log}" 2>"${nano_err}" || die "nano single failed ${tag}: $(tail -5 "${nano_err}")"
 
     CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
     NCCL_ALGO=Ring NCCL_PROTO=Simple \
+    NCCL_P2P_DISABLE=0 NCCL_SHM_DISABLE=0 \
     NCCL_MIN_NCHANNELS=4 NCCL_MAX_NCHANNELS=4 NCCL_BUFFSIZE=33554432 \
-      "${NCCL_BIN}" -b 262144 -e 67108864 -f 4 -g 4 -w 5 -n 20 \
+      "${MPIRUN}" --prefix "${MPI_HOME}" --bind-to none -np 4 \
+      -x CUDA_VISIBLE_DEVICES -x LD_LIBRARY_PATH -x NCCL_ALGO -x NCCL_PROTO \
+      -x NCCL_P2P_DISABLE -x NCCL_SHM_DISABLE \
+      -x NCCL_MIN_NCHANNELS -x NCCL_MAX_NCHANNELS -x NCCL_BUFFSIZE \
+      "${NCCL_BIN}" -b 262144 -e 67108864 -f 4 -g 1 -w 5 -n 20 "${NCCL_TIMING_ARGS[@]}" \
       -d "${ndt}" -o "${redop}" \
       >"${nccl_log}" 2>"${nccl_err}" || die "nccl single failed ${tag}"
 
@@ -191,7 +215,9 @@ def parse_nccl(path, dt, ro):
 ndt={'float':'float','fp16':'half','bf16':'bfloat16'}[dtype]
 n=parse_nano(nano_log); c=parse_nccl(nccl_log, ndt, redop)
 sizes=sorted(set(n)&set(c))
-if not sizes: raise SystemExit(f'no overlapping sizes for single {dtype}/{redop}')
+expected=[262144,1048576,4194304,16777216,67108864]
+if sorted(n)!=expected or sorted(c)!=expected:
+    raise SystemExit(f'incomplete sizes for single {dtype}/{redop}: nano={sorted(n)} nccl={sorted(c)}')
 with open(out,'a') as f:
     for s in sizes:
         nt,nb,nw=n[s]; ct,cb,cw=c[s]
@@ -220,7 +246,13 @@ run_mpi_pair() {
     ndt="$(python3 -c "print({'float':'float','fp16':'half','bf16':'bfloat16'}['${dtype}'])")"
 
     echo "==> ${section} ${dtype}/${redop} transport=${transport}"
-    if [[ "${DRY_RUN}" -eq 1 ]]; then return 0; fi
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        printf '    nano ranks: %q --prefix %q --host <host-a>:4 -np 4 ... : --host <host-b>:4 -np 4 ... (8 global MPI ranks, one rank per GPU)\n' "${MPIRUN}" "${MPI_HOME}"
+        printf '    nano args per rank: %q --algo ring_simple --transport %q --dtype %q --redop %q -b 262144 -e 67108864 -f 4 -w 5 -n 20 --wait-mode query\n' "${RDMA_BIN}" "${transport}" "${dtype}" "${redop}"
+        printf '    nccl ranks: %q --host <host-a>:4 -np 4 ... : --host <host-b>:4 -np 4 ... (8 global MPI processes, one GPU per process)\n' "${MPIRUN}"
+        printf '    nccl args per process: %q -b 262144 -e 67108864 -f 4 -g 1 -w 5 -n 20 %s -d %q -o %q\n' "${NCCL_BIN}" "${NCCL_TIMING_ARGS[*]}" "${ndt}" "${redop}"
+        return 0
+    fi
     [[ -x "${RDMA_BIN}" ]] || die "missing rdma/mpi bin ${RDMA_BIN}"
     [[ -n "${NCCL_SOCKET_IFNAME:-}" ]] || die "set NCCL_SOCKET_IFNAME"
 
@@ -233,36 +265,36 @@ run_mpi_pair() {
     local -a nano_env=(NANO_NCCL_SOCKET_IFNAME="${sock_if}")
     if [[ "${transport}" == "rdma" ]]; then
         [[ -n "${NANO_NCCL_RDMA_IFNAME:-}" ]] || die "set NANO_NCCL_RDMA_IFNAME"
-        nano_x+=(-x NANO_NCCL_RDMA_IFNAME)
-        nano_env+=(NANO_NCCL_RDMA_IFNAME="${NANO_NCCL_RDMA_IFNAME}")
+        nano_x+=(-x NANO_NCCL_RDMA_IFNAME -x NANO_NCCL_RDMA_GDR
+                 -x NANO_NCCL_RDMA_USE_WRITE)
+        nano_env+=(NANO_NCCL_RDMA_IFNAME="${NANO_NCCL_RDMA_IFNAME}"
+                   NANO_NCCL_RDMA_GDR=0 NANO_NCCL_RDMA_USE_WRITE=1)
         if [[ -n "${NANO_NCCL_RDMA_GID_INDEX:-}" ]]; then
             nano_x+=(-x NANO_NCCL_RDMA_GID_INDEX)
             nano_env+=(NANO_NCCL_RDMA_GID_INDEX="${NANO_NCCL_RDMA_GID_INDEX}")
         fi
-        if [[ -n "${NANO_NCCL_RDMA_USE_WRITE:-}" ]]; then
-            nano_x+=(-x NANO_NCCL_RDMA_USE_WRITE)
-            nano_env+=(NANO_NCCL_RDMA_USE_WRITE="${NANO_NCCL_RDMA_USE_WRITE}")
-        fi
     fi
 
     env "${nano_env[@]}" \
-    "${MPIRUN}" --prefix "${MPI_HOME}" "${mca[@]}" \
-      --host "${host_a}:1" -np 1 "${nano_x[@]}" \
+    "${MPIRUN}" --prefix "${MPI_HOME}" --bind-to none "${mca[@]}" \
+      --host "${host_a}:4" -np 4 "${nano_x[@]}" \
       "${RDMA_BIN}" --algo ring_simple --transport "${transport}" \
       --dtype "${dtype}" --redop "${redop}" \
-      -b 262144 -e 67108864 -f 4 -w 5 -n 20 : \
-      --host "${host_b}:1" -np 1 "${nano_x[@]}" \
+      -b 262144 -e 67108864 -f 4 -w 5 -n 20 "${NANO_WAIT_ARGS[@]}" : \
+      --host "${host_b}:4" -np 4 "${nano_x[@]}" \
       "${RDMA_BIN}" --algo ring_simple --transport "${transport}" \
       --dtype "${dtype}" --redop "${redop}" \
-      -b 262144 -e 67108864 -f 4 -w 5 -n 20 \
+      -b 262144 -e 67108864 -f 4 -w 5 -n 20 "${NANO_WAIT_ARGS[@]}" \
       >"${nano_log}" 2>"${nano_err}" || die "nano ${tag} failed: $(tail -8 "${nano_err}")"
 
     local -a nccl_x=(-x CUDA_VISIBLE_DEVICES -x LD_LIBRARY_PATH
         -x NCCL_SOCKET_IFNAME -x NCCL_ALGO -x NCCL_PROTO
+        -x NCCL_P2P_DISABLE -x NCCL_SHM_DISABLE
         -x NCCL_MIN_NCHANNELS -x NCCL_MAX_NCHANNELS -x NCCL_BUFFSIZE)
     local -a nccl_env=(
         NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME}"
         NCCL_ALGO=Ring NCCL_PROTO=Simple
+        NCCL_P2P_DISABLE=0 NCCL_SHM_DISABLE=0
         NCCL_MIN_NCHANNELS=4 NCCL_MAX_NCHANNELS=4 NCCL_BUFFSIZE=33554432
     )
     local -a nccl_mca
@@ -273,11 +305,11 @@ run_mpi_pair() {
         nccl_env+=(NCCL_IB_DISABLE=1)
         nccl_x+=(-x NCCL_IB_DISABLE)
         env "${nccl_env[@]}" \
-        "${MPIRUN}" --prefix "${MPI_HOME}" "${nccl_mca[@]}" \
-          --host "${host_a}:1" -np 1 "${nccl_x[@]}" \
-          "${NCCL_BIN}" -b 262144 -e 67108864 -f 4 -g 4 -w 5 -n 20 -d "${ndt}" -o "${redop}" : \
-          --host "${host_b}:1" -np 1 "${nccl_x[@]}" \
-          "${NCCL_BIN}" -b 262144 -e 67108864 -f 4 -g 4 -w 5 -n 20 -d "${ndt}" -o "${redop}" \
+        "${MPIRUN}" --prefix "${MPI_HOME}" --bind-to none "${nccl_mca[@]}" \
+          --host "${host_a}:4" -np 4 "${nccl_x[@]}" \
+          "${NCCL_BIN}" -b 262144 -e 67108864 -f 4 -g 1 -w 5 -n 20 "${NCCL_TIMING_ARGS[@]}" -d "${ndt}" -o "${redop}" : \
+          --host "${host_b}:4" -np 4 "${nccl_x[@]}" \
+          "${NCCL_BIN}" -b 262144 -e 67108864 -f 4 -g 1 -w 5 -n 20 "${NCCL_TIMING_ARGS[@]}" -d "${ndt}" -o "${redop}" \
           >"${nccl_log}" 2>"${nccl_err}" || die "nccl socket ${tag} failed"
     else
         [[ -n "${NCCL_IB_HCA:-}" ]] || die "set NCCL_IB_HCA"
@@ -288,11 +320,11 @@ run_mpi_pair() {
             nccl_x+=(-x NCCL_IB_GID_INDEX)
         fi
         env -u NCCL_IB_DISABLE "${nccl_env[@]}" \
-        "${MPIRUN}" --prefix "${MPI_HOME}" "${nccl_mca[@]}" \
-          --host "${host_a}:1" -np 1 "${nccl_x[@]}" \
-          "${NCCL_BIN}" -b 262144 -e 67108864 -f 4 -g 4 -w 5 -n 20 -d "${ndt}" -o "${redop}" : \
-          --host "${host_b}:1" -np 1 "${nccl_x[@]}" \
-          "${NCCL_BIN}" -b 262144 -e 67108864 -f 4 -g 4 -w 5 -n 20 -d "${ndt}" -o "${redop}" \
+        "${MPIRUN}" --prefix "${MPI_HOME}" --bind-to none "${nccl_mca[@]}" \
+          --host "${host_a}:4" -np 4 "${nccl_x[@]}" \
+          "${NCCL_BIN}" -b 262144 -e 67108864 -f 4 -g 1 -w 5 -n 20 "${NCCL_TIMING_ARGS[@]}" -d "${ndt}" -o "${redop}" : \
+          --host "${host_b}:4" -np 4 "${nccl_x[@]}" \
+          "${NCCL_BIN}" -b 262144 -e 67108864 -f 4 -g 1 -w 5 -n 20 "${NCCL_TIMING_ARGS[@]}" -d "${ndt}" -o "${redop}" \
           >"${nccl_log}" 2>"${nccl_err}" || die "nccl rdma ${tag} failed"
     fi
 
@@ -321,7 +353,9 @@ def parse_nccl(path, dt, ro):
 ndt={'float':'float','fp16':'half','bf16':'bfloat16'}[dtype]
 n=parse_nano(nano_log); c=parse_nccl(nccl_log, ndt, redop)
 sizes=sorted(set(n)&set(c))
-if not sizes: raise SystemExit(f'no sizes {section} {dtype}/{redop}')
+expected=[262144,1048576,4194304,16777216,67108864]
+if sorted(n)!=expected or sorted(c)!=expected:
+    raise SystemExit(f'incomplete sizes for {section} {dtype}/{redop}: nano={sorted(n)} nccl={sorted(c)}')
 with open(out,'a') as f:
     for s in sizes:
         nt,nb,nw=n[s]; ct,cb,cw=c[s]
@@ -412,6 +446,17 @@ doc={
     'node_b_kernel': f'Linux {kb}' if kb and not kb.startswith('Linux') else (kb or 'unknown'),
     'node_a_driver': da or 'unknown',
     'node_b_driver': db or 'unknown',
+    'benchmark_timing': {
+      'nano_wait_mode': 'query',
+      'nccl_tests_blocking_coll': 2,
+      'nccl_tests_average': 3,
+      'nccl_tests_agg_iters': 1,
+      'warmup_iterations': 5,
+      'timed_iterations': 20,
+      'semantics': 'per-collective completion; max across MPI ranks',
+    },
+    'rank_layout': 'one MPI process per GPU for nano and nccl-tests; 4 ranks on a single host or 4 ranks per host on two hosts',
+    'rank_device_map': 'single: ranks 0-3 -> local visible GPUs 0-3; two-host: ranks 0-3 -> host A visible GPUs 0-3, ranks 4-7 -> host B visible GPUs 0-3',
   },
   'sections': sections,
 }

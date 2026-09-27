@@ -63,6 +63,8 @@ public:
     TransportKind transport() const noexcept;
     // Returns the backend for source_global_rank -> (source_global_rank + 1) % nranks.
     TransportKind edge_transport(int source_global_rank) const;
+    // True when a directed RDMA edge uses registered GPU FIFO memory.
+    bool edge_uses_gdr(int source_global_rank) const;
 
 private:
     class Impl;

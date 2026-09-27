@@ -39,8 +39,8 @@ edge is accepted even without direct NVLink. Rank 8 is not validated support
 until it has matching hardware execution coverage.
 
 The historical tables in [performance.md](performance.md) predate the
-one-process-per-GPU contract. Unless a result is explicitly marked as
-revalidated, it is not acceptance evidence for this architecture.
+one-process-per-GPU and matched-timing contracts. Unless a result is explicitly
+marked as revalidated, it is not acceptance evidence for this architecture.
 
 A post-change rank-2 repeatability smoke (`float`/`sum`, `-w 5 -n 20`, three
 runs) produced median busbw of 7.60/19.39/26.62/32.62/34.36 GB/s for P2P and
@@ -126,7 +126,7 @@ mpirun -np 4 --bind-to none bash -c '
   export CUDA_VISIBLE_DEVICES=$OMPI_COMM_WORLD_LOCAL_RANK
   exec ./build/benchmarks/nano_nccl_all_reduce_bench \
     --algo ring_simple --transport auto --dtype float --redop sum \
-    -b 262144 -e 67108864 -f 4 -w 5 -n 20
+    -b 262144 -e 67108864 -f 4 -w 5 -n 20 --wait-mode query
 '
 ```
 
@@ -268,6 +268,42 @@ registered host-pinned FIFO with RC SEND/RECV.
 GDR setup fails rather than falling back. `rdma` still resolves same-host edges
 with the P2P/SHM auto rule and uses RDMA only for cross-host edges, so the
 aggregate result is commonly `mixed`.
+
+`Communicator::edge_uses_gdr(edge)` (and `nano_nccl_edge_uses_gdr`) reports
+whether a directed RDMA edge uses a registered GPU FIFO. The benchmark prints
+each directed edge with its transport and RDMA memory placement before the
+measurement table. Peers reject mismatched GDR placement or RDMA data-plane
+selection during bootstrap. `nano_nccl_rdma_gdr` probes a full 32 MiB FIFO
+registration and prints `registration=dmabuf` or `registration=device-verbs`
+on success; the latter identifies the verbs call, not a particular kernel
+registration mechanism.
+
+For an end-to-end GDR correctness run, build with `NANO_NCCL_NRANKS=2` and
+launch one MPI rank on each host with the same binary and environment:
+
+```bash
+export NANO_NCCL_SOCKET_IFNAME=<interface>
+export NANO_NCCL_RDMA_IFNAME=<rdma-interface>
+export NANO_NCCL_RDMA_GDR=1
+mpirun -np 2 --host <host-a>:1,<host-b>:1 --bind-to none \
+  -x NANO_NCCL_SOCKET_IFNAME -x NANO_NCCL_RDMA_IFNAME \
+  -x NANO_NCCL_RDMA_GDR \
+  ./build-rdma/tests/nano_nccl_mpi_native_api rdma-gdr
+```
+
+The `rdma-gdr` mode checks GPU FIFO placement on cross-host edges and runs
+long, repeated float/FP16/BF16 AllReduce, ReduceScatter, and AllGather
+correctness cases. Run it once with the default SEND/RECV data plane and once
+with `NANO_NCCL_RDMA_USE_WRITE=1` exported to all ranks for WRITE+CTS.
+
+For the two-host, eight-GPU GDR performance comparison, see
+`scripts/run_gdr_matched.py --help`. The runner takes hosts, MPI prefix, all
+three collective binaries for both implementations, network devices, and an
+output directory. It defaults to five alternating repetitions per case,
+one MPI process per GPU, nano `--wait-mode query` with WRITE+CTS GDR, and
+nccl-tests `-z 2 -a 3 -m 1 -g 1` with bidirectional GDR. It saves raw logs
+and checks correctness and actual GDR placement. Earlier performance tables
+used a different timing contract and process layout.
 
 ## Implementation ownership
 

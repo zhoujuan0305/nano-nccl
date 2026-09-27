@@ -9,6 +9,7 @@ struct ibv_mr;
 namespace nano_nccl::transport::rdma {
 
 enum class RdmaMemoryPlacement { HostPin, GpuDirect };
+enum class RdmaRegistrationMethod { None, HostVerbs, DmaBuf, DeviceVerbs };
 
 // NANO_NCCL_RDMA_GDR unset/""/0/false/off → HostPin;
 // 1/true/on → GpuDirect; otherwise throws.
@@ -58,10 +59,12 @@ public:
     std::uint32_t lkey() const noexcept;
     std::uint32_t rkey() const noexcept;
     bool is_device() const noexcept { return device_; }
+    RdmaRegistrationMethod registration_method() const noexcept { return method_; }
+    const char* registration_method_name() const noexcept;
 
 private:
     RdmaRegisteredMemory(ibv_mr* mr, void* addr, std::size_t bytes,
-                         bool device) noexcept;
+                         bool device, RdmaRegistrationMethod method) noexcept;
 
     void reset() noexcept;
 
@@ -69,6 +72,7 @@ private:
     void* addr_ = nullptr;
     std::size_t bytes_ = 0;
     bool device_ = false;
+    RdmaRegistrationMethod method_ = RdmaRegistrationMethod::None;
 };
 
 }  // namespace nano_nccl::transport::rdma

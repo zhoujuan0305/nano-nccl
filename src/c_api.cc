@@ -387,4 +387,20 @@ nano_nccl_status_t nano_nccl_edge_transport(
     });
 }
 
+nano_nccl_status_t nano_nccl_edge_uses_gdr(
+    const nano_nccl_communicator_t* communicator, int source_global_rank,
+    int* uses_gdr) {
+    begin_call();
+    nano_nccl_status_t status = validate_handle(communicator);
+    if (status != NANO_NCCL_STATUS_SUCCESS) return status;
+    if (uses_gdr == nullptr) {
+        return fail(NANO_NCCL_STATUS_INVALID_ARGUMENT,
+                    "uses_gdr output must be non-null");
+    }
+    return translate_exceptions([&] {
+        *uses_gdr = communicator->communicator->edge_uses_gdr(
+            source_global_rank) ? 1 : 0;
+    });
+}
+
 }  // extern "C"

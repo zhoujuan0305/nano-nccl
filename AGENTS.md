@@ -1,5 +1,7 @@
 # AGENTS.md
 
+项目长期状态、GDR 实现与证据记录见 [PROJECT_MEMORY.md](PROJECT_MEMORY.md)。
+
 ## Project Mission
 
 nano-nccl is a deliberately narrow GPU collective communication library and an
@@ -10,7 +12,7 @@ and one protocol so that their implementation can be understood end to end:
 - protocol: Simple only
 - collectives: out-of-place AllReduce, ReduceScatter, and AllGather
 - transports: per-edge SHM, P2P, and NET
-- NET backends: Socket reference path, host-pinned RDMA, and eventually
+- NET backends: Socket reference path, host-pinned RDMA, and host-proxy
   GPUDirect RDMA
 - device code: generated specialization registry backed by readable,
   handwritten CUDA templates
@@ -52,17 +54,22 @@ Keep the distinction between current behavior and target architecture clear:
   matrices are validated on the single-host SHM, auto, and available P2P paths.
   Reduction NaN propagation for float, FP16, and BF16 is validated for
   AllReduce on auto and for ReduceScatter on SHM, auto, and available P2P.
-  Current execution coverage is ranks 2 and 4 on one 4x RTX A6000 (SM86) host;
-  rank 8 is compile-tested only. Distributed correctness and performance
-  evidence currently covers AllReduce only.
+  Single-host coverage includes ranks 2 and 4; rank 8 is compile-tested only.
+  Two-host GDR rank-8 finite-input benchmark correctness covers AllReduce and
+  ReduceScatter for all supported dtypes and reduction ops, and AllGather for
+  all supported dtypes, in both SEND/RECV and WRITE+CTS modes. See
+  `PROJECT_MEMORY.md` for exact scope and limitations.
 - The public C++ API uses distinct typed descriptors for all three collectives;
   the C ABI mirrors their distinct count and reduction semantics.
 - dtype and reduce op are compile-time kernel dimensions, but `nranks` is still
   a runtime kernel argument and `NANO_NCCL_NRANKS` fixes host-side sizing.
 - Single-host SHM and P2P paths exist. Transport selection is resolved per Ring
   edge and can produce a mixed plan.
-- MPI/socket and MPI/RDMA paths are validated for cross-process AllReduce;
-  ReduceScatter and AllGather have not completed distributed acceptance.
+- MPI/socket and MPI/RDMA paths are validated for cross-process AllReduce.
+  Two-host GDR ReduceScatter and AllGather `sum` cases pass at ranks 2, 4,
+  and 8. Rank-8 finite-input dtype/reduction matrices also pass correctness,
+  while the corrected two-host WRITE+CTS finite-input matrix passes the
+  NCCL-relative gate; SEND/RECV and baseline regression remain open.
 - RDMA supports registered host-pinned FIFO memory and opt-in host-proxy
   GPUDirect RDMA. SEND/RECV and WRITE+CTS modes exist.
 - `src/collective/collective.h` and `src/transport/transport.h` are empty virtual
@@ -113,8 +120,8 @@ and a shared composition for AllReduce.
 ### Phase 3: Deepen NET
 
 Retain Socket as a reference NET data-plane backend, characterize host-pinned
-RDMA, then implement and compare GPUDirect RDMA. Compare host-pinned paths with
-NCCL GDR disabled and GDR paths with NCCL GDR enabled.
+RDMA, and verify and compare host-proxy GPUDirect RDMA. Compare host-pinned
+paths with NCCL GDR disabled and GDR paths with NCCL GDR enabled.
 
 ## Local Workspace And Worktrees
 
@@ -319,6 +326,13 @@ NCCL comparisons must be same-round and match all relevant conditions:
 - channels and buffer size
 - topology and transport class
 - GDR disabled for host-pinned comparison, enabled for GDR comparison
+- timing and aggregation semantics: explicitly run nano with
+  `--wait-mode query` and nccl-tests with `-z 2 -a 3 -m 1`; both must use the
+  same `-w` and `-n`. These settings give per-collective completion and report
+  the slowest rank/process. The nccl-tests default `-z 0 -a 1` batches
+  asynchronous iterations and averages processes, so it cannot serve as the
+  same-round performance gate. Use one MPI process per GPU on both sides and
+  `-g 1` for nccl-tests. Record the exact rank-to-GPU mapping in each report.
 
 For each declared contract matrix:
 
