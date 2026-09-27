@@ -49,7 +49,7 @@ def main() -> int:
         require(text, "cts_fifo_addr", "rdma_protocol.h cts_fifo_addr field")
         require(text, "static_assert(sizeof(RdmaCtsSlot) == 32)",
                 "rdma_protocol.h RdmaCtsSlot size assert")
-        require(text, "static_assert(sizeof(RdmaPeerInfo) == 64)",
+        require(text, "static_assert(sizeof(RdmaPeerInfo) == 72)",
                 "rdma_protocol.h RdmaPeerInfo size assert")
 
     # Communicator must wire WRITE+CTS bootstrap when the env plane is selected.

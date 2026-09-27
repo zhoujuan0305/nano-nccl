@@ -35,7 +35,7 @@ MPI rank 对应一个进程，并选择、独占一张 GPU。这与 PyTorch/nano
 CUDA IPC P2P 由实际 open/close probe 决定，因此即使没有 direct NVLink，只要 PCIe
 P2P 可用也会被接受。rank 8 在具备对应硬件执行覆盖前不能描述为已验证支持。
 
-历史 [performance.md](performance.md) 中的表格早于 1 进程 1 GPU 合同；除非明确
+历史 [performance.md](performance.md) 中的表格早于 1 进程 1 GPU 与统一计时合同；除非明确
 标注重新验证，否则不能作为当前架构的性能验收数据。
 
 修改后的 rank 2 重复性 smoke（`float`/`sum`、`-w 5 -n 20`、连续 3 轮）在
@@ -116,7 +116,7 @@ mpirun -np 4 --bind-to none bash -c '
   export CUDA_VISIBLE_DEVICES=$OMPI_COMM_WORLD_LOCAL_RANK
   exec ./build/benchmarks/nano_nccl_all_reduce_bench \
     --algo ring_simple --transport auto --dtype float --redop sum \
-    -b 262144 -e 67108864 -f 4 -w 5 -n 20
+    -b 262144 -e 67108864 -f 4 -w 5 -n 20 --wait-mode query
 '
 ```
 
@@ -253,6 +253,37 @@ SEND/RECV；`NANO_NCCL_RDMA_USE_WRITE=1` 选择 WRITE+CTS，
 `NANO_NCCL_RDMA_GDR=1` 显式选择 GPU memory registration。GDR 能力不可用时会失败，
 不会回退。`rdma` 对同机 edge 仍按 P2P/SHM auto 规则解析，对跨机 edge 使用 RDMA，
 因此聚合结果通常是 `mixed`。
+
+`Communicator::edge_uses_gdr(edge)`（以及 `nano_nccl_edge_uses_gdr`）可查询
+指定有向 RDMA edge 是否使用已注册的 GPU FIFO。benchmark 会在结果表前打印每条
+edge 的 transport 和 RDMA 内存放置；bootstrap 会拒绝两端不一致的 GDR 内存放置或
+RDMA 数据面选择。`nano_nccl_rdma_gdr` 按实际 32 MiB FIFO 大小探测注册，成功时
+输出 `registration=dmabuf` 或 `registration=device-verbs`；后者仅表示设备地址经
+verbs 调用注册成功，不代表已识别内核的具体注册机制。
+
+端到端 GDR 正确性测试需以 `NANO_NCCL_NRANKS=2` 构建，并在两台机器各启动一个
+MPI rank，确保二进制和环境变量一致：
+
+```bash
+export NANO_NCCL_SOCKET_IFNAME=<interface>
+export NANO_NCCL_RDMA_IFNAME=<rdma-interface>
+export NANO_NCCL_RDMA_GDR=1
+mpirun -np 2 --host <host-a>:1,<host-b>:1 --bind-to none \
+  -x NANO_NCCL_SOCKET_IFNAME -x NANO_NCCL_RDMA_IFNAME \
+  -x NANO_NCCL_RDMA_GDR \
+  ./build-rdma/tests/nano_nccl_mpi_native_api rdma-gdr
+```
+
+`rdma-gdr` 模式会检查跨机 edge 的 GPU FIFO，并以长消息、重复轮次验证
+float/FP16/BF16 的 AllReduce、ReduceScatter 和 AllGather。默认 SEND/RECV
+运行一次，再向全部 rank 导出 `NANO_NCCL_RDMA_USE_WRITE=1`，验证 WRITE+CTS。
+
+双机 8 GPU 的 GDR 性能对照使用 `scripts/run_gdr_matched.py --help` 查看参数。
+脚本要求传入两台主机、MPI 前缀、三个 collective 的 nano 与 nccl-tests 二进制、
+网卡/HCA/GID 和日志目录；默认每个 case 交错重复五轮。它固定双方每 GPU 一个 MPI
+进程、nano `--wait-mode query` 与 WRITE+CTS GDR、nccl-tests
+`-z 2 -a 3 -m 1 -g 1` 和双向 GDR，逐轮保存原始日志并检查结果与 GDR 路径。
+旧性能表的计时口径与进程布局不同，不能作为这套脚本的验收基线。
 
 ## 实现归属
 

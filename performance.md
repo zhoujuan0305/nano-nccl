@@ -2,6 +2,8 @@
 
 All results below are out-of-place all-reduce measurements. Bandwidth is `busbw` in GB/s. Every measured nano-nccl and NCCL result completed validation with zero wrong values. The `nano/NCCL` column is calculated from the unrounded measured time (`nccl_time_us / nano_time_us`).
 
+**Historical timing caveat:** this matrix predates the matched benchmark contract. Nano synchronized after every collective and reported the slowest MPI rank; nccl-tests used its default asynchronous batch and averaged MPI processes. Nano used one MPI process per GPU while NCCL used multiple GPUs per MPI process. These ratios cannot be used for formal NCCL-relative acceptance. The reproduction commands below use the corrected protocol and will not reproduce these historical timing values.
+
 ## Test Topology And Environment
 
 Two hosts, each two-socket Intel Xeon Platinum 8462Y+ (32 cores per socket, two threads per core), 4x NVIDIA RTX A6000 (SM86), CUDA 12.8.61, NCCL 2.30.7 built from source, nccl-tests 2.19.6, and Open MPI 4.1.2.
@@ -412,7 +414,7 @@ In-process 4-GPU communicator. Nano `--transport auto` resolves each ring edge i
 
 Same 2x4 topology as the host-pinned RDMA table. Nano `--transport rdma` with `NANO_NCCL_RDMA_USE_WRITE=1` and `NANO_NCCL_RDMA_GDR=1` (WRITE+CTS from a registered GPU FIFO; host proxy still posts). After a receive CQE, nano flushes third-party GDR writes before publishing `recv_tail` when the device lacks native GPU/RDMA write ordering. NCCL: Ring+Simple with `NCCL_NET_GDR_LEVEL=SYS`; debug logs confirmed `/GDRDMA` on the cross-host edges. Each cell is the median of five complete, alternating-order repetitions; no isolated retries replace matrix samples. This is host-proxy GDR, not GPU-initiated IBGDA.
 
-Across 60 dtype/op/size cells, nano/NCCL busbw geomean is 1.101; the minimum cell is 0.937, with 0 cells below 0.90.
+This historical 60-cell table used the unmatched timing and rank layout noted above; its ratios are not NCCL-relative acceptance results. Under that historical setup, nano/NCCL busbw geomean was 1.101, the minimum cell was 0.937, and 0 cells were below 0.90. The corrected matched two-host WRITE+CTS matrix is recorded in the experiments repository under `nano-nccl/two-host-rdma-gdr/runs/run-20260927-003/`.
 
 No accepted GDR nano baseline exists, so the formal 3% baseline-regression gate is not adjudicated. Cells below NCCL remain `Unknown` performance gaps until controlled causal experiments explain them. The existing packed FP16/BF16 `max`/`min` single-NaN propagation failure is unchanged in GDR=0 and GDR=1; these tables validate their ordinary benchmark inputs but do not establish complete dtype/redop contract correctness.
 
@@ -545,30 +547,30 @@ No accepted GDR nano baseline exists, so the formal 3% baseline-regression gate 
 
 ## Reproduction
 
-Build nano-nccl with CUDA 12.8, SM86, Release mode, and profiling disabled. The in-process auto binary uses four ranks in one process. The two-host Socket and RDMA tables use one MPI process with four GPUs per host and a global `NANO_NCCL_NRANKS=8`, from the same Open MPI 4.1.2 prefix.
+For a new matched comparison, build nano-nccl with CUDA 12.8, SM86, Release mode, and profiling disabled. Run one MPI process per GPU for both implementations: four local ranks for a single-host comparison or four ranks per host with a global `NANO_NCCL_NRANKS=8` for two hosts. Use the same Open MPI 4.1.2 prefix.
 
 ```bash
-# nano-nccl, in-process auto (P2P/SHM)
+# nano-nccl, four local MPI ranks over auto (P2P/SHM)
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
-  ./build-perf-single/benchmarks/nano_nccl_all_reduce_bench \
+  mpirun --bind-to none -np 4 ./build-perf-single/benchmarks/nano_nccl_all_reduce_bench \
   --algo ring_simple --transport auto --dtype <float|fp16|bf16> \
-  --redop <sum|avg|max|min> -b 262144 -e 67108864 -f 4 -w 5 -n 20
+  --redop <sum|avg|max|min> -b 262144 -e 67108864 -f 4 -w 5 -n 20 --wait-mode query
 
-# NCCL, in-process intra-node
+# NCCL, four local MPI ranks, one GPU per process
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 LD_LIBRARY_PATH=<path-to-nccl-lib> \
 NCCL_ALGO=Ring NCCL_PROTO=Simple NCCL_MIN_NCHANNELS=4 \
 NCCL_MAX_NCHANNELS=4 NCCL_BUFFSIZE=33554432 \
-  <path-to-nccl-tests>/build/all_reduce_perf \
-  -b 262144 -e 67108864 -f 4 -g 4 -w 5 -n 20 \
+  mpirun --bind-to none -np 4 <path-to-nccl-tests>/build/all_reduce_perf \
+  -b 262144 -e 67108864 -f 4 -g 1 -w 5 -n 20 -z 2 -a 3 -m 1 \
   -d <float|half|bfloat16> -o <sum|avg|max|min>
 ```
 
-For the socket runs, launch one MPI process with four visible GPUs per host. Nano uses `--transport auto` (cross-process edges are socket). NCCL sets `NCCL_P2P_DISABLE=1`, `NCCL_SHM_DISABLE=1`, and `NCCL_IB_DISABLE=1`.
+For socket runs, launch four MPI processes with four visible GPUs per host. Nano uses `--transport auto` (cross-host edges are socket). NCCL sets `NCCL_IB_DISABLE=1`; local P2P/SHM remain enabled.
 
-For host-pinned RDMA, use nano `--transport rdma` with `NANO_NCCL_RDMA_USE_WRITE=1`. Set `NANO_NCCL_SOCKET_IFNAME=<interface>` for bootstrap and `NANO_NCCL_RDMA_IFNAME=<rdma-interface>` (and `NANO_NCCL_RDMA_GID_INDEX` when required). NCCL sets `NCCL_P2P_DISABLE=1`, `NCCL_SHM_DISABLE=1`, `NCCL_NET_GDR_LEVEL=0`, `NCCL_IB_HCA=<rdma-hca>`, and `NCCL_IB_GID_INDEX` when required.
+For host-pinned RDMA, use nano `--transport rdma` with `NANO_NCCL_RDMA_USE_WRITE=1`. Set `NANO_NCCL_SOCKET_IFNAME=<interface>` for bootstrap and `NANO_NCCL_RDMA_IFNAME=<rdma-interface>` (and `NANO_NCCL_RDMA_GID_INDEX` when required). NCCL sets `NCCL_NET_GDR_LEVEL=0`, `NCCL_IB_HCA=<rdma-hca>`, and `NCCL_IB_GID_INDEX` when required.
 
-For the two-host GDR matrix, build both hosts for eight ranks and launch one MPI process per host with four visible GPUs. Add `NANO_NCCL_RDMA_GDR=1` for nano and use `NCCL_NET_GDR_LEVEL=SYS` for NCCL. Run `nano_nccl_rdma_gdr` before the matrix; nano's explicit GDR request fails instead of falling back, but its benchmark currently reports only the aggregate `mixed` transport rather than the required per-edge placement. Verify `/GDRDMA` in NCCL debug output.
+For a two-host GDR matrix, build both hosts for eight ranks and launch four MPI processes per host with four visible GPUs. Add `NANO_NCCL_RDMA_GDR=1` for nano and use `NCCL_NET_GDR_LEVEL=SYS` and `NCCL_NET_GDR_READ=1` for NCCL. Run `nano_nccl_rdma_gdr` before the matrix; nano's explicit GDR request fails instead of falling back. The benchmark prints the aggregate transport and each directed edge's backend and RDMA FIFO placement (`gdr`, `host-pinned`, or `n/a`). Verify `/GDRDMA` in both NCCL send and receive logs.
 
 ```bash
 cmake -S . -B build-perf-rdma-n8 -DCMAKE_BUILD_TYPE=Release \

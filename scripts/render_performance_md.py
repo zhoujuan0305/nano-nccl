@@ -56,26 +56,32 @@ def table_for(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def render_section(name: str, body: dict) -> str:
+def render_section(name: str, body: dict, matched_timing: bool) -> str:
     parts = [f"## {SECTION_HEAD[name]}", ""]
     if name == "single":
         parts.extend(
             [
-                "In-process 4-GPU communicator. Nano `--transport auto` resolves each ring edge independently (P2P when bidirectional NVLink peer access is available, otherwise SHM). NCCL is the matching intra-node Ring+Simple path (P2P/SHM allowed).",
+                ("Four local MPI processes, one GPU per process. " if matched_timing
+                 else "In-process 4-GPU communicator. ") +
+                "Nano `--transport auto` resolves each ring edge independently (P2P when bidirectional NVLink peer access is available, otherwise SHM). NCCL is the matching intra-node Ring+Simple path (P2P/SHM allowed).",
                 "",
             ]
         )
     elif name == "socket":
         parts.extend(
             [
-                "2 hosts x 4 GPUs, one MPI process per host. Nano `--transport auto` keeps local ring edges on P2P/SHM and places cross-host edges on TCP socket. NCCL is Ring+Simple with `NCCL_IB_DISABLE=1` (P2P/SHM allowed intra-node). Bootstrap uses the management IPv4 interface, not loopback.",
+                ("2 hosts x 4 GPUs, one MPI process per GPU. " if matched_timing
+                 else "2 hosts x 4 GPUs, one MPI process per host. ") +
+                "Nano `--transport auto` keeps local ring edges on P2P/SHM and places cross-host edges on TCP socket. NCCL is Ring+Simple with `NCCL_IB_DISABLE=1` (P2P/SHM allowed intra-node). Bootstrap uses the management IPv4 interface, not loopback.",
                 "",
             ]
         )
     elif name == "rdma":
         parts.extend(
             [
-                "2 hosts x 4 GPUs, one MPI process per host. Nano `--transport rdma` with `NANO_NCCL_RDMA_USE_WRITE=1` (WRITE+CTS over registered host-pinned FIFO). Local edges stay P2P/SHM; cross-host edges are RDMA. RTR `path_mtu` is `min(local, remote) port.active_mtu`. NCCL: Ring+Simple, `NCCL_NET_GDR_LEVEL=0`, P2P/SHM allowed intra-node. NCCL 256 KiB OOP that collapsed (~0.8 GB/s) was re-run isolated up to four times; cells that stayed collapsed are not nano wins.",
+                ("2 hosts x 4 GPUs, one MPI process per GPU. " if matched_timing
+                 else "2 hosts x 4 GPUs, one MPI process per host. ") +
+                "Nano `--transport rdma` with `NANO_NCCL_RDMA_USE_WRITE=1` (WRITE+CTS over registered host-pinned FIFO). Local edges stay P2P/SHM; cross-host edges are RDMA. RTR `path_mtu` is `min(local, remote) port.active_mtu`. NCCL: Ring+Simple, `NCCL_NET_GDR_LEVEL=0`, P2P/SHM allowed intra-node.",
                 "",
             ]
         )
@@ -120,6 +126,14 @@ def render_section(name: str, body: dict) -> str:
 def render(doc: dict) -> str:
     env = doc.get("env", {})
     sections = doc.get("sections", {})
+    timing = env.get("benchmark_timing")
+    matched_timing = bool(timing) and all((
+        timing.get("nano_wait_mode") == "query",
+        timing.get("nccl_tests_blocking_coll") == 2,
+        timing.get("nccl_tests_average") == 3,
+        timing.get("nccl_tests_agg_iters") == 1,
+        env.get("rank_layout", "").startswith("one MPI process per GPU"),
+    ))
 
     out: list[str] = []
     out.append("# Performance")
@@ -131,6 +145,28 @@ def render(doc: dict) -> str:
         "unrounded measured time (`nccl_time_us / nano_time_us`)."
     )
     out.append("")
+    if matched_timing:
+        out.append(
+            "Benchmark timing contract: nano waits with `--wait-mode "
+            f"{timing.get('nano_wait_mode', 'unknown')}` after each collective; "
+            "nccl-tests uses `-z "
+            f"{timing.get('nccl_tests_blocking_coll', 'unknown')} -a "
+            f"{timing.get('nccl_tests_average', 'unknown')} -m "
+            f"{timing.get('nccl_tests_agg_iters', 'unknown')}`. Both use "
+            f"`-w {timing.get('warmup_iterations', 'unknown')} -n "
+            f"{timing.get('timed_iterations', 'unknown')}`. This means per-collective "
+            "completion and maximum-rank aggregation, with one collective per timing sample."
+        )
+    else:
+        out.append(
+            "**This matrix does not record the matched timing and rank-layout "
+            "contract.** Do not use its ratios for formal nano/NCCL performance "
+            "acceptance."
+        )
+    out.append("")
+    if matched_timing:
+        out.append(f"Rank-to-GPU mapping: {env.get('rank_device_map', 'not recorded')}.")
+        out.append("")
     out.append("## Test Topology And Environment")
     out.append("")
     out.append(
@@ -155,73 +191,92 @@ def render(doc: dict) -> str:
     out.append(
         "On each host, GPU0-GPU1 and GPU2-GPU3 are connected by four NVLinks. The two pairs are "
         "separated by `SYS` paths across NUMA nodes. Tables are separate transport classes: "
-        "in-process auto (P2P/SHM) on one host, two-host TCP socket, two-host host-pinned RDMA, "
-        "and two-host RDMA with GPUDirect (device FIFO)."
+        + ("four-process auto (P2P/SHM) on one host" if matched_timing
+           else "in-process auto (P2P/SHM) on one host")
+        + ", two-host TCP socket and host-pinned RDMA"
+        + (", and two-host RDMA with GPUDirect (device FIFO)." if "rdma_gdr" in sections else ".")
     )
     out.append("")
-    out.append(
+    measurement = (
         "All measurements use a Release build with `NANO_NCCL_ENABLE_BENCH_PROFILING=OFF`, "
         "message sizes 256 KiB through 64 MiB, `-w 5`, and `-n 20`. "
-        "NCCL uses `Ring`, `Simple`, four channels, and a 32 MiB buffer. "
-        "RDMA WRITE+CTS posts from the registered mapped FIFO (no host bounce; "
-        "publication via publisher `st.release.sys(send_tail)` after block sync and host acquire loads). "
-        "The GDR table reports the median of five full-matrix repetitions for each implementation."
     )
+    if matched_timing:
+        measurement += (
+            "Nano uses `--wait-mode query`; nccl-tests uses `-z 2 -a 3 -m 1` for "
+            "per-collective completion, maximum-rank aggregation, and one collective per timing sample. "
+        )
+    measurement += (
+        "NCCL uses `Ring`, `Simple`, four channels, and a 32 MiB buffer. "
+    )
+    if "rdma_gdr" in sections:
+        measurement += (
+            "RDMA WRITE+CTS posts from the registered mapped FIFO (no host bounce; "
+            "publication via publisher `st.release.sys(send_tail)` after block sync and host acquire loads). "
+            "The GDR table reports the median of five full-matrix repetitions for each implementation."
+        )
+    out.append(measurement)
     out.append("")
 
     for name in ("single", "socket", "rdma", "rdma_gdr"):
         if name in sections:
-            out.append(render_section(name, sections[name]))
+            out.append(render_section(name, sections[name], matched_timing))
             out.append("")
 
     out.append("## Reproduction")
     out.append("")
+    if not matched_timing:
+        out.append(
+            "The commands below use the corrected timing contract. They do not "
+            "reproduce the historical timing values in this metadata-free matrix."
+        )
+        out.append("")
     out.append(
         "Build nano-nccl with CUDA 12.8, SM86, Release mode, and profiling disabled. "
-        "The in-process auto binary uses four ranks in one process. "
-        "The two-host Socket and RDMA tables use one MPI process with four GPUs per host "
-        "and a global `NANO_NCCL_NRANKS=8`, from the same Open MPI 4.1.2 prefix."
+        "Run one MPI process per GPU for both implementations: four local ranks "
+        "for the single-host section or four ranks per host with a global "
+        "`NANO_NCCL_NRANKS=8` for the two-host sections. Build with MPI and use "
+        "the same Open MPI 4.1.2 prefix."
     )
     out.append("")
     out.append("```bash")
-    out.append("# nano-nccl, in-process auto (P2P/SHM)")
+    out.append("# nano-nccl, four local MPI ranks over auto (P2P/SHM)")
     out.append("CUDA_VISIBLE_DEVICES=0,1,2,3 \\")
-    out.append("  ./build-perf-single/benchmarks/nano_nccl_all_reduce_bench \\")
+    out.append("  mpirun --bind-to none -np 4 ./build-perf-single/benchmarks/nano_nccl_all_reduce_bench \\")
     out.append("  --algo ring_simple --transport auto --dtype <float|fp16|bf16> \\")
-    out.append("  --redop <sum|avg|max|min> -b 262144 -e 67108864 -f 4 -w 5 -n 20")
+    out.append("  --redop <sum|avg|max|min> -b 262144 -e 67108864 -f 4 -w 5 -n 20 --wait-mode query")
     out.append("")
-    out.append("# NCCL, in-process intra-node")
+    out.append("# NCCL, four local MPI ranks, one GPU per process")
     out.append("CUDA_VISIBLE_DEVICES=0,1,2,3 \\")
     out.append("LD_LIBRARY_PATH=<path-to-nccl-lib> \\")
     out.append("NCCL_ALGO=Ring NCCL_PROTO=Simple NCCL_MIN_NCHANNELS=4 \\")
     out.append("NCCL_MAX_NCHANNELS=4 NCCL_BUFFSIZE=33554432 \\")
-    out.append("  <path-to-nccl-tests>/build/all_reduce_perf \\")
-    out.append("  -b 262144 -e 67108864 -f 4 -g 4 -w 5 -n 20 \\")
+    out.append("  mpirun --bind-to none -np 4 <path-to-nccl-tests>/build/all_reduce_perf \\")
+    out.append("  -b 262144 -e 67108864 -f 4 -g 1 -w 5 -n 20 -z 2 -a 3 -m 1 \\")
     out.append("  -d <float|half|bfloat16> -o <sum|avg|max|min>")
     out.append("```")
     out.append("")
     out.append(
-        "For the socket runs, launch one MPI process with four visible GPUs per host. "
+        "For the socket runs, launch four MPI processes with four visible GPUs per host. "
         "Nano uses `--transport auto` "
-        "(cross-process edges are socket). NCCL sets `NCCL_P2P_DISABLE=1`, `NCCL_SHM_DISABLE=1`, "
-        "and `NCCL_IB_DISABLE=1`."
+        "(cross-host edges are socket). NCCL sets `NCCL_IB_DISABLE=1`; local P2P/SHM remain enabled."
     )
     out.append("")
     out.append(
         "For host-pinned RDMA, use nano `--transport rdma` with "
         "`NANO_NCCL_RDMA_USE_WRITE=1`. Set `NANO_NCCL_SOCKET_IFNAME=<interface>` for bootstrap "
         "and `NANO_NCCL_RDMA_IFNAME=<rdma-interface>` (and `NANO_NCCL_RDMA_GID_INDEX` when required). "
-        "NCCL sets `NCCL_P2P_DISABLE=1`, `NCCL_SHM_DISABLE=1`, `NCCL_NET_GDR_LEVEL=0`, "
+        "NCCL sets `NCCL_NET_GDR_LEVEL=0`, "
         "`NCCL_IB_HCA=<rdma-hca>`, and `NCCL_IB_GID_INDEX` when required."
     )
     out.append("")
     out.append(
-        "For the two-host GDR matrix, build both hosts for eight ranks and launch one MPI process "
+        "For the two-host GDR matrix, build both hosts for eight ranks and launch four MPI processes "
         "per host with four visible GPUs. Add `NANO_NCCL_RDMA_GDR=1` for nano and use "
         "`NCCL_NET_GDR_LEVEL=SYS` for NCCL. Run `nano_nccl_rdma_gdr` before the matrix; nano's "
-        "explicit GDR request fails instead of falling back, but its benchmark currently reports only "
-        "the aggregate `mixed` transport rather than the required per-edge placement. Verify "
-        "`/GDRDMA` in NCCL debug output."
+        "explicit GDR request fails instead of falling back. The benchmark prints the aggregate "
+        "transport and each directed edge's backend and RDMA FIFO placement (`gdr`, `host-pinned`, "
+        "or `n/a`). Verify `/GDRDMA` in NCCL debug output."
     )
     out.append("")
     out.append("```bash")

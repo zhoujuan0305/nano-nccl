@@ -1,5 +1,6 @@
 #include "nano_nccl/mpi.h"
 #include "nano_nccl/traits.h"
+#include "bench_wait.h"
 #if defined(NANO_NCCL_ENABLE_BENCH_PROFILING)
 #include "collective/all_reduce/bench_profiling.h"
 #endif
@@ -45,6 +46,7 @@ void usage(const char* program) {
                  "Usage: %s [--algo auto|ring_simple] "
                  "[--dtype float|fp16|bf16] [--redop sum|avg|max|min] "
                  "[--transport auto|shm|p2p|socket|rdma] "
+                 "[--wait-mode query|sync] "
                  "[--device local-cuda-index] "
                  "[-b bytes] [-e bytes] [-f factor] [-w warmup] [-n iters]\n",
                  program);
@@ -52,7 +54,8 @@ void usage(const char* program) {
 
 template <nano_nccl::DType kDType>
 int run_typed(const nano_nccl::BenchConfig& config,
-              std::vector<nano_nccl::BenchResult>* results, int rank) {
+              std::vector<nano_nccl::BenchResult>* results, int rank,
+              nano_nccl::benchmarks::WaitMode wait_mode) {
     using Traits = nano_nccl::DTypeTraits<kDType>;
     using T = typename Traits::type;
     const std::vector<std::size_t> sizes = nano_nccl::make_sizes(
@@ -71,6 +74,28 @@ int run_typed(const nano_nccl::BenchConfig& config,
         nano_nccl::create_communicator_from_mpi(MPI_COMM_WORLD,
                                                 communicator_config);
     const nano_nccl::TransportKind actual_transport = communicator->transport();
+    for (int edge = 0; edge < nano_nccl::kRanks; ++edge) {
+        const auto backend = communicator->edge_transport(edge);
+        const int local_gdr = communicator->edge_uses_gdr(edge) ? 1 : 0;
+        int min_gdr = 0;
+        int max_gdr = 0;
+        mpi_check(MPI_Allreduce(&local_gdr, &min_gdr, 1, MPI_INT, MPI_MIN,
+                                MPI_COMM_WORLD), "MPI_Allreduce(min GDR placement)");
+        mpi_check(MPI_Allreduce(&local_gdr, &max_gdr, 1, MPI_INT, MPI_MAX,
+                                MPI_COMM_WORLD), "MPI_Allreduce(max GDR placement)");
+        if (min_gdr != max_gdr) {
+            throw std::runtime_error(
+                "inconsistent GDR placement across MPI ranks for edge " +
+                std::to_string(edge));
+        }
+        if (rank == 0) {
+            const char* placement = backend == nano_nccl::TransportKind::Rdma
+                ? (max_gdr != 0 ? "gdr" : "host-pinned") : "n/a";
+            std::printf("# edge %d->%d transport=%s rdma_memory=%s\n",
+                        edge, (edge + 1) % nano_nccl::kRanks,
+                        nano_nccl::transport_name(backend), placement);
+        }
+    }
 
     const std::size_t max_count = sizes.back() / sizeof(T);
     T* send = nullptr;
@@ -111,13 +136,15 @@ int run_typed(const nano_nccl::BenchConfig& config,
         auto launch_and_wait = [&] {
             communicator->all_reduce({send, recv, stream, count, kDType,
                                       config.redop});
-            cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
-            communicator->check_async_error();
+            nano_nccl::benchmarks::wait_for_stream(
+                stream, wait_mode, [&] { communicator->check_async_error(); });
         };
-        for (int iteration = 0; iteration < config.warmup_iters; ++iteration) {
+        for (int iteration = 1; iteration < config.warmup_iters; ++iteration) {
             launch_and_wait();
         }
         mpi_check(MPI_Barrier(MPI_COMM_WORLD), "MPI_Barrier(benchmark start)");
+        // The final untimed collective absorbs rank skew after the barrier.
+        if (config.warmup_iters > 0) launch_and_wait();
 
 #if defined(NANO_NCCL_ENABLE_BENCH_PROFILING)
         bench_profiling::ProfilerSession profiler;
@@ -195,14 +222,15 @@ int run_typed(const nano_nccl::BenchConfig& config,
 }
 
 int run_benchmark(const nano_nccl::BenchConfig& config,
-                  std::vector<nano_nccl::BenchResult>* results, int rank) {
+                  std::vector<nano_nccl::BenchResult>* results, int rank,
+                  nano_nccl::benchmarks::WaitMode wait_mode) {
     switch (config.dtype) {
         case nano_nccl::DType::Float:
-            return run_typed<nano_nccl::DType::Float>(config, results, rank);
+            return run_typed<nano_nccl::DType::Float>(config, results, rank, wait_mode);
         case nano_nccl::DType::Float16:
-            return run_typed<nano_nccl::DType::Float16>(config, results, rank);
+            return run_typed<nano_nccl::DType::Float16>(config, results, rank, wait_mode);
         case nano_nccl::DType::BFloat16:
-            return run_typed<nano_nccl::DType::BFloat16>(config, results, rank);
+            return run_typed<nano_nccl::DType::BFloat16>(config, results, rank, wait_mode);
     }
     return 2;
 }
@@ -211,6 +239,7 @@ int run_benchmark(const nano_nccl::BenchConfig& config,
 
 int main(int argc, char** argv) {
     nano_nccl::BenchConfig config;
+    auto wait_mode = nano_nccl::benchmarks::WaitMode::Query;
     for (int index = 1; index < argc; ++index) {
         const char* argument = argv[index];
         auto next = [&]() -> const char* {
@@ -231,6 +260,10 @@ int main(int argc, char** argv) {
             } else if (std::strcmp(argument, "--transport") == 0) {
                 if (!nano_nccl::parse_transport(next(), &config.transport)) {
                     throw std::invalid_argument("invalid transport");
+                }
+            } else if (std::strcmp(argument, "--wait-mode") == 0) {
+                if (!nano_nccl::benchmarks::parse_wait_mode(next(), &wait_mode)) {
+                    throw std::invalid_argument("invalid wait mode");
                 }
             } else if (std::strcmp(argument, "--device") == 0) {
                 config.device = std::atoi(next());
@@ -277,9 +310,12 @@ int main(int argc, char** argv) {
             throw std::runtime_error("MPI process count must match kRanks");
         }
         std::vector<nano_nccl::BenchResult> results;
-        exit_code = run_benchmark(config, &results, rank);
+        exit_code = run_benchmark(config, &results, rank, wait_mode);
         if (rank == 0) {
             std::printf("# nano-nccl one-process-per-GPU all_reduce_bench\n");
+            std::printf("# timing=host_wall_per_iteration_complete wait_mode=%s rank_aggregation=max warmup=%d iters=%d\n",
+                        nano_nccl::benchmarks::wait_mode_name(wait_mode),
+                        config.warmup_iters, config.iters);
             std::printf("# %14s %8s %8s %10s %12s %12s %10s %10s %10s %8s %12s\n",
                         "algo", "dtype", "redop", "transport", "size(B)",
                         "count", "time(us)", "algbw", "busbw", "#wrong",

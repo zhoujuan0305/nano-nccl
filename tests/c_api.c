@@ -53,5 +53,16 @@ int main(void) {
         fprintf(stderr, "a null edge-transport handle was not rejected\n");
         return 1;
     }
+    int uses_gdr = 0;
+    if (nano_nccl_edge_uses_gdr(NULL, 0, &uses_gdr) !=
+        NANO_NCCL_STATUS_INVALID_ARGUMENT) {
+        fprintf(stderr, "a null edge-GDR handle was not rejected\n");
+        return 1;
+    }
+    if (nano_nccl_edge_uses_gdr(NULL, 0, NULL) !=
+        NANO_NCCL_STATUS_INVALID_ARGUMENT) {
+        fprintf(stderr, "a null edge-GDR output was not rejected\n");
+        return 1;
+    }
     return 0;
 }

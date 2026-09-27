@@ -34,7 +34,13 @@ inline std::uint32_t negotiate_path_mtu(std::uint32_t local,
 // 定长 POD，通过 TCP bootstrap fd 在环上邻居间交换一次。
 // QP 字段用于 RC 建链；recv/cts FIFO 字段供 WRITE+CTS 数据面使用。
 // SEND/RECV 模式可将 FIFO/CTS 字段保持为 0。
-// Layout: active_mtu fills the 4B hole after gid[16]; sizeof stays 64.
+// Both endpoints must agree on the data plane and FIFO memory placement.
+constexpr std::uint32_t kRdmaPeerFlagGpuDirect = 1u << 0;
+constexpr std::uint32_t kRdmaPeerFlagWriteCts = 1u << 1;
+constexpr std::uint32_t kRdmaPeerKnownFlags =
+    kRdmaPeerFlagGpuDirect | kRdmaPeerFlagWriteCts;
+
+// Layout: active_mtu fills the 4B hole after gid[16].
 struct RdmaPeerInfo {
     std::uint32_t qpn = 0;        // 本端 QPN
     std::uint32_t psn = 0;        // 本端起始 PSN
@@ -48,8 +54,9 @@ struct RdmaPeerInfo {
     std::uint64_t cts_fifo_addr = 0;
     std::uint32_t cts_fifo_rkey = 0;
     std::uint32_t cts_slot_count = 0;
+    std::uint32_t flags = 0;
 };
 
-static_assert(sizeof(RdmaPeerInfo) == 64);
+static_assert(sizeof(RdmaPeerInfo) == 72);
 
 }  // namespace nano_nccl::transport::rdma
