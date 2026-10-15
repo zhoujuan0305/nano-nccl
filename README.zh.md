@@ -33,7 +33,8 @@ MPI rank 对应一个进程，并选择、独占一张 GPU。这与 PyTorch/nano
   communicator
 
 CUDA IPC P2P 由实际 open/close probe 决定，因此即使没有 direct NVLink，只要 PCIe
-P2P 可用也会被接受。rank 8 在具备对应硬件执行覆盖前不能描述为已验证支持。
+P2P 可用也会被接受。rank 8 的跨机 GDR 已有记录中的有限输入执行证据，但不代表
+完整合同矩阵已经验收。
 
 [performance.md](performance.md) 中的历史性能章节早于 1 进程 1 GPU 与统一计时合同，除非明确
 标注重新验证。下述 2026-10-15 结果是限定范围的诊断对照，不代表完整性能验收。
@@ -44,17 +45,25 @@ P2P 可用也会被接受。rank 8 在具备对应硬件执行覆盖前不能描
 5.57/10.91/13.62/15.08/15.32 GB/s，且 `#wrong=0`。这些只是 nano-nccl 本机
 smoke 数据，不是同轮 NCCL 对比或性能验收结果。
 
-### 2026-10-15 双机四 rank GDR 对照
+### GDR 与 channel 性能更新
 
-与 NCCL 2.30.7 进行 `float`/`sum`/out-of-place Ring + Simple AllReduce 对照；两台主机各用
-physical GPU 0 和 1，共四个 rank。channels 1–4、七种尺寸、每格四对运行（共 224 个作业）均
-`wrong=0`；nano-nccl 在 28 格中的 27 格中位数更快，25 格的四对结果全部更快。28 格中位数
-`NCCL/nano` 比值的几何平均为 1.1024。本次使用 U8 与 channel 对齐的诊断快照；这不是 `main`
-默认配置；被测源码为本地 `cf473a4` 加冻结的未提交诊断修改，本次仅发布结果文档。
-GPU 和主机与其他任务共享，完整 scope 和相对已接受
-nano-nccl 基线的 3% 回归门槛仍未验收。详见
-[完整结果](performance.md#2026-10-15-two-host-four-rank-gdr)和
-[实验记录](docs/performance/20261015-rank4-gdr/README.md)。
+当前代码已包含 host-proxy GDR、共享 RDMA progress、AllReduce 的 16B channel
+边界对齐，以及 copy/reduce 的向量主体与标量尾部。float4 worker 默认按八组向量
+批量 load/store（`NANO_NCCL_FLOAT4_UNROLL=8`，可设为 `1` 做对照）；默认 block
+为 288 线程，即 256 worker 加 32 control。此前测试的 channel/向量实现已合入
+`main`，使用这些实现不再需要诊断宏。
+
+2026-10-15 与 NCCL 2.30.7 的同轮对照使用双机各 physical GPU0/1，共四个 MPI
+rank，测试 `float`/`sum`/out-of-place Ring + Simple AllReduce。channels 1–4、
+七种尺寸、每格四对，共 224 个作业，全部 `wrong=0`。nano 在 27/28 格中位耗时
+更低，25 格四对全部更快；28 格 `NCCL time / nano time` 中位耗时比的几何平均为
+1.1024。
+
+这组数据采集于合入前的开发实现，配置为 U8、16B channel 对齐、288 线程、
+WRITE+CTS 与共享 progress；对应机制现已纳入代码。GDR 和 WRITE+CTS 仍需按下文
+显式启用。双方都有慢样，共享 GPU/主机资源可能干扰；完整 scope 与相对已接受
+nano 基线的 3% 回归门槛仍未验收。完整 28 格、配置与合入验证见
+[performance.md](performance.md#2026-10-15-two-host-four-rank-gdr)。
 
 ## 同机进程间 transport
 
@@ -81,6 +90,7 @@ transport 和 benchmark 都需要 Open MPI 4.1.2 C ABI，因此正常运行构�
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
   -DNANO_NCCL_ENABLE_MPI=ON \
   -DNANO_NCCL_NRANKS=4 \
   -DNANO_NCCL_CUDA_ARCH=86
@@ -109,7 +119,8 @@ communicator 创建阶段会拒绝两个同机 MPI rank 选择同一张物理 CU
 | `NANO_NCCL_NRANKS` | 4 | communicator 的全局 rank/进程数 |
 | `NANO_NCCL_NCHANNELS` | 4 | channel 数 |
 | `NANO_NCCL_CUDA_ARCH` | 70 | CUDA compute capability；低于 70 的值会被拒绝 |
-| `NANO_NCCL_BLOCK_THREADS` | 512 | 每个 block 的线程数 |
+| `NANO_NCCL_BLOCK_THREADS` | 288 | 每 block 线程数，通常为 256 worker + 32 control |
+| `NANO_NCCL_FLOAT4_UNROLL` | 8 | float4 批量 load/store 的展开数，支持 1 或 8 |
 | `NANO_NCCL_FIFO_BUFF_BYTES` | 33554432 | 每 channel FIFO 字节数 |
 | `NANO_NCCL_ENABLE_MPI` | `OFF` | 构建 MPI bootstrap、进程间 transport 和 benchmark |
 | `NANO_NCCL_ENABLE_RDMA` | `OFF` | 构建 RC RDMA；要求 MPI 和 libibverbs |
@@ -117,6 +128,13 @@ communicator 创建阶段会拒绝两个同机 MPI rank 选择同一张物理 CU
 
 `float` 和 FP16 需要 SM70+，因为 Simple counter 使用 system-scope ordering；
 BF16 需要 SM80+。
+
+AllReduce 的 channel 内部边界固定按 16B 对齐，最后一个 channel 可以保留真实
+尾数。对齐 slice 先处理完整向量，再处理标量余数；地址不对齐时保留全标量回退。
+分别在独立 build 目录设置 `-DNANO_NCCL_NCHANNELS=1`、`2`、`3` 或 `4`，即可
+选择已验证的 channel 数。边界调整仅针对 AllReduce；ReduceScatter 和 AllGather
+保留原有分区。请使用新 build 目录；若复用旧 CMake cache，显式设置
+`NANO_NCCL_BLOCK_THREADS=288` 和 `NANO_NCCL_FLOAT4_UNROLL=8`。
 
 ## 运行
 
@@ -265,6 +283,18 @@ SEND/RECV；`NANO_NCCL_RDMA_USE_WRITE=1` 选择 WRITE+CTS，
 `NANO_NCCL_RDMA_GDR=1` 显式选择 GPU memory registration。GDR 能力不可用时会失败，
 不会回退。`rdma` 对同机 edge 仍按 P2P/SHM auto 规则解析，对跨机 edge 使用 RDMA，
 因此聚合结果通常是 `mixed`。
+
+RDMA 默认在每个 MPI 进程的每个 communicator 内用一个共享 host polling 线程，
+轮询其各 channel 的 sender/receiver；不再按方向/channel 分别创建轮询线程，
+也不是在多个 MPI 进程之间共用线程。`NANO_NCCL_RDMA_SHARED_PROGRESS=0` 可恢复
+独立 proxy 线程作对照。共享 engine 的异常进入 communicator 的稳定异步错误，
+并在对外发布错误之前写入 GPU abort flag。
+
+注册 GPU FIFO 时先设置 `CU_POINTER_ATTRIBUTE_SYNC_MEMOPS`，优先尝试 DMA-BUF，
+不可用时尝试设备地址 `ibv_reg_mr`（需要可用的 peer-memory provider，例如
+`nvidia-peermem`）。原有接收可见性 flush 和 selective CQE 保持不变。
+这是 CPU proxy 提交 verbs 的 host-proxy GDR；硬件与驱动仍需支持，不是 GPU
+直接发起 verbs 的 IBGDA。
 
 `Communicator::edge_uses_gdr(edge)`（以及 `nano_nccl_edge_uses_gdr`）可查询
 指定有向 RDMA edge 是否使用已注册的 GPU FIFO。benchmark 会在结果表前打印每条

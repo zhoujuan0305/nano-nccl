@@ -19,23 +19,60 @@ namespace ring = nano_nccl::collective::all_reduce;
 namespace {
 
 constexpr bool empty_channel_geometry_is_zero() {
-    std::size_t offset = 1;
-    std::size_t count = 1;
-    std::size_t chunk = 1;
-    ring::cbd_part<float>(1, 1, &offset, &count, &chunk);
-    return offset == 0 && count == 0 && chunk == 0;
+    for (int channel = 0; channel < nano_nccl::kChannels; ++channel) {
+        std::size_t offset = 1;
+        std::size_t count = 1;
+        std::size_t chunk = 1;
+        ring::cbd_part<float>(0, channel, &offset, &count, &chunk);
+        if (offset != 0 || count != 0 || chunk != 0) return false;
+    }
+    return true;
 }
 
 constexpr bool non_aligned_channel_geometry_is_bounded() {
-    std::size_t offset = 0;
-    std::size_t count = 0;
-    std::size_t chunk = 0;
-    ring::cbd_part<float>(1025, 3, &offset, &count, &chunk);
-    const std::size_t expected_chunk = simple::align_up(
-        simple::div_up(count, nano_nccl::kRanks),
-        ring::simple_grain_elems<float>());
-    return offset == 768 && count == 257 && chunk == expected_chunk &&
-           chunk <= count;
+    constexpr std::size_t total = 1025;
+    constexpr std::size_t grain = ring::simple_grain_elems<float>();
+    std::size_t covered = 0;
+    for (int channel = 0; channel < nano_nccl::kChannels; ++channel) {
+        std::size_t offset = 0;
+        std::size_t count = 0;
+        std::size_t chunk = 0;
+        ring::cbd_part<float>(total, channel, &offset, &count, &chunk);
+        if (offset != covered || count > total - covered) return false;
+        if (offset % (simple::kVectorBytes / sizeof(float)) != 0) return false;
+        if (channel + 1 != nano_nccl::kChannels &&
+            count % (simple::kVectorBytes / sizeof(float)) != 0) return false;
+        if (count == 0) {
+            if (chunk != 0) return false;
+        } else if (chunk % grain != 0 ||
+                   chunk < simple::div_up(count, nano_nccl::kRanks)) {
+            return false;
+        }
+        covered += count;
+    }
+    return covered == total;
+}
+
+template <typename T>
+constexpr bool channel_partition_covers_boundaries() {
+    constexpr std::size_t vector_elems = simple::kVectorBytes / sizeof(T);
+    for (std::size_t total = 0; total <= 129; ++total) {
+        std::size_t covered = 0;
+        for (int channel = 0; channel < nano_nccl::kChannels; ++channel) {
+            std::size_t offset = 0;
+            std::size_t count = 0;
+            std::size_t chunk = 0;
+            ring::cbd_part<T>(total, channel, &offset, &count, &chunk);
+            if (offset != covered || count > total - covered) return false;
+            if (offset % vector_elems != 0) return false;
+            if (channel + 1 != nano_nccl::kChannels &&
+                count % vector_elems != 0) return false;
+            if ((count == 0) != (chunk == 0)) return false;
+            covered += count;
+        }
+        if (covered != total) return false;
+    }
+    return true;
 }
 
 }  // namespace
@@ -107,6 +144,8 @@ static_assert(simple::slice_elems<float>(100, 1024) == 64);
 static_assert(simple::slice_elems<float>(1025, 1024) == 516);
 static_assert(empty_channel_geometry_is_zero());
 static_assert(non_aligned_channel_geometry_is_bounded());
+static_assert(channel_partition_covers_boundaries<float>());
+static_assert(channel_partition_covers_boundaries<std::uint16_t>());
 static_assert(ring::loop_chunk_elems<float>(64, 128) == 64);
 static_assert(ring::loop_chunk_elems<float>(256, 128) == 128);
 static_assert(ring::nelem(128, 100, 0) == 100);

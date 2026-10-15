@@ -1,11 +1,7 @@
 # Build
 build*/
 .worktrees/
-# Keep generated/local docs ignored; publish only this measured evidence snapshot.
-docs/*
-!docs/performance/
-docs/performance/*
-!docs/performance/20261015-rank4-gdr/
+docs/
 *.o
 *.a
 *.so

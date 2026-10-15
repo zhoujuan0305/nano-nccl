@@ -35,8 +35,9 @@ host as follows:
   each followed by successful communicator reconstruction
 
 CUDA IPC P2P is selected from a real open/close probe, so a working PCIe P2P
-edge is accepted even without direct NVLink. Rank 8 is not validated support
-until it has matching hardware execution coverage.
+edge is accepted even without direct NVLink. Rank-8 cross-host GDR evidence
+is limited to the recorded finite-input campaigns; it does not establish full
+contract acceptance.
 
 Historical sections in [performance.md](performance.md) predate the
 one-process-per-GPU and matched-timing contracts unless explicitly marked as
@@ -49,20 +50,31 @@ runs) produced median busbw of 7.60/19.39/26.62/32.62/34.36 GB/s for P2P and
 MiB, with zero wrong values. These are nano-nccl-only smoke numbers, not a
 same-round NCCL comparison or performance acceptance result.
 
-### 2026-10-15 two-host, four-rank GDR comparison
+### GDR and channel performance updates
 
-A matched `float`/`sum`/out-of-place Ring + Simple AllReduce comparison against
-NCCL 2.30.7 covered two hosts, physical GPUs 0 and 1 on each host, and four
-ranks. Across channels 1–4, seven sizes, and four paired runs per cell (224
-jobs), all jobs had `wrong=0`; nano-nccl's median was lower in 27/28 cells and
-all four pairs were faster in 25/28. The geometric mean of the 28 cell median
-`NCCL/nano` ratios was 1.1024. This used a U8, aligned-channel diagnostic
-snapshot based on local commit `cf473a4` plus frozen uncommitted diagnostic
-changes; these are not `main` default performance or full-scope acceptance
-results. This documentation update does not merge the diagnostic code. The GPUs
-and hosts were shared with other workloads, and the full scope and 3% baseline regression gate remain unaccepted. See
-[the full results](performance.md#2026-10-15-two-host-four-rank-gdr) and the
-[experiment record](docs/performance/20261015-rank4-gdr/README.md).
+The current code includes host-proxy GDR, shared RDMA progress, vector-aligned
+AllReduce channel partitions, and vector-body/scalar-tail copy and reduction.
+Float4 workers use an eight-vector load/store batch by default
+(`NANO_NCCL_FLOAT4_UNROLL=8`, with `1` available for comparison). The default
+block has 288 threads: 256 workers and 32 control threads. These changes bring
+the tested channel/vector implementation into `main`; no diagnostic build
+flags are needed.
+
+The 2026-10-15 matched `float`/`sum`/out-of-place Ring + Simple AllReduce
+comparison against NCCL 2.30.7 used two hosts, physical GPUs 0 and 1 on each,
+and four ranks. Channels 1–4, seven sizes, and four pairs per cell produced
+224 jobs, all with `wrong=0`. Nano had lower median time in 27/28 cells and
+won all four pairs in 25/28; the geometric mean of the 28 cell median
+`NCCL time / nano time` ratios was 1.1024.
+
+The measurements were collected from the development implementation before
+integration, with U8, 16-byte-aligned channel partitions, 288 threads,
+WRITE+CTS, and shared progress. These mechanisms are now part of the code.
+GDR and WRITE+CTS still require the runtime opt-ins below. Both implementations
+had slow samples, shared host/GPU resources remained in use, and the full
+scope and 3% baseline-regression gate remain open. See
+[performance.md](performance.md#2026-10-15-two-host-four-rank-gdr) for all
+28 cells, the exact configuration, and the integration validation results.
 
 ## Same-host interprocess transports
 
@@ -93,6 +105,7 @@ bootstrap, interprocess transports, and the benchmark require the Open MPI
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
   -DNANO_NCCL_ENABLE_MPI=ON \
   -DNANO_NCCL_NRANKS=4 \
   -DNANO_NCCL_CUDA_ARCH=86
@@ -122,7 +135,8 @@ Common CMake options:
 | `NANO_NCCL_NRANKS` | 4 | Global ranks/processes in one communicator |
 | `NANO_NCCL_NCHANNELS` | 4 | Channel count |
 | `NANO_NCCL_CUDA_ARCH` | 70 | CUDA compute capability; values below 70 are rejected |
-| `NANO_NCCL_BLOCK_THREADS` | 512 | Threads per block |
+| `NANO_NCCL_BLOCK_THREADS` | 288 | Threads per block; normally 256 workers + 32 control threads |
+| `NANO_NCCL_FLOAT4_UNROLL` | 8 | Float4 load/store batch size; accepts 1 or 8 |
 | `NANO_NCCL_FIFO_BUFF_BYTES` | 33554432 | FIFO bytes per channel |
 | `NANO_NCCL_ENABLE_MPI` | `OFF` | Build MPI bootstrap, interprocess transports, and benchmark |
 | `NANO_NCCL_ENABLE_RDMA` | `OFF` | Build RC RDMA; requires MPI and libibverbs |
@@ -130,6 +144,15 @@ Common CMake options:
 
 `float` and FP16 require SM70+ because Simple counters use system-scope
 ordering. BF16 requires SM80+.
+
+AllReduce channel boundaries are aligned to 16 bytes; only the final channel
+may retain a scalar remainder. Aligned slices process full vectors first and
+only the remainder scalarly; misaligned addresses keep the scalar fallback.
+Use `-DNANO_NCCL_NCHANNELS=1`, `2`, `3`, or `4` in separate build directories
+to select the validated channel counts. The boundary change is specific to
+AllReduce; ReduceScatter and AllGather keep their existing work partition.
+Use a fresh build directory, or set `NANO_NCCL_BLOCK_THREADS=288` and
+`NANO_NCCL_FLOAT4_UNROLL=8` explicitly when reusing an older CMake cache.
 
 ## Run
 
@@ -284,6 +307,20 @@ registered host-pinned FIFO with RC SEND/RECV.
 GDR setup fails rather than falling back. `rdma` still resolves same-host edges
 with the P2P/SHM auto rule and uses RDMA only for cross-host edges, so the
 aggregate result is commonly `mixed`.
+
+RDMA progress defaults to one communicator-owned host polling thread per
+MPI process, multiplexing that communicator's send and receive proxies across
+channels. It does not create one polling thread per direction/channel, and
+threads are not shared across MPI processes. Set
+`NANO_NCCL_RDMA_SHARED_PROGRESS=0` to compare with dedicated proxy threads.
+The shared engine reports failures through the communicator's stable async
+error and publishes the GPU abort flag before making that error visible.
+
+GPU memory registration first enables `CU_POINTER_ATTRIBUTE_SYNC_MEMOPS`, then
+tries DMA-BUF and, if unavailable, device-address `ibv_reg_mr` (requiring a
+working peer-memory provider, such as `nvidia-peermem`). Receive visibility
+flushes and selective CQEs are preserved. GDR is host-proxy RDMA, not
+GPU-initiated IBGDA, and hardware/driver support is still required.
 
 `Communicator::edge_uses_gdr(edge)` (and `nano_nccl_edge_uses_gdr`) reports
 whether a directed RDMA edge uses a registered GPU FIFO. The benchmark prints

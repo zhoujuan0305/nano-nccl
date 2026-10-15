@@ -147,10 +147,13 @@ RdmaDataPlane parse_rdma_data_plane_env() {
 
 bool parse_rdma_shared_progress_env() {
     const char* env = std::getenv("NANO_NCCL_RDMA_SHARED_PROGRESS");
-    // Default dedicated: A/B on this platform showed equal-or-better nano busbw
-    // vs shared; keep shared available via explicit 1/true/on.
-    if (env == nullptr || env[0] == '\0' || std::strcmp(env, "0") == 0 ||
-        std::strcmp(env, "false") == 0 || std::strcmp(env, "off") == 0) {
+    // Share one progress thread across this communicator's RDMA proxies by
+    // default; explicit 0 retains the dedicated mode for controlled A/B runs.
+    if (env == nullptr || env[0] == '\0') {
+        return true;
+    }
+    if (std::strcmp(env, "0") == 0 || std::strcmp(env, "false") == 0 ||
+        std::strcmp(env, "off") == 0) {
         return false;
     }
     if (std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0 ||
@@ -164,23 +167,30 @@ bool parse_rdma_shared_progress_env() {
 void RdmaAsyncErrorState::record_failure(RdmaProxyIdentity identity,
                                          std::uint64_t step,
                                          const std::string& reason) noexcept {
-    bool expected = false;
-    if (!has_error_.compare_exchange_strong(expected, true,
-                                            std::memory_order_acq_rel)) {
-        return;
-    }
-    {
+    try {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (has_error_.load(std::memory_order_relaxed)) {
+            return;
+        }
         message_ = format_failure(identity, step, reason);
-    }
-    if (device_abort_ != nullptr) {
-        __atomic_store_n(device_abort_, 1U, __ATOMIC_RELEASE);
+        if (device_abort_ != nullptr) {
+            __atomic_store_n(device_abort_, 1U, __ATOMIC_RELEASE);
+        }
+        has_error_.store(true, std::memory_order_release);
+    } catch (...) {
+        // Failure reporting itself must not terminate a proxy or progress thread.
+        if (device_abort_ != nullptr) {
+            __atomic_store_n(device_abort_, 1U, __ATOMIC_RELEASE);
+        }
+        has_error_.store(true, std::memory_order_release);
     }
 }
 
 std::string RdmaAsyncErrorState::message() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return message_;
+    return message_.empty()
+               ? "rdma asynchronous failure (details unavailable)"
+               : message_;
 }
 
 std::size_t RdmaSendProxy::max_inflight() const {

@@ -2,8 +2,8 @@
 
 ## 2026-10-15: Two-host four-rank GDR
 
-The latest campaign compares a **nano diagnostic snapshot** with **NCCL 2.30.7**
-on two hosts, using physical GPU0 and GPU1 on each host (four MPI ranks,
+The latest campaign compares the nano implementation now integrated into main
+with **NCCL 2.30.7** on two hosts, using physical GPU0 and GPU1 on each host (four MPI ranks,
 one process per GPU). It measures out-of-place `float`/`sum` AllReduce with
 Ring/Simple, local NVLink P2P, and bidirectional cross-host GDR over a 100 Gb/s
 link with MTU 1500. Existing authorized vLLM workers remained running.
@@ -24,12 +24,52 @@ link with MTU 1500. Existing authorized vLLM workers remained running.
   synchronization, shared progress, WRITE+CTS, and selective send CQEs.
   Profiling and hot-path investigation instrumentation were off during timing;
   NCCL CPU profiler metadata was collected separately before timing.
-- This snapshot is based on local commit `cf473a44b9bdc89a1dacb88ccfef612a3e4deba9`
-  plus frozen uncommitted diagnostic changes. **These numbers do not measure
-  main defaults, and this documentation update does not merge that code.**
-  The diagnostic tree still defaults to U1 with channel alignment off.
-  Source and binary fingerprints are recorded in the
-  [evidence snapshot](docs/performance/20261015-rank4-gdr/README.md).
+- The measurements were collected before integration from local commit
+  `cf473a44b9bdc89a1dacb88ccfef612a3e4deba9` plus frozen development changes
+  (kernel SHA256 `0c31cff07ee5fb71f765307777bd84d78de5812351d4e8dbbae762e2c0d17518`).
+  Main now includes those channel alignment, vector-body/scalar-tail, float4
+  batching, and shared-progress mechanisms, with regular build options and
+  the original Simple synchronization. Experimental NCCL-style synchronization,
+  forced SHM edges, all-data signaled CQEs, and hot-path diagnostics are not
+  enabled by this integration. The timings below remain the original measured
+  development-run data, not a newly timed main run.
+
+### Implementation and reproduction
+
+Main defaults to 288 block threads, U8 float4 batching, 16-byte-aligned
+AllReduce channel boundaries, and shared RDMA progress. The last channel can
+have a scalar tail; unaligned pointers keep the scalar path. The partition
+change applies to AllReduce, while vector worker changes are shared by the
+three collectives. `NANO_NCCL_FLOAT4_UNROLL=1` retains the unbatched comparison.
+GDR remains an explicit request and fails rather than silently falling back;
+WRITE+CTS also remains opt-in. Empty slices still skip unnecessary data WRs.
+
+Build a separate directory on both hosts for each channel count (1–4):
+
+```bash
+cmake -S . -B build-gdr-c<channels> -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
+  -DCMAKE_PREFIX_PATH=<openmpi-4.1.2-prefix> \
+  -DNANO_NCCL_ENABLE_MPI=ON -DNANO_NCCL_ENABLE_RDMA=ON \
+  -DNANO_NCCL_NRANKS=4 -DNANO_NCCL_NCHANNELS=<channels> \
+  -DNANO_NCCL_CUDA_ARCH=86 -DNANO_NCCL_BLOCK_THREADS=288 \
+  -DNANO_NCCL_FLOAT4_UNROLL=8 -DNANO_NCCL_ENABLE_BENCH_PROFILING=OFF
+cmake --build build-gdr-c<channels> -j<jobs>
+```
+
+For nano, export `NANO_NCCL_RDMA_GDR=1`, `NANO_NCCL_RDMA_USE_WRITE=1`, and
+`NANO_NCCL_RDMA_SHARED_PROGRESS=1`, together with the correct bootstrap/RDMA
+interface and GID. Launch two MPI ranks per host and expose physical GPU0/1,
+using a local-rank device selection. For each message size, run
+`nano_nccl_all_reduce_bench --algo ring_simple --transport rdma --dtype float
+--redop sum --wait-mode query -b <bytes> -e <bytes> -w 5 -n 20`.
+
+For NCCL 2.30.7, match Ring/Simple, channel count, `NCCL_NTHREADS=256`,
+`NCCL_BUFFSIZE=33554432`, `NCCL_NET_GDR_LEVEL=SYS`, and `NCCL_NET_GDR_READ=1`;
+use nccl-tests `-g 1 -z 2 -a 3 -m 1` with the same sizes/warmups/iterations
+and rank/device mapping. Verify actual per-edge local P2P and cross-host GDR
+in both implementations' logs. A working GDR registration provider and
+compatible end-to-end RoCE configuration are prerequisites.
 
 ### Latency matrix
 
@@ -59,7 +99,7 @@ caused the advantage. At 32 MiB the median-time advantage is about 2–3%.
   (2661.34 vs 2619.15 us). Source inspection confirms that nano executes a
   second outer loop with one valid float at this boundary, while NCCL remains
   in one outer loop. Its contribution to the timing gap remains `Unknown`;
-  see the [source analysis](docs/performance/20261015-rank4-gdr/SOURCE_NOTES.md).
+  this is an open performance gap, `GAP-RANK4-CHUNK-CAP-001`.
 - Both implementations have slow job samples. For 4 channels / 12 MiB,
   nano spans 1654.29–2311.95 us; its median is faster, but its arithmetic mean
   is 1823.95 vs NCCL's 1779.62 us. NCCL's 2-channel / 9 MiB samples span
@@ -78,13 +118,64 @@ caused the advantage. At 32 MiB the median-time advantage is about 2–3%.
   cubins include SM80 but not SM86, so byte-for-byte build reproducibility is
   not claimed.
 
-Published evidence: [all 224 measurements](docs/performance/20261015-rank4-gdr/measurements.csv),
-[112 pairs](docs/performance/20261015-rank4-gdr/paired-results.csv),
-[28-cell statistics](docs/performance/20261015-rank4-gdr/summary.csv),
-and [verification summary](docs/performance/20261015-rank4-gdr/verification.json).
-The [full report](docs/performance/20261015-rank4-gdr/README.md) includes all
-samples, configuration, fingerprints, and interpretation limits. Original logs
-remain in the local experiments record, not in this published snapshot.
+### Evidence and source references
+
+The full original measurements (224 rows), 112 pairs, 28-cell statistics,
+verification, build manifests, and logs remain in the independent experiments
+repository under `nano-nccl/two-host-rdma-gdr/runs/run-20261015-001/`.
+The NCCL source is v2.30.7-1 commit
+`73cf112295c33aee2b895f329f592f2a9b4b0f97`; the reference library SHA256 is
+`45d7b107276c3b865e06c25b24b5988850dda99a1db71af2eae7bc077b933c35` and
+nccl-tests commit is `a0b82b2260cf5152b9f8c061bbf7eaf0ba096432`.
+
+The boundary difference above follows from nano
+`src/collective/all_reduce/ring_simple_geometry.h::cbd_part`,
+`communicator.cu::ensure_fifo_buffers`, and
+`src/kernels/ring_simple_kernel.cuh`: 32 MiB / 8 FIFO steps gives a 4 MiB slot,
+so the four-rank, one-channel 16 MiB + 4 B input requires a second loop with
+one valid float. NCCL `src/include/collectives.h`,
+`src/enqueue.cc::calcCollChunking`, and
+`src/device/all_reduce.h::runRing` use a nominal 16 MiB/rank chunk limit,
+then shrink the actual final chunk for this input; the nominal outer stride
+is 64 MiB and this input stays within one loop. Neither nominal capacity
+nor loop count alone proves actual WR traffic or timing causality.
+
+### Integration validation
+
+The integrated implementation was freshly built and checked on both hosts
+with `/usr/local/cuda-12.8/bin/nvcc` (12.8.61), keeping the authorized vLLM
+workers running:
+
+- Eight Release MPI/RDMA builds passed: channels 1–4 on both hosts, using
+  default U8/288 threads and the vector-aligned AllReduce partition.
+- 63 CTest executions across host/channel configurations passed, including
+  vector tails, Simple publication, RDMA protocol/proxy progress, GDR
+  registration/flush checks, C API/static contracts, and the minimum SM70
+  default-build contract. These are executions, not 63 distinct test cases.
+  The profiling static check was updated to match the already implemented
+  barrier-followed-by-final-warmup timing contract.
+- A separate U1 build passed float/FP16/BF16 vector-worker tests, including
+  aligned bodies, scalar tails, misalignment, aliases, NaNs, and guard values.
+- Six dual-host, four-rank native GDR jobs passed: WRITE+CTS on channels 1–4,
+  plus SEND/RECV and dedicated-progress compatibility on channel 3. Each
+  checked all three collectives, float/FP16/BF16, two rounds, and 5,242,883
+  elements; reductions used `sum`. This is finite execution coverage, not
+  the full dtype/op/rank contract.
+- Twelve bounded AllReduce smoke jobs produced 32 size/channel results with
+  zero wrong values: 1/2/4/8/16/32 MiB and 1 MiB + 4 B / 16 MiB + 4 B on
+  each channel count. Both cross-host edges reported GPU FIFO placement,
+  and both local edges reported P2P. These used `-w 2 -n 3` for correctness;
+  their times do not replace the paired performance matrix above.
+- Both hosts matched the 98-file implementation/test manifest. All 236
+  selected-GPU health readings in 118 host snapshots reported recovery action
+  `None`; the original four authorized workers remained present. Discrete
+  checks do not replace an unrestricted kernel-log audit.
+
+Full build/test logs and verification are retained locally in the integration
+worktree's ignored `.local/integration-20261015/` directory. The matrix above
+remains the original 224-job measurement. Full-scope performance acceptance,
+the packed-type regression questions, and the accepted nano baseline gate
+remain open.
 
 ## Historical measurements: timing caveat
 
@@ -677,7 +768,7 @@ cmake -S . -B build-perf-rdma-n8 -DCMAKE_BUILD_TYPE=Release \
 cmake --build build-perf-rdma-n8 -j<jobs>
 ```
 
-The legacy renderer regenerates the historical matrix document from a completed matrix JSON. Its output replaces the whole file; render to a separate path and preserve the latest campaign section and evidence links above when updating this document:
+The legacy renderer replaces the whole document. Render historical matrices to a separate path and preserve the current implementation and measured campaign section above:
 
 ```bash
 scripts/run_performance_matrix.sh --nccl-bin <path> --nccl-lib <dir> --out-dir <out>

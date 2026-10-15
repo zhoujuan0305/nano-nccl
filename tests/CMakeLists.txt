@@ -7,6 +7,10 @@ target_link_libraries(nano_nccl_p2p_topology PRIVATE nano_nccl)
 add_executable(nano_nccl_simple_protocol simple_protocol.cu)
 target_link_libraries(nano_nccl_simple_protocol PRIVATE nano_nccl)
 
+# Exercise vector bodies, scalar tails, alignment, and worker/unroll boundaries.
+add_executable(nano_nccl_vector_tail_test vector_tail_test.cu)
+target_link_libraries(nano_nccl_vector_tail_test PRIVATE nano_nccl)
+
 add_executable(nano_nccl_c_api_contract c_api.c)
 target_compile_features(nano_nccl_c_api_contract PRIVATE c_std_11)
 set_target_properties(nano_nccl_c_api_contract PROPERTIES LINKER_LANGUAGE CXX)
@@ -31,6 +35,8 @@ if(BUILD_TESTING)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     add_test(NAME nano_nccl_simple_protocol COMMAND nano_nccl_simple_protocol)
     set_tests_properties(nano_nccl_simple_protocol PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME nano_nccl_vector_tail_test COMMAND nano_nccl_vector_tail_test)
+    set_tests_properties(nano_nccl_vector_tail_test PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME nano_nccl_c_api_contract COMMAND nano_nccl_c_api_contract)
     add_test(
         NAME nano_nccl_cuda_arch_contract

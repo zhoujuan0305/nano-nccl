@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -30,6 +31,39 @@ static_assert(sizeof(nano_nccl::transport::rdma::RdmaProxyFifo) ==
               sizeof(nano_nccl::transport::socket::SocketProxyFifo));
 
 int main() {
+    const char* progress_env = "NANO_NCCL_RDMA_SHARED_PROGRESS";
+    const auto expect_progress_mode = [&](const char* value, bool expected) {
+        const int status = value == nullptr
+            ? unsetenv(progress_env) : setenv(progress_env, value, 1);
+        if (status != 0 ||
+            nano_nccl::transport::rdma::parse_rdma_shared_progress_env() != expected) {
+            throw std::runtime_error("RDMA shared progress mode mismatch");
+        }
+    };
+    try {
+        expect_progress_mode(nullptr, true);
+        expect_progress_mode("", true);
+        expect_progress_mode("1", true);
+        expect_progress_mode("0", false);
+        expect_progress_mode("false", false);
+        if (setenv(progress_env, "invalid", 1) != 0) {
+            throw std::runtime_error("cannot set RDMA progress test environment");
+        }
+        bool rejected = false;
+        try {
+            (void)nano_nccl::transport::rdma::parse_rdma_shared_progress_env();
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        if (!rejected) {
+            throw std::runtime_error("invalid RDMA progress mode was accepted");
+        }
+        unsetenv(progress_env);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "rdma_protocol: progress mode: %s\n", error.what());
+        return 1;
+    }
+
     nano_nccl::transport::rdma::RdmaCtsSlot cts{};
     cts.raddr = 0x1111222233334444ULL;
     cts.rkey = 0xabcdu;
@@ -127,12 +161,17 @@ int main() {
     }
 
     {
-        nano_nccl::transport::rdma::RdmaAsyncErrorState state(nullptr);
+        std::uint32_t abort_flag = 0;
+        nano_nccl::transport::rdma::RdmaAsyncErrorState state(&abort_flag);
         if (state.has_error()) { std::fprintf(stderr, "rdma: empty state has_error\n"); return 1; }
         state.record_failure(
             nano_nccl::transport::rdma::RdmaProxyIdentity{1, 2, 3}, 42,
             "test-failure");
         if (!state.has_error()) { std::fprintf(stderr, "rdma: has_error not set\n"); return 1; }
+        if (__atomic_load_n(&abort_flag, __ATOMIC_ACQUIRE) != 1) {
+            std::fprintf(stderr, "rdma: abort not published before error\n");
+            return 1;
+        }
         const std::string msg = state.message();
         if (msg.find("source=1") == std::string::npos ||
             msg.find("destination=2") == std::string::npos ||

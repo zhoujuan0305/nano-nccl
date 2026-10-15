@@ -21,8 +21,16 @@ __host__ __device__ constexpr void cbd_part(std::size_t count, int channel,
                                             std::size_t* part_offset,
                                             std::size_t* part_count,
                                             std::size_t* chunk_count) {
-    const std::size_t begin = count * static_cast<std::size_t>(channel) / kChannels;
-    const std::size_t end = count * static_cast<std::size_t>(channel + 1) / kChannels;
+    std::size_t begin = count * static_cast<std::size_t>(channel) / kChannels;
+    std::size_t end = count * static_cast<std::size_t>(channel + 1) / kChannels;
+    // Align internal channel starts to the 16-byte Simple vector width while
+    // keeping contiguous coverage and leaving the final channel tail intact.
+    constexpr std::size_t vector_elems =
+        transport::simple::kVectorBytes / sizeof(T);
+    begin = begin / vector_elems * vector_elems;
+    if (channel + 1 != kChannels) {
+        end = end / vector_elems * vector_elems;
+    }
     *part_offset = begin;
     *part_count = end - begin;
     *chunk_count = *part_count == 0

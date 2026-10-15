@@ -3,6 +3,7 @@
 
 #include <immintrin.h>
 #include <stdexcept>
+#include <utility>
 
 namespace nano_nccl::transport::rdma {
 
@@ -39,13 +40,17 @@ void RdmaProgressEngine::add_recv(RdmaRecvProxy* proxy) {
     recvs_.push_back(proxy);
 }
 
-void RdmaProgressEngine::start() {
+void RdmaProgressEngine::start(std::shared_ptr<RdmaAsyncErrorState> errors) {
     if (thread_.joinable()) {
         throw std::runtime_error("rdma progress engine already started");
     }
     if (sends_.empty() && recvs_.empty()) {
         return;
     }
+    if (errors == nullptr) {
+        throw std::runtime_error("rdma progress engine missing error state");
+    }
+    errors_ = std::move(errors);
     stop_.store(false, std::memory_order_release);
     thread_ = std::thread(&RdmaProgressEngine::run, this);
 }
@@ -69,43 +74,54 @@ void RdmaProgressEngine::drain() const {
 }
 
 void RdmaProgressEngine::run() noexcept {
-    if (pin_numa_node_ >= 0) {
-        core::pin_current_thread_to_numa_node(pin_numa_node_);
-    }
-    while (!stop_.load(std::memory_order_acquire)) {
-        bool work = false;
-        bool any_error = false;
-        for (RdmaRecvProxy* proxy : recvs_) {
-            if (proxy == nullptr) {
-                continue;
+    try {
+        if (pin_numa_node_ >= 0) {
+            core::pin_current_thread_to_numa_node(pin_numa_node_);
+        }
+        while (!stop_.load(std::memory_order_acquire)) {
+            bool work = false;
+            bool any_error = false;
+            for (RdmaRecvProxy* proxy : recvs_) {
+                if (proxy == nullptr) {
+                    continue;
+                }
+                if (proxy->has_error()) {
+                    any_error = true;
+                    continue;
+                }
+                work = proxy->progress() || work;
+                if (proxy->has_error()) {
+                    any_error = true;
+                }
             }
-            if (proxy->has_error()) {
-                any_error = true;
-                continue;
+            for (RdmaSendProxy* proxy : sends_) {
+                if (proxy == nullptr) {
+                    continue;
+                }
+                if (proxy->has_error()) {
+                    any_error = true;
+                    continue;
+                }
+                work = proxy->progress() || work;
+                if (proxy->has_error()) {
+                    any_error = true;
+                }
             }
-            work = proxy->progress() || work;
-            if (proxy->has_error()) {
-                any_error = true;
+            if (any_error) {
+                break;
+            }
+            if (!work) {
+                _mm_pause();
             }
         }
-        for (RdmaSendProxy* proxy : sends_) {
-            if (proxy == nullptr) {
-                continue;
-            }
-            if (proxy->has_error()) {
-                any_error = true;
-                continue;
-            }
-            work = proxy->progress() || work;
-            if (proxy->has_error()) {
-                any_error = true;
-            }
+    } catch (const std::exception& error) {
+        if (errors_ != nullptr) {
+            errors_->record_failure({-1, -1, -1}, 0, error.what());
         }
-        if (any_error) {
-            break;
-        }
-        if (!work) {
-            _mm_pause();
+    } catch (...) {
+        if (errors_ != nullptr) {
+            errors_->record_failure({-1, -1, -1}, 0,
+                                    "unknown RDMA shared progress failure");
         }
     }
 }

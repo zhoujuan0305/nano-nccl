@@ -28,8 +28,8 @@ enum class RdmaDataPlane { SendRecv, WriteCts };
 // 1/true/on → WriteCts; otherwise throws.
 RdmaDataPlane parse_rdma_data_plane_env();
 
-// NANO_NCCL_RDMA_SHARED_PROGRESS unset/""/0/false/off → false (dedicated
-// per-proxy threads, default); 1/true/on → true (shared engine); otherwise throws.
+// NANO_NCCL_RDMA_SHARED_PROGRESS unset/""/1/true/on → true (shared engine,
+// default); 0/false/off → false (dedicated per-proxy threads); otherwise throws.
 bool parse_rdma_shared_progress_env();
 
 struct RdmaWriteTargets {
@@ -77,9 +77,8 @@ struct RdmaRecvControl {
     std::uint64_t* recv_tail = nullptr;
 };
 
-// 接口与 SocketAsyncErrorState 逐字对应：record_failure 用 compare_exchange
-// 单次置位，message 在互斥下格式化，device_abort_ 非空时以 release 序写入 1
-// 唤醒设备端轮询。
+// record_failure serializes first-error capture under mutex, publishes the
+// device abort flag, then marks the stable message available to readers.
 class RdmaAsyncErrorState {
 public:
     explicit RdmaAsyncErrorState(std::uint32_t* device_abort = nullptr)

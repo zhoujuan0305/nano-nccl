@@ -118,7 +118,40 @@ NCCL 2.30.7、Ring/Simple、双方每 GPU 一个 MPI 进程，w5/n20、query/max
 shared progress、WRITE+CTS、selective CQE、原同步。它不是main默认配置；
 本次只发布文档和脱敏测量副本，不合入诊断实现或改变默认值。
 完整矩阵、测量CSV、审核与指纹见
-`docs/performance/20261015-rank4-gdr/README.md`；原实验记录为独立experiments
+`performance.md`（本次实现合入后已直接整合于此）；原实验记录为独立experiments
 仓库 `nano-nccl/two-host-rdma-gdr/runs/run-20261015-001/`。
 参与卡背景利用率离散采样为0%，其它卡最高84%，共享主机资源仍会干扰；
 本轮不隔离各修改的因果收益，不裁定完整scope或3% nano baseline gate。
+
+
+## 2026-10-15：维护者要求合入实现并修正文档结构
+
+维护者澄清需要把已验证的实现合入main，而非仅发布诊断结果副本。main此前已有
+host-proxy GDR注册/flush/WRITE+CTS；本次补入后续channel/向量与共享progress改进。
+使用新的集成worktree，保留原研究worktree和未提交诊断，未采用NCCL同步实验、
+强制SHM edge和all-data signaled CQE。AllReduce内部channel边界始终按16B对齐，
+float/FP16/BF16 worker采用向量主体/标量尾部；普通构建宏
+`NANO_NCCL_FLOAT4_UNROLL`支持1/8，默认8；block默认288（256 worker+32 control）。
+共享RDMA progress默认启用，每MPI进程/communicator一个poller复用收发各channel，
+并修复异步错误消息/设备abort发布次序及NUMA绑定异常处理。GDR和WRITE+CTS仍显式启用。
+
+移除上一提交新增的`docs/performance`测量副本，README与performance直接描述实现、
+配置和本轮28格结果；完整实验数据仍在独立experiments记录中保留。
+两端使用`/usr/local/cuda-12.8/bin/nvcc`完成C1-4八个全新MPI/RDMA Release构建，
+默认U8/288；两端共62次选定CTest及额外最低SM70架构合同1次全部通过（63次执行，
+不是63个不同测试）。补跑U1构建的float/FP16/BF16向量worker测试通过。
+首轮发现旧profiling静态检查仍匹配旧warmup循环，已修为既有barrier前w-1、
+barrier后最后一次不计时预热的合同并复验；另一端首次CTest未启动因PATH缺CMake，
+修正测试环境PATH后通过。失败原始日志保留，没有将它们记作通过。
+profiling静态gate最终加强了预热loop主体检查，最终版本另在两端直接执行通过，
+并重新核对最终98文件manifest；CUDA实现和已测二进制未因此改变。
+
+集成版本双机4rank/GPU0-1 GDR native六个作业全通过：C1-4 WRITE+CTS，
+C3 SEND/RECV和C3独立轮询兼容；每作业3dtype、3collective、sum规约、两轮、
+5,242,883元素。12个w2/n3有界AllReduce smoke共32个尺寸/channel结果均wrong0，
+逐edge检查两条本机P2P及两条跨机GDR。不能把这些短测当成新NCCL性能对照。
+两端98个实现/测试文件SHA一致；118份主机前后快照共236次参与卡读取恢复状态None，
+原四个获准workers始终存在，未kill/reset或修改服务/网络。日志和核验留在集成
+worktree忽略目录`.local/integration-20261015/`。
+旧28格性能数据保持原值，清楚标为合入前开发实现测量；不谎称本轮重新测量main，
+不宣布完整scope、packed性能回退问题或正式3%baseline gate已通过。

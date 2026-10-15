@@ -9,7 +9,7 @@ namespace nano_nccl {
 
 // 全局 rank 数 / channel 数 / block 线程数为编译期常量，由 CMake 通过
 // NANO_NCCL_NRANKS / NANO_NCCL_NCHANNELS / NANO_NCCL_BLOCK_THREADS 注入；
-// 默认 4/4/512 对应 4 个单 GPU 进程。宏兜底保证脱离 CMake 也能编译。
+// 默认 4/4/288 对应 4 个单 GPU 进程。宏兜底保证脱离 CMake 也能编译。
 #ifndef NANO_NCCL_NRANKS
 #define NANO_NCCL_NRANKS 4
 #endif
@@ -19,12 +19,17 @@ constexpr int kRanks = NANO_NCCL_NRANKS;
 #define NANO_NCCL_NCHANNELS 4
 #endif
 constexpr int kChannels = NANO_NCCL_NCHANNELS;
+static_assert(kChannels > 0, "NANO_NCCL_NCHANNELS must be positive");
+
+#ifndef NANO_NCCL_FLOAT4_UNROLL
+#define NANO_NCCL_FLOAT4_UNROLL 8
+#endif
 
 #ifndef NANO_NCCL_BLOCK_THREADS
-#define NANO_NCCL_BLOCK_THREADS 512
+#define NANO_NCCL_BLOCK_THREADS 288
 #endif
 constexpr int kBlockThreads = NANO_NCCL_BLOCK_THREADS;
-static_assert(kBlockThreads % 32 == 0,
+static_assert(kBlockThreads > 0 && kBlockThreads % 32 == 0,
               "NANO_NCCL_BLOCK_THREADS must be a multiple of 32");
 
 // dtype 枚举与名称转换是公共接口；实际存储类型由 DTypeTraits 提供。

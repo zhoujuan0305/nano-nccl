@@ -312,6 +312,15 @@ int main(int argc, char** argv) {
         std::vector<nano_nccl::BenchResult> results;
         exit_code = run_benchmark(config, &results, rank, wait_mode);
         if (rank == 0) {
+            std::printf("# launch_geometry block_threads=%d worker_threads=%d channels=%d "
+                        "fifo_bytes_per_channel=%zu float4_unroll=%d channel_partition=vector_aligned\n",
+                        nano_nccl::kBlockThreads,
+                        nano_nccl::kBlockThreads >= 96
+                            ? nano_nccl::kBlockThreads - 32
+                            : nano_nccl::kBlockThreads,
+                        nano_nccl::kChannels,
+                        static_cast<std::size_t>(NANO_NCCL_FIFO_BUFF_BYTES),
+                        NANO_NCCL_FLOAT4_UNROLL);
             std::printf("# nano-nccl one-process-per-GPU all_reduce_bench\n");
             std::printf("# timing=host_wall_per_iteration_complete wait_mode=%s rank_aggregation=max warmup=%d iters=%d\n",
                         nano_nccl::benchmarks::wait_mode_name(wait_mode),

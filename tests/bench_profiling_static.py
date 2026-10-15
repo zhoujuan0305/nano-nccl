@@ -64,18 +64,27 @@ def main() -> int:
     ])
 
     mpi_bench = function_body(benchmark_source, "int run_typed")
+    require(
+        mpi_bench,
+        "for (int iteration = 1; iteration < config.warmup_iters; ++iteration) {\n"
+        "            launch_and_wait();\n"
+        "        }",
+        "pre-barrier warmup must run warmup_iters - 1 collectives",
+    )
     require_in_order(mpi_bench, [
-        "for (int iteration = 0; iteration < config.warmup_iters; ++iteration)",
-        "launch_and_wait();",
+        "for (int iteration = 1; iteration < config.warmup_iters; ++iteration)",
         'MPI_Barrier(MPI_COMM_WORLD), "MPI_Barrier(benchmark start)"',
+        "if (config.warmup_iters > 0) launch_and_wait();",
         "ProfilerSession profiler;",
         "NvtxRange size_range(",
         "all_reduce_size_range_name(bytes)",
+        "const auto start = std::chrono::steady_clock::now();",
         "for (int iteration = 0; iteration < config.iters; ++iteration)",
         "NvtxRange iteration_range(",
         "all_reduce_iteration_range_name(bytes,",
         "iteration));",
         "launch_and_wait();",
+        "const auto end = std::chrono::steady_clock::now();",
         "profiler.stop();",
         "cudaMemcpy(output.data(), recv, bytes,",
     ])

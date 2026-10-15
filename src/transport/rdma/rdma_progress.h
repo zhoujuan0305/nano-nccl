@@ -3,12 +3,13 @@
 #include "transport/rdma/rdma_proxy.h"
 
 #include <atomic>
+#include <memory>
 #include <thread>
 #include <vector>
 
 namespace nano_nccl::transport::rdma {
 
-// One host thread multiplexes progress() across all local RDMA proxies
+// One communicator-owned host thread multiplexes progress() across its RDMA proxies
 // (recv-first, then send), matching NCCL ncclProxyProgress readiness order.
 class RdmaProgressEngine {
 public:
@@ -20,7 +21,7 @@ public:
     void add_send(RdmaSendProxy* proxy);
     void add_recv(RdmaRecvProxy* proxy);
 
-    void start();
+    void start(std::shared_ptr<RdmaAsyncErrorState> errors);
     void shutdown() noexcept;
     void join() noexcept;
     void drain() const;
@@ -30,6 +31,7 @@ private:
 
     std::vector<RdmaSendProxy*> sends_;
     std::vector<RdmaRecvProxy*> recvs_;
+    std::shared_ptr<RdmaAsyncErrorState> errors_;
     std::thread thread_;
     std::atomic<bool> stop_{false};
     int pin_numa_node_ = -1;

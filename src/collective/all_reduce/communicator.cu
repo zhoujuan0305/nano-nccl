@@ -867,7 +867,7 @@ private:
             for (const auto& proxy : rdma_send_proxies_) {
                 rdma_progress_.add_send(proxy.get());
             }
-            rdma_progress_.start();
+            rdma_progress_.start(rdma_errors_);
         } else {
             for (const auto& proxy : rdma_recv_proxies_) proxy->start();
             exchange_ready_bytes(rdma_ready_connections);

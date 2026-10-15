@@ -51,6 +51,11 @@ struct RedOpTraits<RedOp::Avg, __nv_bfloat16> {
 
 namespace nano_nccl::kernels {
 
+static_assert(NANO_NCCL_FLOAT4_UNROLL == 1 ||
+              NANO_NCCL_FLOAT4_UNROLL == 8,
+              "float4 unroll must be 1 or 8");
+constexpr int kFloat4Unroll = NANO_NCCL_FLOAT4_UNROLL;
+
 __device__ __forceinline__ unsigned long long global_address(const void* ptr) {
     return static_cast<unsigned long long>(__cvta_generic_to_global(ptr));
 }
@@ -73,22 +78,23 @@ __device__ __forceinline__ uint4 load_volatile_uint4(const void* ptr) {
     return value;
 }
 
+// Address alignment selects the vector body; a short scalar tail is handled
+// separately so a non-multiple count does not scalarize the entire slice.
 __device__ inline bool aligned_vec4(const float* a, const float* b,
-                                    const float* c, std::size_t count) {
+                                    const float* c) {
     unsigned long long addr =
         reinterpret_cast<unsigned long long>(a) |
         reinterpret_cast<unsigned long long>(b) |
         reinterpret_cast<unsigned long long>(c);
-    return (count % 4 == 0) && ((addr & 0xfULL) == 0);
+    return (addr & 0xfULL) == 0;
 }
 
 template <typename T>
-__device__ inline bool aligned_packed16(const T* a, const T* b, const T* c,
-                                        std::size_t count) {
+__device__ inline bool aligned_packed16(const T* a, const T* b, const T* c) {
     unsigned long long address = reinterpret_cast<unsigned long long>(a) |
                                  reinterpret_cast<unsigned long long>(b) |
                                  reinterpret_cast<unsigned long long>(c);
-    return count % 8 == 0 && (address & 0xfULL) == 0;
+    return (address & 0xfULL) == 0;
 }
 
 template <typename T>
@@ -230,6 +236,9 @@ __device__ inline void copy_packed16_worker(const T* src, T* dst,
     for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
         dst4[i] = src4[i];
     }
+    for (std::size_t i = vec_count * 8 + threadIdx.x; i < count; i += nworkers) {
+        dst[i] = src[i];
+    }
 }
 
 template <typename T>
@@ -240,6 +249,10 @@ __device__ inline void copy_volatile_packed16_worker(
     uint4* dst4 = reinterpret_cast<uint4*>(dst);
     for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
         dst4[i] = load_volatile_uint4(src + 8 * i);
+    }
+    volatile const T* src_v = reinterpret_cast<volatile const T*>(src);
+    for (std::size_t i = vec_count * 8 + threadIdx.x; i < count; i += nworkers) {
+        dst[i] = src_v[i];
     }
 }
 
@@ -259,6 +272,14 @@ __device__ inline void reduce_volatile_packed16_worker(
         }
         dst4[i] = value;
     }
+    volatile const T* recv_v = reinterpret_cast<volatile const T*>(recv);
+    for (std::size_t i = vec_count * 8 + threadIdx.x; i < count; i += nworkers) {
+        T value = RedOpTraits<kRedOp, T>::apply(local[i], recv_v[i]);
+        if constexpr (kScaleAvg && kRedOp == RedOp::Avg) {
+            value = scale_avg(value, inverse_nranks);
+        }
+        dst[i] = value;
+    }
 }
 
 template <typename T>
@@ -272,6 +293,12 @@ __device__ inline void copy_broadcast_volatile_packed16_worker(
         uint4 value = load_volatile_uint4(src + 8 * i);
         dst04[i] = value;
         dst14[i] = value;
+    }
+    volatile const T* src_v = reinterpret_cast<volatile const T*>(src);
+    for (std::size_t i = vec_count * 8 + threadIdx.x; i < count; i += nworkers) {
+        T value = src_v[i];
+        dst0[i] = value;
+        dst1[i] = value;
     }
 }
 
@@ -293,21 +320,48 @@ __device__ inline void reduce_broadcast_volatile_packed16_worker(
         dst04[i] = value;
         dst14[i] = value;
     }
+    volatile const T* recv_v = reinterpret_cast<volatile const T*>(recv);
+    for (std::size_t i = vec_count * 8 + threadIdx.x; i < count; i += nworkers) {
+        T value = RedOpTraits<kRedOp, T>::apply(local[i], recv_v[i]);
+        if constexpr (kRedOp == RedOp::Avg) {
+            value = scale_avg(value, inverse_nranks);
+        }
+        dst0[i] = value;
+        dst1[i] = value;
+    }
 }
 
 __device__ inline void copy_float_worker(const float* src, float* dst,
                                           std::size_t count, int nworkers) {
     if (threadIdx.x >= nworkers) return;
-    if (aligned_vec4(src, dst, dst, count)) {
+    std::size_t scalar_begin = 0;
+    if (aligned_vec4(src, dst, dst)) {
         std::size_t vec_count = count / 4;
         const float4* src4 = reinterpret_cast<const float4*>(src);
         float4* dst4 = reinterpret_cast<float4*>(dst);
-        for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
-            dst4[i] = src4[i];
+        if constexpr (kFloat4Unroll == 1) {
+            for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
+                dst4[i] = src4[i];
+            }
+        } else {
+            for (std::size_t base = threadIdx.x; base < vec_count;
+                 base += static_cast<std::size_t>(nworkers) * kFloat4Unroll) {
+                float4 values[kFloat4Unroll];
+                #pragma unroll
+                for (int u = 0; u < kFloat4Unroll; ++u) {
+                    const std::size_t i = base + static_cast<std::size_t>(u) * nworkers;
+                    if (i < vec_count) values[u] = src4[i];
+                }
+                #pragma unroll
+                for (int u = 0; u < kFloat4Unroll; ++u) {
+                    const std::size_t i = base + static_cast<std::size_t>(u) * nworkers;
+                    if (i < vec_count) dst4[i] = values[u];
+                }
+            }
         }
-        return;
+        scalar_begin = vec_count * 4;
     }
-    for (std::size_t i = threadIdx.x; i < count; i += nworkers) {
+    for (std::size_t i = scalar_begin + threadIdx.x; i < count; i += nworkers) {
         dst[i] = src[i];
     }
 }
@@ -316,16 +370,34 @@ __device__ inline void copy_volatile_float_worker(const float* src, float* dst,
                                                    std::size_t count,
                                                    int nworkers) {
     if (threadIdx.x >= nworkers) return;
-    if (aligned_vec4(src, dst, dst, count)) {
+    std::size_t scalar_begin = 0;
+    if (aligned_vec4(src, dst, dst)) {
         std::size_t vec_count = count / 4;
         float4* dst4 = reinterpret_cast<float4*>(dst);
-        for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
-            dst4[i] = load_volatile_float4(src + 4 * i);
+        if constexpr (kFloat4Unroll == 1) {
+            for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
+                dst4[i] = load_volatile_float4(src + 4 * i);
+            }
+        } else {
+            for (std::size_t base = threadIdx.x; base < vec_count;
+                 base += static_cast<std::size_t>(nworkers) * kFloat4Unroll) {
+                float4 values[kFloat4Unroll];
+                #pragma unroll
+                for (int u = 0; u < kFloat4Unroll; ++u) {
+                    const std::size_t i = base + static_cast<std::size_t>(u) * nworkers;
+                    if (i < vec_count) values[u] = load_volatile_float4(src + 4 * i);
+                }
+                #pragma unroll
+                for (int u = 0; u < kFloat4Unroll; ++u) {
+                    const std::size_t i = base + static_cast<std::size_t>(u) * nworkers;
+                    if (i < vec_count) dst4[i] = values[u];
+                }
+            }
         }
-        return;
+        scalar_begin = vec_count * 4;
     }
     volatile const float* src_v = reinterpret_cast<volatile const float*>(src);
-    for (std::size_t i = threadIdx.x; i < count; i += nworkers) {
+    for (std::size_t i = scalar_begin + threadIdx.x; i < count; i += nworkers) {
         dst[i] = src_v[i];
     }
 }
@@ -344,7 +416,7 @@ __device__ inline void copy_worker(const T* src, T* dst, std::size_t count,
     if constexpr (std::is_same_v<T, float>) {
         copy_float_worker(src, dst, count, nworkers);
     } else if constexpr (kIsPacked16<T>) {
-        if (aligned_packed16(src, dst, dst, count)) {
+        if (aligned_packed16(src, dst, dst)) {
             copy_packed16_worker(src, dst, count, nworkers);
         } else {
             copy_scalar_worker(src, dst, count, nworkers);
@@ -360,7 +432,7 @@ __device__ inline void copy_volatile_worker(const T* src, T* dst,
     if constexpr (std::is_same_v<T, float>) {
         copy_volatile_float_worker(src, dst, count, nworkers);
     } else if constexpr (kIsPacked16<T>) {
-        if (aligned_packed16(src, dst, dst, count)) {
+        if (aligned_packed16(src, dst, dst)) {
             copy_volatile_packed16_worker(src, dst, count, nworkers);
         } else {
             copy_scalar_worker(src, dst, count, nworkers);
@@ -377,38 +449,75 @@ __device__ inline void reduce_volatile_worker(const T* local, const T* recv,
                                               int nworkers,
                                               float inverse_nranks = 1.0f) {
     if (threadIdx.x >= nworkers) return;
+    std::size_t scalar_begin = 0;
     if constexpr (std::is_same_v<T, float>) {
-        if (aligned_vec4(local, recv, dst, count)) {
+        if (aligned_vec4(local, recv, dst)) {
             std::size_t vec_count = count / 4;
             const float4* local4 = reinterpret_cast<const float4*>(local);
             float4* dst4 = reinterpret_cast<float4*>(dst);
-            for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
-                float4 a = local4[i];
-                float4 b = load_volatile_float4(recv + 4 * i);
-                float4 value = make_float4(
-                    RedOpTraits<kRedOp, T>::apply(a.x, b.x),
-                    RedOpTraits<kRedOp, T>::apply(a.y, b.y),
-                    RedOpTraits<kRedOp, T>::apply(a.z, b.z),
-                    RedOpTraits<kRedOp, T>::apply(a.w, b.w));
-                if constexpr (kScaleAvg && kRedOp == RedOp::Avg) {
-                    value.x = scale_avg(value.x, inverse_nranks);
-                    value.y = scale_avg(value.y, inverse_nranks);
-                    value.z = scale_avg(value.z, inverse_nranks);
-                    value.w = scale_avg(value.w, inverse_nranks);
+            if constexpr (kFloat4Unroll == 1) {
+                for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
+                    float4 a = local4[i];
+                    float4 b = load_volatile_float4(recv + 4 * i);
+                    float4 value = make_float4(
+                        RedOpTraits<kRedOp, T>::apply(a.x, b.x),
+                        RedOpTraits<kRedOp, T>::apply(a.y, b.y),
+                        RedOpTraits<kRedOp, T>::apply(a.z, b.z),
+                        RedOpTraits<kRedOp, T>::apply(a.w, b.w));
+                    if constexpr (kScaleAvg && kRedOp == RedOp::Avg) {
+                        value.x = scale_avg(value.x, inverse_nranks);
+                        value.y = scale_avg(value.y, inverse_nranks);
+                        value.z = scale_avg(value.z, inverse_nranks);
+                        value.w = scale_avg(value.w, inverse_nranks);
+                    }
+                    dst4[i] = value;
                 }
-                dst4[i] = value;
+            } else {
+                for (std::size_t base = threadIdx.x; base < vec_count;
+                     base += static_cast<std::size_t>(nworkers) * kFloat4Unroll) {
+                    float4 locals[kFloat4Unroll];
+                    float4 recvs[kFloat4Unroll];
+                    #pragma unroll
+                    for (int u = 0; u < kFloat4Unroll; ++u) {
+                        const std::size_t i = base + static_cast<std::size_t>(u) * nworkers;
+                        if (i < vec_count) {
+                            locals[u] = local4[i];
+                            recvs[u] = load_volatile_float4(recv + 4 * i);
+                        }
+                    }
+                    #pragma unroll
+                    for (int u = 0; u < kFloat4Unroll; ++u) {
+                        const std::size_t i = base + static_cast<std::size_t>(u) * nworkers;
+                        if (i < vec_count) {
+                            const float4 a = locals[u];
+                            const float4 b = recvs[u];
+                            float4 value = make_float4(
+                                RedOpTraits<kRedOp, T>::apply(a.x, b.x),
+                                RedOpTraits<kRedOp, T>::apply(a.y, b.y),
+                                RedOpTraits<kRedOp, T>::apply(a.z, b.z),
+                                RedOpTraits<kRedOp, T>::apply(a.w, b.w));
+                            if constexpr (kScaleAvg && kRedOp == RedOp::Avg) {
+                                value.x = scale_avg(value.x, inverse_nranks);
+                                value.y = scale_avg(value.y, inverse_nranks);
+                                value.z = scale_avg(value.z, inverse_nranks);
+                                value.w = scale_avg(value.w, inverse_nranks);
+                            }
+                            dst4[i] = value;
+                        }
+                    }
+                }
             }
-            return;
+            scalar_begin = vec_count * 4;
         }
     } else if constexpr (kIsPacked16<T>) {
-        if (aligned_packed16(local, recv, dst, count)) {
+        if (aligned_packed16(local, recv, dst)) {
             reduce_volatile_packed16_worker<T, kRedOp, kScaleAvg>(
                 local, recv, dst, count, nworkers, inverse_nranks);
             return;
         }
     }
     volatile const T* recv_v = reinterpret_cast<volatile const T*>(recv);
-    for (std::size_t i = threadIdx.x; i < count; i += nworkers) {
+    for (std::size_t i = scalar_begin + threadIdx.x; i < count; i += nworkers) {
         T value = RedOpTraits<kRedOp, T>::apply(local[i], recv_v[i]);
         if constexpr (kScaleAvg && kRedOp == RedOp::Avg) {
             value = scale_avg(value, inverse_nranks);
@@ -422,27 +531,48 @@ __device__ inline void copy_broadcast_volatile_worker(
     const T* src, T* dst0, T* dst1, std::size_t count,
     int nworkers) {
     if (threadIdx.x >= nworkers) return;
+    std::size_t scalar_begin = 0;
     if constexpr (std::is_same_v<T, float>) {
-        if (aligned_vec4(src, dst0, dst1, count)) {
+        if (aligned_vec4(src, dst0, dst1)) {
             std::size_t vec_count = count / 4;
             float4* dst04 = reinterpret_cast<float4*>(dst0);
             float4* dst14 = reinterpret_cast<float4*>(dst1);
-            for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
-                float4 v = load_volatile_float4(src + 4 * i);
-                dst04[i] = v;
-                dst14[i] = v;
+            if constexpr (kFloat4Unroll == 1) {
+                for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
+                    float4 v = load_volatile_float4(src + 4 * i);
+                    dst04[i] = v;
+                    dst14[i] = v;
+                }
+            } else {
+                for (std::size_t base = threadIdx.x; base < vec_count;
+                     base += static_cast<std::size_t>(nworkers) * kFloat4Unroll) {
+                    float4 values[kFloat4Unroll];
+                    #pragma unroll
+                    for (int u = 0; u < kFloat4Unroll; ++u) {
+                        const std::size_t i = base + static_cast<std::size_t>(u) * nworkers;
+                        if (i < vec_count) values[u] = load_volatile_float4(src + 4 * i);
+                    }
+                    #pragma unroll
+                    for (int u = 0; u < kFloat4Unroll; ++u) {
+                        const std::size_t i = base + static_cast<std::size_t>(u) * nworkers;
+                        if (i < vec_count) {
+                            dst04[i] = values[u];
+                            dst14[i] = values[u];
+                        }
+                    }
+                }
             }
-            return;
+            scalar_begin = vec_count * 4;
         }
     } else if constexpr (kIsPacked16<T>) {
-        if (aligned_packed16(src, dst0, dst1, count)) {
+        if (aligned_packed16(src, dst0, dst1)) {
             copy_broadcast_volatile_packed16_worker(src, dst0, dst1, count,
                                                      nworkers);
             return;
         }
     }
     volatile const T* src_v = reinterpret_cast<volatile const T*>(src);
-    for (std::size_t i = threadIdx.x; i < count; i += nworkers) {
+    for (std::size_t i = scalar_begin + threadIdx.x; i < count; i += nworkers) {
         T v = src_v[i];
         dst0[i] = v;
         dst1[i] = v;
@@ -454,42 +584,80 @@ __device__ inline void reduce_broadcast_volatile_worker(
     const T* local, const T* recv, T* dst0, T* dst1,
     std::size_t count, float inverse_nranks, int nworkers) {
     if (threadIdx.x >= nworkers) return;
+    std::size_t scalar_begin = 0;
     if constexpr (std::is_same_v<T, float>) {
-        if (aligned_vec4(local, recv, dst0, count) &&
-            aligned_vec4(local, recv, dst1, count)) {
+        if (aligned_vec4(local, recv, dst0) &&
+            aligned_vec4(local, recv, dst1)) {
             std::size_t vec_count = count / 4;
             const float4* local4 = reinterpret_cast<const float4*>(local);
             float4* dst04 = reinterpret_cast<float4*>(dst0);
             float4* dst14 = reinterpret_cast<float4*>(dst1);
-            for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
-                float4 a = local4[i];
-                float4 b = load_volatile_float4(recv + 4 * i);
-                float4 v = make_float4(
-                    RedOpTraits<kRedOp, T>::apply(a.x, b.x),
-                    RedOpTraits<kRedOp, T>::apply(a.y, b.y),
-                    RedOpTraits<kRedOp, T>::apply(a.z, b.z),
-                    RedOpTraits<kRedOp, T>::apply(a.w, b.w));
-                if constexpr (kRedOp == RedOp::Avg) {
-                    v.x = scale_avg(v.x, inverse_nranks);
-                    v.y = scale_avg(v.y, inverse_nranks);
-                    v.z = scale_avg(v.z, inverse_nranks);
-                    v.w = scale_avg(v.w, inverse_nranks);
+            if constexpr (kFloat4Unroll == 1) {
+                for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
+                    float4 a = local4[i];
+                    float4 b = load_volatile_float4(recv + 4 * i);
+                    float4 v = make_float4(
+                        RedOpTraits<kRedOp, T>::apply(a.x, b.x),
+                        RedOpTraits<kRedOp, T>::apply(a.y, b.y),
+                        RedOpTraits<kRedOp, T>::apply(a.z, b.z),
+                        RedOpTraits<kRedOp, T>::apply(a.w, b.w));
+                    if constexpr (kRedOp == RedOp::Avg) {
+                        v.x = scale_avg(v.x, inverse_nranks);
+                        v.y = scale_avg(v.y, inverse_nranks);
+                        v.z = scale_avg(v.z, inverse_nranks);
+                        v.w = scale_avg(v.w, inverse_nranks);
+                    }
+                    dst04[i] = v;
+                    dst14[i] = v;
                 }
-                dst04[i] = v;
-                dst14[i] = v;
+            } else {
+                for (std::size_t base = threadIdx.x; base < vec_count;
+                     base += static_cast<std::size_t>(nworkers) * kFloat4Unroll) {
+                    float4 locals[kFloat4Unroll];
+                    float4 recvs[kFloat4Unroll];
+                    #pragma unroll
+                    for (int u = 0; u < kFloat4Unroll; ++u) {
+                        const std::size_t i = base + static_cast<std::size_t>(u) * nworkers;
+                        if (i < vec_count) {
+                            locals[u] = local4[i];
+                            recvs[u] = load_volatile_float4(recv + 4 * i);
+                        }
+                    }
+                    #pragma unroll
+                    for (int u = 0; u < kFloat4Unroll; ++u) {
+                        const std::size_t i = base + static_cast<std::size_t>(u) * nworkers;
+                        if (i < vec_count) {
+                            const float4 a = locals[u];
+                            const float4 b = recvs[u];
+                            float4 v = make_float4(
+                                RedOpTraits<kRedOp, T>::apply(a.x, b.x),
+                                RedOpTraits<kRedOp, T>::apply(a.y, b.y),
+                                RedOpTraits<kRedOp, T>::apply(a.z, b.z),
+                                RedOpTraits<kRedOp, T>::apply(a.w, b.w));
+                            if constexpr (kRedOp == RedOp::Avg) {
+                                v.x = scale_avg(v.x, inverse_nranks);
+                                v.y = scale_avg(v.y, inverse_nranks);
+                                v.z = scale_avg(v.z, inverse_nranks);
+                                v.w = scale_avg(v.w, inverse_nranks);
+                            }
+                            dst04[i] = v;
+                            dst14[i] = v;
+                        }
+                    }
+                }
             }
-            return;
+            scalar_begin = vec_count * 4;
         }
     } else if constexpr (kIsPacked16<T>) {
-        if (aligned_packed16(local, recv, dst0, count) &&
-            aligned_packed16(local, recv, dst1, count)) {
+        if (aligned_packed16(local, recv, dst0) &&
+            aligned_packed16(local, recv, dst1)) {
             reduce_broadcast_volatile_packed16_worker<T, kRedOp>(
                 local, recv, dst0, dst1, count, inverse_nranks, nworkers);
             return;
         }
     }
     volatile const T* recv_v = reinterpret_cast<volatile const T*>(recv);
-    for (std::size_t i = threadIdx.x; i < count; i += nworkers) {
+    for (std::size_t i = scalar_begin + threadIdx.x; i < count; i += nworkers) {
         T v = RedOpTraits<kRedOp, T>::apply(local[i], recv_v[i]);
         if constexpr (kRedOp == RedOp::Avg) {
             v = scale_avg(v, inverse_nranks);
@@ -511,31 +679,68 @@ __device__ inline void reduce_local_into_dst(const T* local, T* dst,
                                              std::size_t count, int nworkers,
                                              float inverse_nranks = 1.0f) {
     if (threadIdx.x >= nworkers) return;
+    std::size_t scalar_begin = 0;
     if constexpr (std::is_same_v<T, float>) {
-        if (aligned_vec4(local, dst, dst, count)) {
+        if (aligned_vec4(local, dst, dst)) {
             std::size_t vec_count = count / 4;
             const float4* local4 = reinterpret_cast<const float4*>(local);
             float4* dst4 = reinterpret_cast<float4*>(dst);
-            for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
-                float4 a = local4[i];
-                float4 b = dst4[i];
-                float4 value = make_float4(
-                    RedOpTraits<kRedOp, T>::apply(a.x, b.x),
-                    RedOpTraits<kRedOp, T>::apply(a.y, b.y),
-                    RedOpTraits<kRedOp, T>::apply(a.z, b.z),
-                    RedOpTraits<kRedOp, T>::apply(a.w, b.w));
-                if constexpr (kScaleAvg && kRedOp == RedOp::Avg) {
-                    value.x = scale_avg(value.x, inverse_nranks);
-                    value.y = scale_avg(value.y, inverse_nranks);
-                    value.z = scale_avg(value.z, inverse_nranks);
-                    value.w = scale_avg(value.w, inverse_nranks);
+            if constexpr (kFloat4Unroll == 1) {
+                for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
+                    float4 a = local4[i];
+                    float4 b = dst4[i];
+                    float4 value = make_float4(
+                        RedOpTraits<kRedOp, T>::apply(a.x, b.x),
+                        RedOpTraits<kRedOp, T>::apply(a.y, b.y),
+                        RedOpTraits<kRedOp, T>::apply(a.z, b.z),
+                        RedOpTraits<kRedOp, T>::apply(a.w, b.w));
+                    if constexpr (kScaleAvg && kRedOp == RedOp::Avg) {
+                        value.x = scale_avg(value.x, inverse_nranks);
+                        value.y = scale_avg(value.y, inverse_nranks);
+                        value.z = scale_avg(value.z, inverse_nranks);
+                        value.w = scale_avg(value.w, inverse_nranks);
+                    }
+                    dst4[i] = value;
                 }
-                dst4[i] = value;
+            } else {
+                for (std::size_t base = threadIdx.x; base < vec_count;
+                     base += static_cast<std::size_t>(nworkers) * kFloat4Unroll) {
+                    float4 locals[kFloat4Unroll];
+                    float4 dsts[kFloat4Unroll];
+                    #pragma unroll
+                    for (int u = 0; u < kFloat4Unroll; ++u) {
+                        const std::size_t i = base + static_cast<std::size_t>(u) * nworkers;
+                        if (i < vec_count) {
+                            locals[u] = local4[i];
+                            dsts[u] = dst4[i];
+                        }
+                    }
+                    #pragma unroll
+                    for (int u = 0; u < kFloat4Unroll; ++u) {
+                        const std::size_t i = base + static_cast<std::size_t>(u) * nworkers;
+                        if (i < vec_count) {
+                            const float4 a = locals[u];
+                            const float4 b = dsts[u];
+                            float4 value = make_float4(
+                                RedOpTraits<kRedOp, T>::apply(a.x, b.x),
+                                RedOpTraits<kRedOp, T>::apply(a.y, b.y),
+                                RedOpTraits<kRedOp, T>::apply(a.z, b.z),
+                                RedOpTraits<kRedOp, T>::apply(a.w, b.w));
+                            if constexpr (kScaleAvg && kRedOp == RedOp::Avg) {
+                                value.x = scale_avg(value.x, inverse_nranks);
+                                value.y = scale_avg(value.y, inverse_nranks);
+                                value.z = scale_avg(value.z, inverse_nranks);
+                                value.w = scale_avg(value.w, inverse_nranks);
+                            }
+                            dst4[i] = value;
+                        }
+                    }
+                }
             }
-            return;
+            scalar_begin = vec_count * 4;
         }
     } else if constexpr (kIsPacked16<T>) {
-        if (aligned_packed16(local, dst, dst, count)) {
+        if (aligned_packed16(local, dst, dst)) {
             std::size_t vec_count = count / 8;
             const uint4* local4 = reinterpret_cast<const uint4*>(local);
             uint4* dst4 = reinterpret_cast<uint4*>(dst);
@@ -546,10 +751,10 @@ __device__ inline void reduce_local_into_dst(const T* local, T* dst,
                 }
                 dst4[i] = value;
             }
-            return;
+            scalar_begin = vec_count * 8;
         }
     }
-    for (std::size_t i = threadIdx.x; i < count; i += nworkers) {
+    for (std::size_t i = scalar_begin + threadIdx.x; i < count; i += nworkers) {
         T value = RedOpTraits<kRedOp, T>::apply(local[i], dst[i]);
         if constexpr (kScaleAvg && kRedOp == RedOp::Avg) {
             value = scale_avg(value, inverse_nranks);
@@ -564,33 +769,71 @@ __device__ inline void reduce_local_broadcast_worker(
     const T* local, T* dst0, T* dst1, std::size_t count, float inverse_nranks,
     int nworkers) {
     if (threadIdx.x >= nworkers) return;
+    std::size_t scalar_begin = 0;
     if constexpr (std::is_same_v<T, float>) {
-        if (aligned_vec4(local, dst0, dst1, count)) {
+        if (aligned_vec4(local, dst0, dst1)) {
             std::size_t vec_count = count / 4;
             const float4* local4 = reinterpret_cast<const float4*>(local);
             float4* dst04 = reinterpret_cast<float4*>(dst0);
             float4* dst14 = reinterpret_cast<float4*>(dst1);
-            for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
-                float4 a = local4[i];
-                float4 b = dst14[i];
-                float4 v = make_float4(
-                    RedOpTraits<kRedOp, T>::apply(a.x, b.x),
-                    RedOpTraits<kRedOp, T>::apply(a.y, b.y),
-                    RedOpTraits<kRedOp, T>::apply(a.z, b.z),
-                    RedOpTraits<kRedOp, T>::apply(a.w, b.w));
-                if constexpr (kRedOp == RedOp::Avg) {
-                    v.x = scale_avg(v.x, inverse_nranks);
-                    v.y = scale_avg(v.y, inverse_nranks);
-                    v.z = scale_avg(v.z, inverse_nranks);
-                    v.w = scale_avg(v.w, inverse_nranks);
+            if constexpr (kFloat4Unroll == 1) {
+                for (std::size_t i = threadIdx.x; i < vec_count; i += nworkers) {
+                    float4 a = local4[i];
+                    float4 b = dst14[i];
+                    float4 v = make_float4(
+                        RedOpTraits<kRedOp, T>::apply(a.x, b.x),
+                        RedOpTraits<kRedOp, T>::apply(a.y, b.y),
+                        RedOpTraits<kRedOp, T>::apply(a.z, b.z),
+                        RedOpTraits<kRedOp, T>::apply(a.w, b.w));
+                    if constexpr (kRedOp == RedOp::Avg) {
+                        v.x = scale_avg(v.x, inverse_nranks);
+                        v.y = scale_avg(v.y, inverse_nranks);
+                        v.z = scale_avg(v.z, inverse_nranks);
+                        v.w = scale_avg(v.w, inverse_nranks);
+                    }
+                    dst04[i] = v;
+                    dst14[i] = v;
                 }
-                dst04[i] = v;
-                dst14[i] = v;
+            } else {
+                for (std::size_t base = threadIdx.x; base < vec_count;
+                     base += static_cast<std::size_t>(nworkers) * kFloat4Unroll) {
+                    float4 locals[kFloat4Unroll];
+                    float4 dsts[kFloat4Unroll];
+                    #pragma unroll
+                    for (int u = 0; u < kFloat4Unroll; ++u) {
+                        const std::size_t i = base + static_cast<std::size_t>(u) * nworkers;
+                        if (i < vec_count) {
+                            locals[u] = local4[i];
+                            dsts[u] = dst14[i];
+                        }
+                    }
+                    #pragma unroll
+                    for (int u = 0; u < kFloat4Unroll; ++u) {
+                        const std::size_t i = base + static_cast<std::size_t>(u) * nworkers;
+                        if (i < vec_count) {
+                            const float4 a = locals[u];
+                            const float4 b = dsts[u];
+                            float4 v = make_float4(
+                                RedOpTraits<kRedOp, T>::apply(a.x, b.x),
+                                RedOpTraits<kRedOp, T>::apply(a.y, b.y),
+                                RedOpTraits<kRedOp, T>::apply(a.z, b.z),
+                                RedOpTraits<kRedOp, T>::apply(a.w, b.w));
+                            if constexpr (kRedOp == RedOp::Avg) {
+                                v.x = scale_avg(v.x, inverse_nranks);
+                                v.y = scale_avg(v.y, inverse_nranks);
+                                v.z = scale_avg(v.z, inverse_nranks);
+                                v.w = scale_avg(v.w, inverse_nranks);
+                            }
+                            dst04[i] = v;
+                            dst14[i] = v;
+                        }
+                    }
+                }
             }
-            return;
+            scalar_begin = vec_count * 4;
         }
     } else if constexpr (kIsPacked16<T>) {
-        if (aligned_packed16(local, dst0, dst1, count)) {
+        if (aligned_packed16(local, dst0, dst1)) {
             std::size_t vec_count = count / 8;
             const uint4* local4 = reinterpret_cast<const uint4*>(local);
             uint4* dst04 = reinterpret_cast<uint4*>(dst0);
@@ -604,10 +847,10 @@ __device__ inline void reduce_local_broadcast_worker(
                 dst04[i] = value;
                 dst14[i] = value;
             }
-            return;
+            scalar_begin = vec_count * 8;
         }
     }
-    for (std::size_t i = threadIdx.x; i < count; i += nworkers) {
+    for (std::size_t i = scalar_begin + threadIdx.x; i < count; i += nworkers) {
         T v = RedOpTraits<kRedOp, T>::apply(local[i], dst1[i]);
         if constexpr (kRedOp == RedOp::Avg) {
             v = scale_avg(v, inverse_nranks);

@@ -15,6 +15,7 @@
 #include "core/numa.h"
 #include "transport/rdma/rdma_endpoint.h"
 #include "transport/rdma/rdma_protocol.h"
+#include "transport/rdma/rdma_progress.h"
 #include "transport/rdma/rdma_proxy.h"
 #include "transport/rdma/rdma_qp.h"
 #include "transport/socket/socket_endpoint.h"
@@ -25,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <stdexcept>
@@ -47,6 +49,7 @@ using nano_nccl::transport::rdma::RdmaEndpoint;
 using nano_nccl::transport::rdma::RdmaPeerInfo;
 using nano_nccl::transport::rdma::RdmaProxyFifo;
 using nano_nccl::transport::rdma::RdmaProxyIdentity;
+using nano_nccl::transport::rdma::RdmaProgressEngine;
 using nano_nccl::transport::rdma::RdmaQp;
 using nano_nccl::transport::rdma::RdmaRecvControl;
 using nano_nccl::transport::rdma::RdmaRecvProxy;
@@ -107,6 +110,15 @@ bool wait_for(const std::function<bool()>& predicate) {
     return true;
 }
 
+std::size_t process_thread_count() {
+    std::size_t count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator("/proc/self/task")) {
+        (void)entry;
+        ++count;
+    }
+    return count;
+}
+
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
@@ -160,7 +172,8 @@ void fill_slot_payload(std::vector<std::uint8_t>& fifo, std::size_t slot,
     }
 }
 
-void run_four_nonzero_slices() {
+void run_four_nonzero_slices(bool shared_progress,
+                             bool invalid_affinity = false) {
     ConnectedQps qps = make_connected_qps();
     std::vector<std::uint8_t> send_fifo(kFifoBytes, 0);
     std::vector<std::uint8_t> recv_fifo(kFifoBytes, 0);
@@ -199,7 +212,7 @@ void run_four_nonzero_slices() {
     RdmaProxyFifo recv_fifo_desc{recv_fifo.data(), kSlotBytes, kSlotCount,
                                  recv_sizes, kStepIncrement};
     RdmaProxyIdentity identity{0, 1, 0};
-    const int numa_node = current_numa_node();
+    const int numa_node = invalid_affinity ? 9999 : current_numa_node();
 
     RdmaRecvProxy receiver(std::move(qps.qp_recv), recv_mr.get(), recv_fifo_desc,
                            RdmaRecvControl{&recv_head, &recv_tail}, identity,
@@ -207,14 +220,40 @@ void run_four_nonzero_slices() {
     RdmaSendProxy sender(std::move(qps.qp_send), send_mr.get(), send_fifo_desc,
                          RdmaSendControl{&send_head, &send_tail}, identity,
                          numa_node, errors);
+    RdmaProgressEngine progress;
+    const std::size_t threads_before = process_thread_count();
 
     __atomic_store_n(&recv_head, static_cast<std::uint64_t>(kSlotCount),
                      __ATOMIC_RELEASE);
     __atomic_store_n(&send_tail, static_cast<std::uint64_t>(kSlotCount),
                      __ATOMIC_RELEASE);
 
-    receiver.start();
-    sender.start();
+    if (shared_progress) {
+        receiver.prepare();
+        sender.prepare();
+        progress.add_recv(&receiver);
+        progress.add_send(&sender);
+        progress.start(errors);
+    } else {
+        receiver.start();
+        sender.start();
+    }
+    if (invalid_affinity) {
+        require(shared_progress, "invalid affinity case requires shared progress");
+        require(wait_for([&] { return errors->has_error(); }),
+                "shared progress affinity failure was not reported");
+        require(__atomic_load_n(&abort_flag, __ATOMIC_ACQUIRE) == 1,
+                "shared progress affinity failure did not publish abort");
+        sender.shutdown();
+        receiver.shutdown();
+        progress.shutdown();
+        progress.join();
+        return;
+    }
+    const std::size_t expected_pollers = shared_progress ? 1 : 2;
+    require(wait_for([&] {
+                return process_thread_count() == threads_before + expected_pollers;
+            }), "RDMA proxy progress thread count mismatch");
 
     require(wait_for([&] {
                 return __atomic_load_n(&send_head, __ATOMIC_ACQUIRE) ==
@@ -236,10 +275,18 @@ void run_four_nonzero_slices() {
                 "receiver FIFO does not match sent payload");
     }
 
-    sender.shutdown();
-    receiver.shutdown();
-    sender.join();
-    receiver.join();
+    if (shared_progress) {
+        sender.shutdown();
+        receiver.shutdown();
+        progress.shutdown();
+        progress.join();
+        require(!errors->has_error(), "shared progress shutdown recorded an error");
+    } else {
+        sender.shutdown();
+        receiver.shutdown();
+        sender.join();
+        receiver.join();
+    }
 }
 
 void run_zero_byte_elision() {
@@ -332,7 +379,7 @@ void run_zero_byte_elision() {
     receiver.join();
 }
 
-void run_write_cts_four_slices() {
+void run_write_cts_four_slices(bool shared_progress) {
     ConnectedQps qps = make_connected_qps();
     std::vector<std::uint8_t> send_fifo(kFifoBytes, 0);
     std::vector<std::uint8_t> recv_fifo(kFifoBytes, 0);
@@ -416,14 +463,23 @@ void run_write_cts_four_slices() {
                          RdmaSendControl{&send_head, &send_tail}, identity,
                          numa_node, errors, RdmaDataPlane::WriteCts,
                          write_targets);
+    RdmaProgressEngine progress;
 
     // Production credit: head starts at 0; free while head + slot_count covers
     // the next step (same as SEND/socket).
     __atomic_store_n(&send_tail, static_cast<std::uint64_t>(kSlotCount),
                      __ATOMIC_RELEASE);
 
-    receiver.start();
-    sender.start();
+    if (shared_progress) {
+        receiver.prepare();
+        sender.prepare();
+        progress.add_recv(&receiver);
+        progress.add_send(&sender);
+        progress.start(errors);
+    } else {
+        receiver.start();
+        sender.start();
+    }
 
     require(wait_for([&] {
                 return __atomic_load_n(&send_head, __ATOMIC_ACQUIRE) ==
@@ -447,8 +503,13 @@ void run_write_cts_four_slices() {
 
     sender.shutdown();
     receiver.shutdown();
-    sender.join();
-    receiver.join();
+    if (shared_progress) {
+        progress.shutdown();
+        progress.join();
+    } else {
+        sender.join();
+        receiver.join();
+    }
 }
 
 void run_write_cts_credit_backpressure() {
@@ -745,9 +806,14 @@ int main() {
     }
 
     try {
-        run_four_nonzero_slices();
+        run_four_nonzero_slices(false);
+        run_four_nonzero_slices(true);
+        if (numa_available() >= 0) {
+            run_four_nonzero_slices(true, true);
+        }
         run_zero_byte_elision();
-        run_write_cts_four_slices();
+        run_write_cts_four_slices(false);
+        run_write_cts_four_slices(true);
         run_write_cts_credit_backpressure();
         run_write_cts_ring_wrap();
         std::printf("rdma_proxy=PASS\n");
