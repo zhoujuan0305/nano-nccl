@@ -35,14 +35,26 @@ MPI rank 对应一个进程，并选择、独占一张 GPU。这与 PyTorch/nano
 CUDA IPC P2P 由实际 open/close probe 决定，因此即使没有 direct NVLink，只要 PCIe
 P2P 可用也会被接受。rank 8 在具备对应硬件执行覆盖前不能描述为已验证支持。
 
-历史 [performance.md](performance.md) 中的表格早于 1 进程 1 GPU 与统一计时合同；除非明确
-标注重新验证，否则不能作为当前架构的性能验收数据。
+[performance.md](performance.md) 中的历史性能章节早于 1 进程 1 GPU 与统一计时合同，除非明确
+标注重新验证。下述 2026-10-15 结果是限定范围的诊断对照，不代表完整性能验收。
 
 修改后的 rank 2 重复性 smoke（`float`/`sum`、`-w 5 -n 20`、连续 3 轮）在
 256 KiB/1 MiB/4 MiB/16 MiB/64 MiB 上得到的 busbw 中位数分别为：P2P
 7.60/19.39/26.62/32.62/34.36 GB/s，SHM
 5.57/10.91/13.62/15.08/15.32 GB/s，且 `#wrong=0`。这些只是 nano-nccl 本机
 smoke 数据，不是同轮 NCCL 对比或性能验收结果。
+
+### 2026-10-15 双机四 rank GDR 对照
+
+与 NCCL 2.30.7 进行 `float`/`sum`/out-of-place Ring + Simple AllReduce 对照；两台主机各用
+physical GPU 0 和 1，共四个 rank。channels 1–4、七种尺寸、每格四对运行（共 224 个作业）均
+`wrong=0`；nano-nccl 在 28 格中的 27 格中位数更快，25 格的四对结果全部更快。28 格中位数
+`NCCL/nano` 比值的几何平均为 1.1024。本次使用 U8 与 channel 对齐的诊断快照；这不是 `main`
+默认配置；被测源码为本地 `cf473a4` 加冻结的未提交诊断修改，本次仅发布结果文档。
+GPU 和主机与其他任务共享，完整 scope 和相对已接受
+nano-nccl 基线的 3% 回归门槛仍未验收。详见
+[完整结果](performance.md#2026-10-15-two-host-four-rank-gdr)和
+[实验记录](docs/performance/20261015-rank4-gdr/README.md)。
 
 ## 同机进程间 transport
 
@@ -301,7 +313,8 @@ transport runtime lifecycle 与 orchestration 仍由 `Communicator::Impl` 管理
 - 仅 Ring + Simple；无 Tree、CollNet、NVLS、LL、LL128。
 - 仅 out-of-place；无 in-place、任意 overlap、broadcast、`double`、`int8`、`prod`。
 - `nranks` 仍由一次构建固定，尚未切换到生成的 2/4/8 specialization registry。
-- Socket/RDMA 的 1 进程 1 GPU 全矩阵和 NCCL-relative 性能需要重新验收。
+- 完整 scope 的 Socket/RDMA 性能，以及相对已接受 nano-nccl 基线的 3% 回归检查仍待验收；
+  上述限定范围的 GDR 对照不代表这两项门槛已完成。
 - CUDA IPC teardown 使用有界的 peer-close acknowledgement；如果 peer 未在超时内关闭
   imported handle，exporter 会有意泄漏该 device region，而不是释放仍被 peer 映射的
   内存。异常进程失败恢复仍受 MPI runtime 约束。

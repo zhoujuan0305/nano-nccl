@@ -1,10 +1,107 @@
 # Performance
 
-All results below are out-of-place all-reduce measurements. Bandwidth is `busbw` in GB/s. Every measured nano-nccl and NCCL result completed validation with zero wrong values. The `nano/NCCL` column is calculated from the unrounded measured time (`nccl_time_us / nano_time_us`).
+## 2026-10-15: Two-host four-rank GDR
 
-**Historical timing caveat:** this matrix predates the matched benchmark contract. Nano synchronized after every collective and reported the slowest MPI rank; nccl-tests used its default asynchronous batch and averaged MPI processes. Nano used one MPI process per GPU while NCCL used multiple GPUs per MPI process. These ratios cannot be used for formal NCCL-relative acceptance. The reproduction commands below use the corrected protocol and will not reproduce these historical timing values.
+The latest campaign compares a **nano diagnostic snapshot** with **NCCL 2.30.7**
+on two hosts, using physical GPU0 and GPU1 on each host (four MPI ranks,
+one process per GPU). It measures out-of-place `float`/`sum` AllReduce with
+Ring/Simple, local NVLink P2P, and bidirectional cross-host GDR over a 100 Gb/s
+link with MTU 1500. Existing authorized vLLM workers remained running.
 
-## Test Topology And Environment
+### Method and configuration
+
+- Channels: 1, 2, 3, and 4; seven message sizes, including two scalar tails.
+  Each cell contains four pairs in AB/BA/AB/BA order, for 224 formal jobs.
+  All jobs completed with exit status 0 and zero wrong values; slow samples
+  were retained.
+- Both implementations: CUDA 12.8.61, SM86 hardware, Open MPI 4.1.2,
+  32 MiB FIFO/buffer per channel, `-w 5 -n 20`.
+  Nano uses `--wait-mode query` and maximum-rank aggregation; nccl-tests uses
+  `-g 1 -z 2 -a 3 -m 1`. NCCL was explicitly Ring/Simple with matching channel
+  counts and `NCCL_NTHREADS=256`; metadata confirmed nine warps.
+- Nano: U8 vector-loop unrolling, 16-byte-aligned channel partitions,
+  vector body/scalar tail, 288 logical threads/256 workers, original Simple
+  synchronization, shared progress, WRITE+CTS, and selective send CQEs.
+  Profiling and hot-path investigation instrumentation were off during timing;
+  NCCL CPU profiler metadata was collected separately before timing.
+- This snapshot is based on local commit `cf473a44b9bdc89a1dacb88ccfef612a3e4deba9`
+  plus frozen uncommitted diagnostic changes. **These numbers do not measure
+  main defaults, and this documentation update does not merge that code.**
+  The diagnostic tree still defaults to U1 with channel alignment off.
+  Source and binary fingerprints are recorded in the
+  [evidence snapshot](docs/performance/20261015-rank4-gdr/README.md).
+
+### Latency matrix
+
+Each entry is **nano / NCCL time in microseconds**. Each arm's value is the
+median of four independent job averages, with 20 measured collectives per job;
+it is not a median of individual collective latencies.
+
+| Message | 1 channel | 2 channels | 3 channels | 4 channels |
+|---|---:|---:|---:|---:|
+| 1 MiB | 194.44 / 229.12 | 163.47 / 199.26 | 156.94 / 187.21 | 154.98 / 195.28 |
+| 1 MiB + 4 B | 201.08 / 227.79 | 164.37 / 195.81 | 157.03 / 187.29 | 157.22 / 188.59 |
+| 9 MiB | 1416.87 / 1532.55 | 1262.10 / 1442.60 | 1246.85 / 1463.53 | 1241.38 / 1429.62 |
+| 12 MiB | 1881.48 / 2067.82 | 1679.88 / 1836.99 | 1654.19 / 1798.06 | 1664.79 / 1787.08 |
+| 16 MiB | 2513.69 / 2676.43 | 2227.34 / 2408.14 | 2215.30 / 2305.43 | 2204.70 / 2277.51 |
+| 16 MiB + 4 B | 2661.34 / 2619.15 | 2243.06 / 2396.92 | 2211.47 / 2350.96 | 2214.41 / 2274.05 |
+| 32 MiB | 5040.16 / 5184.35 | 4476.26 / 4577.50 | 4497.89 / 4604.35 | 4468.45 / 4579.76 |
+
+Nano has lower median time in **27/28 cells** and wins all four pairs in
+**25/28 cells**. The equally weighted geometric mean of the 28 ratios
+`NCCL median time / nano median time` is **1.1024x**. This is a summary of this
+matrix, not a training speedup or proof that one implementation mechanism
+caused the advantage. At 32 MiB the median-time advantage is about 2–3%.
+
+### Exceptions, variation, and evidence
+
+- The only median regression is 1 channel / 16 MiB + 4 B: nano is 1.61% slower
+  (2661.34 vs 2619.15 us). Source inspection confirms that nano executes a
+  second outer loop with one valid float at this boundary, while NCCL remains
+  in one outer loop. Its contribution to the timing gap remains `Unknown`;
+  see the [source analysis](docs/performance/20261015-rank4-gdr/SOURCE_NOTES.md).
+- Both implementations have slow job samples. For 4 channels / 12 MiB,
+  nano spans 1654.29–2311.95 us; its median is faster, but its arithmetic mean
+  is 1823.95 vs NCCL's 1779.62 us. NCCL's 2-channel / 9 MiB samples span
+  1362.46–2045.11 us. Using the arithmetic mean of all four job averages,
+  nano is faster in 26/28 cells. No samples were removed.
+- All four authorized background workers remained present. The 2116 selected-GPU
+  health samples showed recovery action `None` and sampled GPU utilization 0%.
+  Sampling cannot exclude intervening activity. Unselected GPUs also carried
+  compute load (sampled utilization up to 84%), and CPU, PCIe, memory, and
+  network resources were shared.
+- These four job averages do not establish per-collective p99 or show that
+  tails are eliminated. This campaign does not isolate U8, partition alignment,
+  vectorization, synchronization, or protocol contributions, and it does not
+  complete the full dtype/op/collective contract or the 3% nano-baseline gate.
+  The existing NCCL reference build lacks complete compiler logs; its listed
+  cubins include SM80 but not SM86, so byte-for-byte build reproducibility is
+  not claimed.
+
+Published evidence: [all 224 measurements](docs/performance/20261015-rank4-gdr/measurements.csv),
+[112 pairs](docs/performance/20261015-rank4-gdr/paired-results.csv),
+[28-cell statistics](docs/performance/20261015-rank4-gdr/summary.csv),
+and [verification summary](docs/performance/20261015-rank4-gdr/verification.json).
+The [full report](docs/performance/20261015-rank4-gdr/README.md) includes all
+samples, configuration, fingerprints, and interpretation limits. Original logs
+remain in the local experiments record, not in this published snapshot.
+
+## Historical measurements: timing caveat
+
+The remaining tables are historical out-of-place AllReduce measurements.
+Bandwidth is `busbw` in GB/s; the `nano/NCCL` column is calculated from the
+unrounded time as `nccl_time_us / nano_time_us`. Every measured result in
+these tables completed benchmark validation with zero wrong values.
+
+These historical matrices predate the matched benchmark contract. Nano
+synchronized after every collective and reported the slowest MPI rank;
+nccl-tests used its default asynchronous batch and averaged MPI processes.
+Nano used one MPI process per GPU while NCCL used multiple GPUs per MPI
+process. Their ratios cannot be used for formal NCCL-relative acceptance.
+The reproduction commands below use the corrected protocol and will not
+reproduce these historical timing values.
+
+## Historical test topology and environment
 
 Two hosts, each two-socket Intel Xeon Platinum 8462Y+ (32 cores per socket, two threads per core), 4x NVIDIA RTX A6000 (SM86), CUDA 12.8.61, NCCL 2.30.7 built from source, nccl-tests 2.19.6, and Open MPI 4.1.2.
 
@@ -15,9 +112,9 @@ Two hosts, each two-socket Intel Xeon Platinum 8462Y+ (32 cores per socket, two 
 
 On each host, GPU0-GPU1 and GPU2-GPU3 are connected by four NVLinks. The two pairs are separated by `SYS` paths across NUMA nodes. Tables are separate transport classes: in-process auto (P2P/SHM) on one host, two-host TCP socket, two-host host-pinned RDMA, and two-host RDMA with GPUDirect (device FIFO).
 
-All measurements use a Release build with `NANO_NCCL_ENABLE_BENCH_PROFILING=OFF`, message sizes 256 KiB through 64 MiB, `-w 5`, and `-n 20`. NCCL uses `Ring`, `Simple`, four channels, and a 32 MiB buffer. RDMA WRITE+CTS posts from the registered mapped FIFO (no host bounce; publication via publisher `st.release.sys(send_tail)` after block sync and host acquire loads). The GDR table reports the median of five full-matrix repetitions for each implementation.
+These historical measurements use a Release build with `NANO_NCCL_ENABLE_BENCH_PROFILING=OFF`, message sizes 256 KiB through 64 MiB, `-w 5`, and `-n 20`. NCCL uses `Ring`, `Simple`, four channels, and a 32 MiB buffer. RDMA WRITE+CTS posts from the registered mapped FIFO (no host bounce; publication via publisher `st.release.sys(send_tail)` after block sync and host acquire loads). The GDR table reports the median of five full-matrix repetitions for each implementation.
 
-## Single Host: 4 Ranks Over Auto (P2P/SHM)
+## Historical single host: 4 Ranks Over Auto (P2P/SHM)
 
 In-process 4-GPU communicator. Nano `--transport auto` resolves each ring edge independently (P2P when bidirectional NVLink peer access is available, otherwise SHM). NCCL is the matching intra-node Ring+Simple path (P2P/SHM allowed).
 
@@ -148,7 +245,7 @@ In-process 4-GPU communicator. Nano `--transport auto` resolves each ring edge i
 | 64 MiB | 4360.23 | 23.09 | 4387.45 | 22.94 | 1.01 |
 
 
-## Two Hosts: 8 Ranks Over TCP Socket
+## Historical two hosts: 8 Ranks Over TCP Socket
 
 2 hosts x 4 GPUs, one MPI process per host. Nano `--transport auto` keeps local ring edges on P2P/SHM and places cross-host edges on TCP socket. NCCL is Ring+Simple with `NCCL_IB_DISABLE=1` (P2P/SHM allowed intra-node). Bootstrap uses the management IPv4 interface, not loopback.
 
@@ -279,7 +376,7 @@ In-process 4-GPU communicator. Nano `--transport auto` resolves each ring edge i
 | 64 MiB | 1064346.9 | 0.11 | 1006867.0 | 0.12 | 0.95 |
 
 
-## Two Hosts: 8 Ranks Over RDMA
+## Historical two hosts: 8 Ranks Over RDMA
 
 2 hosts x 4 GPUs, one MPI process per host. Nano `--transport rdma` with `NANO_NCCL_RDMA_USE_WRITE=1` (WRITE+CTS over registered host-pinned FIFO). Local edges stay P2P/SHM; cross-host edges are RDMA. RTR `path_mtu` is `min(local, remote) port.active_mtu`. NCCL: Ring+Simple, `NCCL_NET_GDR_LEVEL=0`, P2P/SHM allowed intra-node. NCCL 256 KiB OOP that collapsed (~0.8 GB/s) was re-run isolated up to four times; cells that stayed collapsed are not nano wins.
 
@@ -410,7 +507,7 @@ In-process 4-GPU communicator. Nano `--transport auto` resolves each ring edge i
 | 64 MiB | 10528.4 | 11.15 | 10264.2 | 11.44 | 0.97 |
 
 
-## Two Hosts: 8 Ranks Over RDMA (GDR)
+## Historical two hosts: 8 Ranks Over RDMA (GDR)
 
 Same 2x4 topology as the host-pinned RDMA table. Nano `--transport rdma` with `NANO_NCCL_RDMA_USE_WRITE=1` and `NANO_NCCL_RDMA_GDR=1` (WRITE+CTS from a registered GPU FIFO; host proxy still posts). After a receive CQE, nano flushes third-party GDR writes before publishing `recv_tail` when the device lacks native GPU/RDMA write ordering. NCCL: Ring+Simple with `NCCL_NET_GDR_LEVEL=SYS`; debug logs confirmed `/GDRDMA` on the cross-host edges. Each cell is the median of five complete, alternating-order repetitions; no isolated retries replace matrix samples. This is host-proxy GDR, not GPU-initiated IBGDA.
 
@@ -545,7 +642,7 @@ No accepted GDR nano baseline exists, so the formal 3% baseline-regression gate 
 | 64 MiB | 10301.4 | 11.40 | 10165.1 | 11.55 | 0.99 |
 
 
-## Reproduction
+## Reproduction of the matched protocol
 
 For a new matched comparison, build nano-nccl with CUDA 12.8, SM86, Release mode, and profiling disabled. Run one MPI process per GPU for both implementations: four local ranks for a single-host comparison or four ranks per host with a global `NANO_NCCL_NRANKS=8` for two hosts. Use the same Open MPI 4.1.2 prefix.
 
@@ -580,9 +677,9 @@ cmake -S . -B build-perf-rdma-n8 -DCMAKE_BUILD_TYPE=Release \
 cmake --build build-perf-rdma-n8 -j<jobs>
 ```
 
-Or regenerate this file from a completed matrix JSON:
+The legacy renderer regenerates the historical matrix document from a completed matrix JSON. Its output replaces the whole file; render to a separate path and preserve the latest campaign section and evidence links above when updating this document:
 
 ```bash
 scripts/run_performance_matrix.sh --nccl-bin <path> --nccl-lib <dir> --out-dir <out>
-python3 scripts/render_performance_md.py <out>/matrix.json -o performance.md
+python3 scripts/render_performance_md.py <out>/matrix.json -o <out>/performance-generated.md
 ```

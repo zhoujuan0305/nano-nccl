@@ -102,3 +102,23 @@ GDR 选择及每条跨机 edge 的实际 placement：
 ## 文档注意
 
 `AGENTS.md` 已把早期“eventually implement GPUDirect RDMA”的过时描述更新为现有 host-proxy GDR 路径。其较早的 Current Implementation Snapshot 是历史范围陈述；上述本轮证据优先用于判断 GDR 的当前覆盖状态。
+
+## 2026-10-15：双机四 rank GDR 文档更新
+
+本轮使用两端 physical GPU0/1，与获准 vLLM workers 共存，完成
+channels1/2/3/4 ×7尺寸 ×4对 AB/BA 的 float/sum/OOP AllReduce 对照；
+NCCL 2.30.7、Ring/Simple、双方每 GPU 一个 MPI 进程，w5/n20、query/max
+与 nccl-tests `-g1 -z2 -a3 -m1` 对齐。224个正式作业全部退出0、wrong0。
+28格中nano在27格中位耗时更低，25格四对全部更快；
+28格 `NCCL median / nano median` 等权几何平均1.1024。
+唯一中位回退格C1/16MiB+4B慢1.61%；双方慢样均保留，不能推断逐collective p99。
+
+被测nano是本地base `cf473a44b9bdc89a1dacb88ccfef612a3e4deba9` 加冻结诊断修改，
+使用U8、16B channel边界对齐、向量主体/标量尾部、288/256线程、
+shared progress、WRITE+CTS、selective CQE、原同步。它不是main默认配置；
+本次只发布文档和脱敏测量副本，不合入诊断实现或改变默认值。
+完整矩阵、测量CSV、审核与指纹见
+`docs/performance/20261015-rank4-gdr/README.md`；原实验记录为独立experiments
+仓库 `nano-nccl/two-host-rdma-gdr/runs/run-20261015-001/`。
+参与卡背景利用率离散采样为0%，其它卡最高84%，共享主机资源仍会干扰；
+本轮不隔离各修改的因果收益，不裁定完整scope或3% nano baseline gate。

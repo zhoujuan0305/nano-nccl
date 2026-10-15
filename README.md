@@ -38,15 +38,31 @@ CUDA IPC P2P is selected from a real open/close probe, so a working PCIe P2P
 edge is accepted even without direct NVLink. Rank 8 is not validated support
 until it has matching hardware execution coverage.
 
-The historical tables in [performance.md](performance.md) predate the
-one-process-per-GPU and matched-timing contracts. Unless a result is explicitly
-marked as revalidated, it is not acceptance evidence for this architecture.
+Historical sections in [performance.md](performance.md) predate the
+one-process-per-GPU and matched-timing contracts unless explicitly marked as
+revalidated. The 2026-10-15 result below is a scoped diagnostic comparison, not
+full-scope performance acceptance.
 
 A post-change rank-2 repeatability smoke (`float`/`sum`, `-w 5 -n 20`, three
 runs) produced median busbw of 7.60/19.39/26.62/32.62/34.36 GB/s for P2P and
 5.57/10.91/13.62/15.08/15.32 GB/s for SHM at 256 KiB/1 MiB/4 MiB/16 MiB/64
 MiB, with zero wrong values. These are nano-nccl-only smoke numbers, not a
 same-round NCCL comparison or performance acceptance result.
+
+### 2026-10-15 two-host, four-rank GDR comparison
+
+A matched `float`/`sum`/out-of-place Ring + Simple AllReduce comparison against
+NCCL 2.30.7 covered two hosts, physical GPUs 0 and 1 on each host, and four
+ranks. Across channels 1–4, seven sizes, and four paired runs per cell (224
+jobs), all jobs had `wrong=0`; nano-nccl's median was lower in 27/28 cells and
+all four pairs were faster in 25/28. The geometric mean of the 28 cell median
+`NCCL/nano` ratios was 1.1024. This used a U8, aligned-channel diagnostic
+snapshot based on local commit `cf473a4` plus frozen uncommitted diagnostic
+changes; these are not `main` default performance or full-scope acceptance
+results. This documentation update does not merge the diagnostic code. The GPUs
+and hosts were shared with other workloads, and the full scope and 3% baseline regression gate remain unaccepted. See
+[the full results](performance.md#2026-10-15-two-host-four-rank-gdr) and the
+[experiment record](docs/performance/20261015-rank4-gdr/README.md).
 
 ## Same-host interprocess transports
 
@@ -323,8 +339,9 @@ Transport runtime lifecycle and orchestration remain in `Communicator::Impl`.
   `int8`, or `prod`.
 - `nranks` is still fixed by one build; the generated 2/4/8 specialization
   registry is not implemented yet.
-- Socket/RDMA one-process-per-GPU matrices and NCCL-relative performance still
-  require revalidation.
+- Full-scope Socket/RDMA performance and the 3% regression check against an
+  accepted nano-nccl baseline remain to be validated; the scoped GDR comparison
+  above does not complete either gate.
 - CUDA IPC teardown uses a bounded peer-close acknowledgement. If a peer does
   not close its imported handle within the timeout, the exporter intentionally
   leaks that device region instead of freeing memory still mapped by the peer;
