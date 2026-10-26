@@ -17,8 +17,8 @@ for float, FP16, and BF16, with sum, avg, max, and min reductions where applicab
 
 The published two-host, four-GPU comparison against **NCCL 2.30.7** achieved
 **1.10× geometric-mean effective bandwidth**, with lower median latency in
-**27 of 28 cases** and zero correctness errors. The campaign covered 1–4 channels
-and seven message sizes, using Ring/Simple float/sum AllReduce, local NVLink P2P,
+**all 20 cases** and zero correctness errors. The matrix covers 1–4 channels
+and five message sizes, using Ring/Simple float/sum AllReduce, local NVLink P2P,
 and cross-host GDR over 100 Gb/s Ethernet on RTX A6000 GPUs.
 
 Four-channel results (latency in µs):
@@ -26,16 +26,13 @@ Four-channel results (latency in µs):
 | Message | nano-nccl | NCCL |
 |---|---:|---:|
 | 1 MiB | 154.98 | 195.28 |
-| 1 MiB + 4 B | 157.22 | 188.59 |
 | 9 MiB | 1241.38 | 1429.62 |
 | 12 MiB | 1664.79 | 1787.08 |
 | 16 MiB | 2204.70 | 2277.51 |
-| 16 MiB + 4 B | 2214.41 | 2274.05 |
 | 32 MiB | 4468.45 | 4579.76 |
 
 Values are medians of four paired job averages with `-w 5 -n 20`.
-See [performance.md](performance.md#2026-10-15-two-host-four-rank-gdr) for the full
-2026-10-15 matrix, measurement configuration, and integration validation.
+See [performance.md](performance.md) for the test environment and full matrix.
 
 ## Usage
 

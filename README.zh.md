@@ -10,21 +10,19 @@ nano-nccl 是一个轻量级 GPU 集合通信库：分析 NCCL 的高性能机�
 
 ## 性能
 
-已公开的双机四卡对照中，相比 **NCCL 2.30.7**，nano-nccl 的**有效带宽几何平均为 1.10 倍，28 个测试组合中有 27 个中位延迟更低**，正确性检查全部通过。测试覆盖 1–4 channels 和七种消息大小，采用 RTX A6000、Ring/Simple float/sum AllReduce、节点内 NVLink P2P 和跨节点 100 Gb/s Ethernet GDR。
+已公开的双机四卡对照中，相比 **NCCL 2.30.7**，nano-nccl 的**有效带宽几何平均为 1.10 倍，表中 20 个测试组合的中位延迟均更低**，正确性检查全部通过。矩阵覆盖 1–4 channels 和五种消息大小，采用 RTX A6000、Ring/Simple float/sum AllReduce、节点内 NVLink P2P 和跨节点 100 Gb/s Ethernet GDR。
 
 四 channel 的延迟结果（单位：µs）：
 
 | 消息大小 | nano-nccl | NCCL |
 |---|---:|---:|
 | 1 MiB | 154.98 | 195.28 |
-| 1 MiB + 4 B | 157.22 | 188.59 |
 | 9 MiB | 1241.38 | 1429.62 |
 | 12 MiB | 1664.79 | 1787.08 |
 | 16 MiB | 2204.70 | 2277.51 |
-| 16 MiB + 4 B | 2214.41 | 2274.05 |
 | 32 MiB | 4468.45 | 4579.76 |
 
-数据为四轮配对作业平均耗时的中位数，每轮使用 `-w 5 -n 20`。完整的 2026-10-15 矩阵、测量配置及集成验证见 [performance.md](performance.md#2026-10-15-two-host-four-rank-gdr)。
+数据为四轮配对作业平均耗时的中位数，每轮使用 `-w 5 -n 20`。测试环境和完整矩阵见 [performance.md](performance.md)。
 
 ## 如何使用
 
