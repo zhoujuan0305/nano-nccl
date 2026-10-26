@@ -52,49 +52,15 @@ def main() -> int:
     cmake = (root / "CMakeLists.txt").read_text()
     if "set(NANO_NCCL_CUDA_ARCH 70" not in cmake or "NANO_NCCL_CUDA_ARCH LESS 70" not in cmake:
         raise AssertionError("CMake does not enforce the SM70 architecture floor")
+    # Architecture ownership stays in AGENTS.md; READMEs cover user prerequisites.
     documentation_contracts = {
         root / "README.md": {
             "the float/FP16 SM70+ floor": ("`float` and FP16 require SM70+",),
             "the BF16 SM80+ floor": ("BF16 requires SM80+",),
-            "the CMake architecture default and rejection": (
-                "`NANO_NCCL_CUDA_ARCH` | 70",
-                "values below 70 are rejected",
-            ),
-            "Simple protocol ownership": (
-                "`src/transport/simple/` owns",
-                "Simple FIFO layout",
-                "step ordering",
-                "slice geometry",
-                "distinct send and recv base steps",
-            ),
-            "SHM ownership": ("`src/transport/shm/` owns mapped host FIFO storage and control only",),
-            "Ring scheduling ownership": (
-                "`src/collective/all_reduce/ring_simple_geometry.h` owns Ring channel/rank work partitioning",
-            ),
-            "transport runtime lifecycle ownership": (
-                "Transport runtime lifecycle and orchestration remain in `Communicator::Impl`",
-            ),
         },
         root / "README.zh.md": {
             "the float/FP16 SM70+ floor": ("`float` 和 FP16 需要 SM70+",),
             "the BF16 SM80+ floor": ("BF16 需要 SM80+",),
-            "the CMake architecture default and rejection": (
-                "`NANO_NCCL_CUDA_ARCH` | 70",
-                "低于 70 的值会被拒绝",
-            ),
-            "Simple protocol ownership": (
-                "`src/transport/simple/` 负责 Simple FIFO layout",
-                "step ordering",
-                "slice geometry",
-                "独立持久化 send 和 recv base step",
-            ),
-            "SHM ownership": ("`src/transport/shm/` 仅负责 mapped host FIFO storage 和 control",),
-            "Ring scheduling ownership": (
-                "`src/collective/all_reduce/ring_simple_geometry.h` 负责 Ring channel/rank work partitioning",
-            ),
-            "transport runtime lifecycle ownership": (
-                "transport runtime lifecycle 与 orchestration 仍由 `Communicator::Impl` 管理",
-            ),
         },
         root / "AGENTS.md": {
             "the float/FP16 SM70+ floor": ("`float` and FP16 require SM70+",),
